@@ -1,17 +1,52 @@
 ---
-
+const title = 'sushi';
 ---
 
+<!doctype html>
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
 		<meta name="viewport" content="width=device-width" />
 		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
+		<title>{title}</title>
 	</head>
 	<body>
-		<h1>Astro</h1>
+		<main>
+			<p>{title}</p>
+			<h1>WebMCP Challenge</h1>
+			<p>Idea pending.</p>
+		</main>
 	</body>
 </html>
+
+<style>
+	:global(*) {
+		box-sizing: border-box;
+	}
+
+	:global(body) {
+		margin: 0;
+		font-family: system-ui, sans-serif;
+		background: #f4f1ea;
+		color: #171717;
+	}
+
+	main {
+		display: grid;
+		min-height: 100svh;
+		place-content: center;
+		gap: 0.5rem;
+		padding: 2rem;
+	}
+
+	p {
+		margin: 0;
+		color: #6d685f;
+	}
+
+	h1 {
+		margin: 0;
+		font-size: clamp(2.5rem, 8vw, 6rem);
+		letter-spacing: -0.06em;
+	}
+</style>
