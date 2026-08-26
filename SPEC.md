@@ -25,8 +25,8 @@ A human and an agent share one musical workspace. Both can create, hear, edit, a
 1. User or agent opens a studio session.
 2. User describes a sound, song, or theme, or asks for a musical change.
 3. The agent calls a Sushi tool.
-4. The tool updates the canonical composition state.
-5. Sushi compiles the state into Strudel runtime patterns.
+4. The tool submits a source edit through the shared source pipeline.
+5. Sushi validates and commits the source, then evaluates it through Strudel.
 6. The interface updates and the user auditions the result.
 7. The user edits, accepts, or asks for another change.
 
@@ -110,7 +110,7 @@ The adapter is the only application layer that talks directly to Strudel.
 Responsibilities:
 
 - Initialize Strudel and Web Audio
-- Compile project patterns into a playable Strudel structure
+- Evaluate the committed Strudel source into a playable Pattern
 - Start and stop playback
 - Update patterns through the source mapper
 - Expose runtime status to the studio
@@ -125,14 +125,29 @@ Strudel's transpilation, evaluation, and runtime are the source of truth for whe
 Every source edit follows the same pipeline:
 
 ```text
-candidate Strudel source
-→ transpile and evaluate
-→ return diagnostics
-→ commit only valid source
-→ update the UI and audio runtime
+draft source
+→ parse and transpile
+→ evaluate with a revision token
+→ verify the resulting Pattern and assets
+→ commit at the declared playback boundary
+→ update the source index and audio runtime
 ```
 
 The user editor and WebMCP source tools use this pipeline. A failed edit keeps the draft source and diagnostics in shared client state while playback continues from `lastValid`. The human sees the diagnostic in the editor and the agent receives the same structured diagnostic in the tool result and through subsequent state reads, so either actor can correct it.
+
+Evaluation is cancellable and transactional. Each evaluation carries its source revision, and only the current revision can become active. Temporary runtime registrations are cleaned up when evaluation fails. Rapid control changes are coalesced before evaluation. Sushi uses a trusted browser-code execution model for authored Strudel source.
+
+```ts
+interface SourceDiagnostic {
+  revision: number;
+  phase: "parse" | "transpile" | "evaluate" | "asset" | "audio" | "commit";
+  severity: "error" | "warning" | "info";
+  code: string;
+  message: string;
+  range?: SourceRange;
+  cause?: string;
+}
+```
 
 The app includes a versioned, client-side Strudel reference containing common functions, sounds, templates, patterns, and working examples. WebMCP can expose focused reference lookups to the agent when it needs syntax or pattern guidance.
 
@@ -157,87 +172,94 @@ Tools operate through musical state, commands, and source revisions.
 
 ## State ownership
 
-### Canonical project state
+Sushi separates persisted project data, derived source projections, runtime state, and UI state.
 
-The application owns a serializable `ProjectState`.
+### Project document
+
+The project document is the persisted, portable source of authorship:
 
 ```ts
-interface ProjectState {
-  version: 1;
+type Rational = { numerator: number; denominator: number };
+
+interface ProjectDocumentV1 {
+  schemaVersion: 1;
   id: string;
   name: string;
-  tempo: number;
-  swing: number;
-  tracks: Track[];
-  strudelSource: SourceState;
-  masterVolumeDb: number;
-  transport: TransportState;
-}
-
-interface SourceState {
-  draft: string;
-  lastValid: string;
-  revision: number;
-  diagnostics: SourceDiagnostic[];
-}
-
-interface SourceDiagnostic {
-  message: string;
-  line?: number;
-  column?: number;
-  endLine?: number;
-  endColumn?: number;
-}
-
-interface Track {
-  id: string;
-  name: string;
-  sourceLabel: string;
-  type: "drums" | "synth" | "audio" | "other";
-  transposeSemitones: number;
-  effects: TrackEffects;
-  muted: boolean;
-  solo: boolean;
-  volume: number;
-  pan: number;
-}
-
-interface TrackEffects {
-  equalizer: {
-    low: number;
-    mid: number;
-    high: number;
+  source: {
+    draft: string;
+    lastValid: string;
+    revision: number;
+    strudelVersion: string;
   };
-  compressor: {
-    threshold: number;
-    ratio: number;
-    attack: number;
-    release: number;
+  timeline: {
+    quarterNotesPerCycle: Rational;
+    cyclesPerBar?: Rational;
+    meter?: { numerator: number; denominator: number };
+    songEndCycle?: Rational;
   };
-}
-
-interface TransportState {
-  playing: boolean;
-  position: number;
+  assets: AssetManifestEntry[];
 }
 ```
 
-The Strudel source document is the canonical musical content. UI lanes are derived from labeled Strudel source blocks. `ProjectState` contains session metadata and arrangement state.
+Strudel source owns tempo, key, track gain, pan, transpose, mapped effects, and source mute. Project metadata owns meter, song boundaries, assets, and compatibility information.
 
-The UI projection and Strudel runtime are derived from the source document.
+### Derived source index
+
+The source index is rebuilt from the current source revision and powers the UI:
+
+```ts
+interface DerivedSourceIndex {
+  sourceRevision: number;
+  tracks: TrackProjection[];
+  globals: GlobalProjection;
+  diagnostics: SourceDiagnostic[];
+}
+
+interface TrackProjection {
+  id: string;
+  label: string;
+  name: string;
+  type: "drum" | "synth" | "sample" | "unknown";
+  range: SourceRange;
+  mappingStatus: "mapped" | "partial" | "opaque";
+  parameters: Record<string, ParameterProjection>;
+}
+```
+
+### Runtime and UI state
+
+```ts
+interface RuntimeState {
+  audioState: "locked" | "initializing" | "ready" | "error";
+  transport: "stopped" | "playing" | "paused";
+  currentCycle: Rational;
+  activeRevision: number | null;
+  masterVolumeDb: number;
+  soloTrackIds: string[];
+}
+
+interface UiState {
+  selectedTrackId?: string;
+  arrangementZoom: number;
+  arrangementScrollCycle: Rational;
+}
+```
+
+Runtime state covers playback, audio readiness, master output, and solo. UI state covers selection and presentation.
 
 ### Source-defined tracks
 
-A Strudel track is a labeled source block. For example:
+A Strudel track is a labeled source block with an embedded Sushi marker. For example:
 
 ```js
+// @sushi-track {"id":"trk_01JABC...","name":"Lead","type":"synth","schema":1}
 $: n("<<0 0 -2 -2> 4 7>*16")
   .scale(key)
   .s("bytebeat")
   .gain(.5)
 ```
 
-The UI derives its track list, block identity, source range, and visual lane from the source document. Adding, removing, or editing a track means adding, removing, or editing a valid source block.
+The UI derives its track list, block identity, source range, and visual lane from the source document. Track IDs use UUID or ULID values. Moving or renaming a block preserves its ID; copying a block creates a new ID; duplicate IDs produce a diagnostic. Marker fields and schema versions are preserved during source edits. Unannotated blocks remain playable and appear as unmanaged source blocks.
 
 The source contains enough metadata to render the first DAW surface:
 
@@ -250,7 +272,7 @@ The source contains enough metadata to render the first DAW surface:
 - Visualizer methods such as `_pianoroll()` and `_scope()` provide lane visualization hints.
 - Underscore-prefixed labels such as `_$:` remain source-defined blocks but are muted by Strudel.
 
-The parser produces a source index for the UI.
+The parser produces a source index for the UI. The executable Strudel label remains separate from the display name and marker identity.
 
 ### Temporal arrangement
 
@@ -260,13 +282,22 @@ Live label changes control immediate performance state. Song and track in/out po
 - `seqPLoop(...)` places patterns at explicit start and stop cycle positions, including overlaps.
 - `mask(...)` and `when(...)` express recurring conditional activation.
 
-Sushi stores timeline positions in seconds in the UI and converts them to Strudel cycles:
+Sushi stores canonical timeline positions as cycles and derives seconds for display. The cycle conversion uses quarter notes per cycle:
 
 ```text
-cycles = seconds × BPM / (60 × beatsPerCycle)
+cycles = seconds × BPM / (60 × quarterNotesPerCycle)
 ```
 
-At 84 BPM with four beats per cycle, 30 seconds is 10.5 cycles. The source mapper writes the resulting timing expression into the track's source block. The arrangement boundary provides the song duration, and the transport stops at that boundary.
+At 84 BPM with four quarter notes per cycle, 30 seconds is 10.5 cycles. The source mapper writes the timing expression into the track's source block. `songEndCycle` defines the finite project boundary, and transport stops when it is reached.
+
+Transport semantics:
+
+- Play starts from the current cycle.
+- Pause freezes the current cycle.
+- Resume continues from the paused cycle.
+- Stop halts playback and returns to cycle zero.
+- Seek changes the current cycle and schedules from the new location.
+- Source changes made during playback commit at the next cycle boundary.
 
 ### Timeline editing
 
@@ -292,15 +323,15 @@ The mapper supports a defined canonical subset of source constructs first. It pr
 
 ### Global controls
 
-The UI stores tempo as BPM and stores the number of perceived beats per Strudel cycle.
+The UI stores tempo as BPM and stores the number of quarter notes per Strudel cycle.
 
 ```js
-setcpm(bpm / beatsPerCycle)
+setcpm(bpm / quarterNotesPerCycle)
 ```
 
-For example, 84 BPM in a four-beat cycle becomes `setcpm(84 / 4)`.
+For example, 84 BPM in a four-quarter-note cycle becomes `setcpm(84 / 4)`.
 
-Meter is represented by the UI model and by the rhythmic grouping of patterns. The mapper preserves this distinction because Strudel expresses meter through pattern structure.
+Meter is project metadata displayed by the UI and reflected through the rhythmic grouping of patterns.
 
 Musical key uses a canonical source declaration:
 
@@ -310,13 +341,36 @@ const key = "E:minor";
 
 The mapper must keep the UI value and recognized source declarations synchronized.
 
+### Source mapper
+
+The mapper supports a defined canonical subset of Strudel source constructs first:
+
+```text
+ManagedTrack := SushiMarker LabeledExpression
+LabeledExpression := Label ':' BasePattern ChainedCall*
+RecognizedValue := NumericLiteral | NegativeNumericLiteral | SliderExpression
+```
+
+Base patterns include common `n(...)`, `note(...)`, `s(...)`, and `sound(...)` expressions. Chained calls include recognized pitch, gain, pan, filter, envelope, room, sustain, decay, color, and visualization methods. Pattern-valued expressions receive an explicit mapping status instead of being reduced to scalar UI values.
+
+```ts
+type MappingStatus =
+  | "mapped-literal"
+  | "mapped-slider"
+  | "readonly-expression"
+  | "unsupported"
+  | "invalid";
+```
+
+The mapper uses source ranges for edits. Parsing and projecting a source document is byte-stable. Editing one mapped property changes its intended source range while preserving comments, whitespace, formatting, and unrelated expressions.
+
 ### Sync rules
 
 - Every update carries a source revision and origin.
 - UI-originated updates serialize through the mapper before runtime evaluation.
 - Source-originated updates parse through the mapper before UI state changes.
 - Equivalent source updates collapse to one revision.
-- Unsupported source remains visible and editable.
+- Unsupported source remains visible and editable through the source editor.
 - Invalid source produces a visible error while the last valid runtime continues playing.
 
 ### Commands
@@ -328,15 +382,17 @@ Initial command set:
 ```text
 createProject
 renameProject
-addSourceBlock
-removeSourceBlock
-editSourceBlock
-setSourceBlockParameter
+writeSource
+patchSource
+setTrackParameter
+setTrackRange
 setTempo
-setSwing
-setMasterVolume
+setKey
 play
+pause
+resume
 stop
+seek
 undo
 redo
 ```
@@ -348,6 +404,8 @@ Every command should be:
 - Undoable when it changes project state
 - Usable by human controls and WebMCP tools
 - Observable by the UI
+
+Source mutations carry a base revision, transaction ID, and origin. A stale base revision returns a structured conflict and leaves the current draft and runtime unchanged.
 
 ### History
 
@@ -380,8 +438,11 @@ Every mutating tool returns:
 - The affected entity IDs
 - A short human-readable result
 - The current relevant state
+- The committed revision and source diff
 
-All musical edits operate on Strudel source directly at the runtime boundary, with validation before compilation.
+Every mutating source tool accepts a base revision and transaction ID. Transaction IDs provide idempotent retries for the same edit.
+
+All musical edits operate on Strudel source through the source pipeline, with validation before runtime activation.
 
 Source tools operate on the source document itself:
 
@@ -406,14 +467,13 @@ Sushi presents a DAW-style visual model while preserving Strudel's pattern-based
 Initial model:
 
 - One project
-- Multiple source-defined audio lanes
-- Drum, synth, and audio-file track types
+- Multiple source-defined lanes
+- Drum, synth, and sample-pattern track types
 - One UI lane per source-defined Strudel block
 - Shared tempo and transport
-- Per-track mixer controls
-- Master volume from -20 dB to +5 dB, with -20 dB mapped to silence in the product UI
-- Per-track equalizer and compressor controls
-- Per-track transpose from -12 to +12 semitones per operation, with repeated operations supported
+- Source-mapped gain, pan, transpose, and selected effects
+- Runtime master output and solo controls
+- Source-authored mute through Strudel label state
 - Pattern editing and replacement
 - Derived visual lanes
 
@@ -429,12 +489,40 @@ Arrangement, scenes, pattern sections, automation, and multi-project workspaces 
 
 Initial persistence is client-only.
 
-- Save projects and imported audio assets in IndexedDB
+- Save the project document and imported sample assets in IndexedDB
 - Save lightweight preferences in browser storage
-- Include a schema version
-- Serialize project state as JSON
-- Support export and import
-- Keep Strudel pattern source intact
+- Serialize the project document as versioned JSON
+- Keep Strudel source and asset metadata intact
+- Autosave source and last-valid state atomically
+- Recompute the derived source index when a project opens
+- Support local export and import
+
+### Assets
+
+V1 audio tracks are Strudel patterns that trigger project-local or registered samples. Linear waveform clips, trimming, recording, and fades belong to a later audio model.
+
+```ts
+interface AssetManifestEntry {
+  id: string;
+  alias: string;
+  originalName: string;
+  contentHash: string;
+  mimeType: string;
+  byteLength: number;
+  storageKey: string;
+  sourceUrl?: string;
+  license?: string;
+  attribution?: string;
+}
+```
+
+Aliases are unique within a project. Missing, undecodable, or quota-failed assets produce structured diagnostics. Portable exports package the manifest, source, and local assets together.
+
+### Compatibility and licensing
+
+Sushi pins its Strudel package versions and records the compatibility version in every project. Opening a project under a different compatible version produces a visible compatibility state and uses an explicit migration when required.
+
+Sushi includes Strudel attribution, dependency notices, and sample attribution in the application and exported projects. Its distribution license and source-availability model must satisfy Strudel's AGPL-3.0 requirements and receive legal review before deployment.
 
 ## Runtime boundaries
 
@@ -489,35 +577,37 @@ The exact component split can evolve. The boundaries between project state, Stru
 
 ## First vertical slice
 
-The first playable slice proves the architecture with a small but complete loop:
+The work is staged as progressively complete vertical slices:
 
-- Studio page loads in Astro
-- React island mounts
-- Strudel initializes through the adapter
-- Default Strudel templates, sounds, and patterns are available
-- Agent can open or restore a studio session
-- User can play, pause, and stop a project
-- Project contains drum, synth, and audio lanes
-- User can edit a track's Strudel source
-- User can read, replace, patch, and semantically edit the Strudel source
-- Invalid Strudel source remains visible as a draft, returns actionable diagnostics to the editing actor, and preserves the last valid playback
-- UI BPM changes update the underlying Strudel source
-- Strudel source changes update the UI BPM state
-- UI and source remain synchronized for the canonical subset
-- User can adjust the BPM
-- User can drag track in/out points and see `arrange(...)` or `seqPLoop(...)` update the source
-- Source timing changes update the UI timeline
-- Playback stops at the derived song duration
-- User can adjust per-track mixer and basic effects
-- User can transpose a track
-- User can adjust master volume
-- Agent can inspect project state
-- Agent can inspect source-defined tracks
-- Agent can add, remove, or change a source block through source tools
-- Agent can compose from a natural-language description
-- UI reflects agent changes
-- Undo restores the previous project state
-- Project can be saved and loaded locally
+### Slice 0: runtime proof
+
+- Astro loads the React studio island.
+- The adapter initializes `@strudel/web`.
+- Sushi evaluates source, plays a Pattern, and stops it.
+- Draft source, last-valid source, diagnostics, and active revision are visible.
+- An invalid draft leaves the last-valid Pattern playing.
+
+### Slice 1: source-first project
+
+- Multiple marked `$:` and `_$:` blocks render as source-derived lanes.
+- Track IDs survive source edits and reordering.
+- The mapper supports tempo, key, one scalar track control, and exact source ranges.
+- UI changes update source; source changes update the UI.
+- Projects save and reopen from IndexedDB.
+
+### Slice 2: musical transport
+
+- Timeline positions use cycles and display derived seconds.
+- Dragging track in/out points writes `arrange(...)` or `seqPLoop(...)`.
+- Source timing changes update the timeline.
+- Play, pause, resume, stop, seek, and `songEndCycle` work as defined.
+
+### Slice 3: agent surface
+
+- WebMCP exposes source inspection, validation, reference lookup, playback, and revision-checked edits.
+- Successful edits return a diff and new revision.
+- Stale edits return a structured conflict.
+- Human and agent changes share undo history.
 
 ## Acceptance criteria
 
@@ -525,19 +615,28 @@ The first playable slice proves the architecture with a small but complete loop:
 - Strudel is the only musical execution engine.
 - Human and agent actions produce the same state transitions.
 - WebMCP tools expose useful musical operations with schemas.
-- The studio UI is derived deterministically from project state.
+- The studio UI is derived deterministically from the source index.
 - State changes are visible, inspectable, and undoable.
+- A no-op source projection is byte-identical.
+- A mapped control edit changes only its intended source range.
+- Comments, formatting, and unsupported expressions survive unrelated edits.
+- Duplicate track IDs produce diagnostics; track IDs survive reordering.
+- An older asynchronous evaluation cannot replace a newer revision.
+- Invalid source leaves the last-valid Pattern active.
+- Transport stops at `songEndCycle`.
+- Saved projects reopen with the same source and local assets.
+- Stale agent edits fail with no mutation.
 - The app functions as a standalone browser studio and exposes WebMCP when available.
 - `bun run build` succeeds.
 
 ## Open decisions
 
 - Exact Strudel package set beyond `@strudel/web`
-- Pattern representation for multi-section arrangements
-- Audio sample and sound-bank strategy
-- Project serialization format and share links
-- Tool approval behavior for large or destructive changes
-- Share and export behavior for client-only projects
+- Versioned reference-catalog generation and curation
+- Expansion of the canonical mapper grammar
+- Effect chain and orbit policy
+- Portable project bundle format
+- Tool approval behavior for large source changes
 
 ## References
 
