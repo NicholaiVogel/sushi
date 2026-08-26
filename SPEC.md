@@ -198,7 +198,7 @@ interface TransportState {
 
 The Strudel source document is the canonical musical content. UI lanes are derived from labeled Strudel source blocks. Track metadata and arrangement state belong to `ProjectState` only when they cannot be represented by the source itself.
 
-The Strudel runtime is derived from project state. It is not a second persistent store.
+The UI projection and Strudel runtime are derived from the source document. Neither is a second persistent store.
 
 ### Source-defined tracks
 
@@ -212,6 +212,19 @@ $: n("<<0 0 -2 -2> 4 7>*16")
 ```
 
 The UI derives its track list, block identity, source range, and visual lane from the source document. Adding, removing, or editing a track means adding, removing, or editing a valid source block. The agent does not need a separate `create_track` operation.
+
+The source contains enough metadata to render the first DAW surface:
+
+- Global declarations provide tempo, key, and reusable helpers.
+- Labeled blocks provide track boundaries and source ranges.
+- Comments can provide display names when present.
+- Method chains provide recognized musical, mixer, and effect controls.
+- `slider(value, min, max)` provides editable control metadata.
+- `color()` provides track visual identity.
+- Visualizer methods such as `_pianoroll()` and `_scope()` provide lane visualization hints.
+- Underscore-prefixed labels such as `_$:` remain source-defined blocks but are muted by Strudel.
+
+The parser produces a source index for the UI. It does not create a competing musical state model.
 
 ## Bidirectional source synchronization
 
@@ -299,26 +312,15 @@ Initial tools:
 
 ```text
 open_studio_session
-get_project_state
+inspect_strudel_state
 read_strudel_source
 write_strudel_source
 patch_strudel_source
-edit_strudel_source
-read_strudel_blocks
-edit_strudel_block
-remove_strudel_block
 validate_strudel_source
 lookup_strudel_reference
-compose_from_description
-transpose_track
-set_track_effects
-set_track_parameter
-set_transport
-set_master_volume
-play_project
-stop_project
-undo_change
-redo_change
+control_playback
+undo_source_edit
+redo_source_edit
 ```
 
 Every mutating tool returns:
@@ -328,20 +330,21 @@ Every mutating tool returns:
 - A short human-readable result
 - The current relevant state
 
-Pattern and source-block tools accept Strudel source directly at the runtime boundary, with validation before compilation. Track-oriented controls target the corresponding source-defined block; they do not create a second pattern store.
+All musical edits operate on Strudel source directly at the runtime boundary, with validation before compilation. The WebMCP surface does not duplicate DAW operations as separate state mutations.
 
 Source tools operate on the source document itself:
 
 - `read_strudel_source` returns the draft, last-valid source, revision, and diagnostics.
 - `write_strudel_source` replaces the draft source and validates it atomically.
 - `patch_strudel_source` applies exact, revision-checked text edits and validates the result.
-- `edit_strudel_source` applies a structured edit to a recognized source construct through the mapper.
-- `read_strudel_blocks` returns the source-defined tracks with labels, ranges, and recognized controls.
-- `edit_strudel_block` updates one source-defined track without reconstructing unrelated source.
-- `remove_strudel_block` removes one source-defined track after revision checking.
+- `inspect_strudel_state` returns source, parsed source blocks, recognized controls, diagnostics, and runtime status.
 - `validate_strudel_source` checks candidate source without changing the project.
+- `control_playback` starts, pauses, or stops the derived Strudel runtime.
+- `undo_source_edit` and `redo_source_edit` operate on source revisions.
 
 Invalid writes are not discarded. They remain as an invalid draft with structured diagnostics, while the runtime and playable project remain on the last valid revision. A successful correction promotes the draft and clears the diagnostics.
+
+Track creation, removal, patterns, transpose, effects, mixer values, tempo, key, and meter are all represented by source edits. The UI derives its state from the resulting source rather than maintaining parallel tool-owned state.
 
 The tool registry should grow from real interaction needs rather than expose the entire command dispatcher automatically.
 
@@ -354,7 +357,7 @@ Initial model:
 - One project
 - Multiple source-defined audio lanes
 - Drum, synth, and audio-file track types
-- One or more labeled Strudel source blocks per lane
+- One UI lane per source-defined Strudel block
 - Shared tempo and transport
 - Per-track mixer controls
 - Master volume from -20 dB to +5 dB, with -20 dB mapped to silence in the product UI
