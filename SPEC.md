@@ -242,13 +242,22 @@ cycles = seconds × BPM / (60 × beatsPerCycle)
 
 At 84 BPM with four beats per cycle, 30 seconds is 10.5 cycles. The source mapper writes the resulting timing expression into the track's source block. The arrangement boundary provides the song duration, and the transport stops at that boundary.
 
+### Timeline editing
+
+Dragging a track's in or out point is a source edit. The mapper converts the dragged seconds to cycles and updates the track's timing wrapper:
+
+- Use `arrange(...)` for section-based timelines with explicit durations.
+- Use `seqPLoop(...)` for independent track ranges with explicit start and stop positions, including overlaps.
+
+The mapper preserves the track's pattern body while changing its timing range. Source edits are parsed back into seconds and rendered as the track's in/out points.
+
 ## Bidirectional source synchronization
 
 The first vertical slice must prove both directions:
 
 ```text
-UI action → ProjectState → Strudel source → Strudel runtime
-Strudel source edit → source parser → ProjectState → UI
+UI action → source mapper → Strudel source → Strudel runtime
+Strudel source edit → source parser → UI timeline and controls
 ```
 
 The `StrudelMapper` is the single translation boundary between the UI model and Strudel source.
@@ -469,7 +478,8 @@ The first playable slice proves the architecture with a small but complete loop:
 - Strudel source changes update the UI BPM state
 - UI and source remain synchronized for the canonical subset
 - User can adjust the BPM
-- User can set song and track in/out points
+- User can drag track in/out points and see `arrange(...)` or `seqPLoop(...)` update the source
+- Source timing changes update the UI timeline
 - Playback stops at the derived song duration
 - User can adjust per-track mixer and basic effects
 - User can transpose a track
