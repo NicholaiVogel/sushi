@@ -17,7 +17,6 @@ A human and an agent share one musical workspace. The human hears, edits, and ar
 - Strudel: musical runtime, pattern language, scheduling, synthesis, and audio
 - `@strudel/web`: Strudel integration for a custom interface
 - WebMCP: agent-facing tool surface
-- json-render: under evaluation as an optional dynamic UI layer
 - Cloudflare Pages: deployment target
 
 ## Product loop
@@ -73,10 +72,10 @@ React owns the interactive DAW surface:
 - Pattern lanes
 - Arrangement view
 - Inspector controls
-- Agent-generated panels
+- Source and pattern views
 - Playback state
 
-The studio uses one command dispatcher for human actions and agent actions.
+The studio uses one command dispatcher for human actions and agent actions. Both mutate the same client-side project state.
 
 ### Strudel adapter
 
@@ -93,6 +92,26 @@ Responsibilities:
 
 The first integration should use `@strudel/web` with a custom interface.
 
+### Strudel authoring and validation
+
+Strudel's transpilation, evaluation, and runtime are the source of truth for whether a composition is valid.
+
+Every source edit follows the same pipeline:
+
+```text
+candidate Strudel source
+→ transpile and evaluate
+→ return diagnostics
+→ commit only valid source
+→ update the UI and audio runtime
+```
+
+The user editor and WebMCP tools use this pipeline. A failed edit keeps the last valid playable state and exposes the error location and message.
+
+The app includes a versioned, client-side Strudel reference containing common functions, sounds, templates, patterns, and working examples. WebMCP can expose focused reference lookups to the agent when it needs syntax or pattern guidance.
+
+An external Strudel LSP can improve developer tooling, but it is not required for the browser runtime or agent contract.
+
 ### WebMCP adapter
 
 WebMCP registration lives in a client-side module.
@@ -105,6 +124,7 @@ Responsibilities:
 - Return compact, useful results
 - Register tools only when the browser exposes WebMCP
 - Unregister tools through an `AbortController` when the studio unmounts
+- Expose source validation and focused Strudel reference lookups to the agent
 
 Tools operate on musical state and commands. They do not operate on DOM selectors or pixel coordinates.
 
@@ -163,6 +183,48 @@ Strudel pattern source is the canonical musical content for each track. Track me
 
 The Strudel runtime is derived from project state. It is not a second persistent store.
 
+## Bidirectional source synchronization
+
+The first vertical slice must prove both directions:
+
+```text
+UI action → ProjectState → Strudel source → Strudel runtime
+Strudel source edit → source parser → ProjectState → UI
+```
+
+The `StrudelMapper` is the single translation boundary between the UI model and Strudel source.
+
+The mapper supports a defined canonical subset of source constructs first. It preserves source that is outside the subset and reports unmapped values instead of silently rewriting them.
+
+### Global controls
+
+The UI stores tempo as BPM and stores the number of perceived beats per Strudel cycle.
+
+```js
+setcpm(bpm / beatsPerCycle)
+```
+
+For example, 84 BPM in a four-beat cycle becomes `setcpm(84 / 4)`.
+
+Meter is represented by the UI model and by the rhythmic grouping of patterns. Strudel does not impose a global bar or time-signature object, so the mapper must preserve this distinction.
+
+Musical key uses a canonical source declaration:
+
+```js
+const key = "E:minor";
+```
+
+The mapper must keep the UI value and recognized source declarations synchronized.
+
+### Sync rules
+
+- Every update carries a source revision and origin.
+- UI-originated updates serialize through the mapper before runtime evaluation.
+- Source-originated updates parse through the mapper before UI state changes.
+- Equivalent source updates do not create feedback loops.
+- Unsupported source remains visible and editable.
+- Invalid source produces a visible error without destroying the last valid runtime.
+
 ### Commands
 
 All state changes go through typed commands.
@@ -217,6 +279,8 @@ Initial tools:
 open_studio_session
 get_project_state
 compose_from_description
+validate_strudel_source
+lookup_strudel_reference
 create_track
 set_track_pattern
 transpose_track
@@ -269,15 +333,14 @@ Arrangement, scenes, pattern sections, automation, and multi-project workspaces 
 
 ## Persistence
 
-Initial persistence is local-first.
+Initial persistence is client-only.
 
-- Save projects in browser storage
+- Save projects and imported audio assets in IndexedDB
+- Save lightweight preferences in browser storage
 - Include a schema version
 - Serialize project state as JSON
 - Support export and import
 - Keep Strudel pattern source intact
-
-A server-backed project store can be added later without changing the WebMCP or Strudel boundaries.
 
 ## Runtime boundaries
 
@@ -295,7 +358,9 @@ The app should remain usable as a normal studio when WebMCP is unavailable. WebM
 
 ### Network
 
-The initial playable loop does not require a server round trip. Cloudflare hosts the application shell and static assets.
+The application has no server-side runtime. Cloudflare serves static application assets only. Strudel, Web Audio, project state, persistence, and WebMCP execution run in the browser.
+
+Default Strudel templates, sounds, and patterns are loaded and used client-side.
 
 ## Repository structure
 
@@ -309,8 +374,14 @@ src/
       model.ts
       commands.ts
       history.ts
+      sync.ts
     strudel/
       adapter.ts
+      mapper.ts
+      reference/
+        sounds.ts
+        templates.ts
+        examples.ts
     webmcp/
       tools.ts
   pages/
@@ -328,10 +399,16 @@ The first playable slice proves the architecture with a small but complete loop:
 - Studio page loads in Astro
 - React island mounts
 - Strudel initializes through the adapter
+- Default Strudel templates, sounds, and patterns are available
 - Agent can open or restore a studio session
-- User can play and stop a project
+- User can play, pause, and stop a project
 - Project contains drum, synth, and audio lanes
-- User can edit a track pattern
+- User can edit a track's Strudel source
+- Invalid Strudel source returns diagnostics and preserves the last valid playback
+- UI BPM changes update the underlying Strudel source
+- Strudel source changes update the UI BPM state
+- UI and source remain synchronized for the canonical subset
+- User can adjust the BPM
 - User can adjust per-track mixer and basic effects
 - User can transpose a track
 - User can adjust master volume
