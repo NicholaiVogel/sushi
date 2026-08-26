@@ -1,52 +1,23 @@
 ---
-const title = 'sushi';
+import Studio from '../components/Studio';
+import '../styles/global.css';
+
+const title = 'Sushi — source-first studio';
+const description = 'A source-first browser studio for composing with Strudel, shared by people and agents.';
 ---
 
 <!doctype html>
 <html lang="en">
 	<head>
-		<meta charset="utf-8" />
+		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width" />
+		<meta name="description" content={description} />
+		<meta name="theme-color" content="#0a0c0d" />
 		<meta name="generator" content={Astro.generator} />
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 		<title>{title}</title>
 	</head>
 	<body>
-		<main>
-			<p>{title}</p>
-			<h1>WebMCP Challenge</h1>
-			<p>Idea pending.</p>
-		</main>
+		<Studio client:load />
 	</body>
 </html>
-
-<style>
-	:global(*) {
-		box-sizing: border-box;
-	}
-
-	:global(body) {
-		margin: 0;
-		font-family: system-ui, sans-serif;
-		background: #f4f1ea;
-		color: #171717;
-	}
-
-	main {
-		display: grid;
-		min-height: 100svh;
-		place-content: center;
-		gap: 0.5rem;
-		padding: 2rem;
-	}
-
-	p {
-		margin: 0;
-		color: #6d685f;
-	}
-
-	h1 {
-		margin: 0;
-		font-size: clamp(2.5rem, 8vw, 6rem);
-		letter-spacing: -0.06em;
-	}
-</style>
