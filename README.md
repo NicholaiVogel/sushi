@@ -1,6 +1,6 @@
 # sushi
 
-Experimental WebMCP Challenge app.
+Experimental WebMCP Challenge app. The canonical product and architecture spec lives in [SPEC.md](./SPEC.md).
 
 ## Stack
 
