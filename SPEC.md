@@ -86,7 +86,7 @@ Responsibilities:
 - Initialize Strudel and Web Audio
 - Compile project patterns into a playable Strudel structure
 - Start and stop playback
-- Update patterns without duplicating musical semantics
+- Update patterns through the source mapper
 - Expose runtime status to the studio
 - Handle audio initialization and browser lifecycle
 
@@ -110,7 +110,7 @@ The user editor and WebMCP source tools use this pipeline. A failed edit keeps t
 
 The app includes a versioned, client-side Strudel reference containing common functions, sounds, templates, patterns, and working examples. WebMCP can expose focused reference lookups to the agent when it needs syntax or pattern guidance.
 
-An external Strudel LSP can improve developer tooling, but it is not required for the browser runtime or agent contract.
+Browser validation uses Strudel's own transpilation and evaluation pipeline. An external Strudel LSP is optional developer tooling.
 
 ### WebMCP adapter
 
@@ -127,7 +127,7 @@ Responsibilities:
 - Unregister tools through an `AbortController` when the studio unmounts
 - Expose source validation and focused Strudel reference lookups to the agent
 
-Tools operate on musical state and commands. They do not operate on DOM selectors or pixel coordinates.
+Tools operate through musical state, commands, and source revisions.
 
 ## State ownership
 
@@ -196,13 +196,13 @@ interface TransportState {
 }
 ```
 
-The Strudel source document is the canonical musical content. UI lanes are derived from labeled Strudel source blocks. Track metadata and arrangement state belong to `ProjectState` only when they cannot be represented by the source itself.
+The Strudel source document is the canonical musical content. UI lanes are derived from labeled Strudel source blocks. `ProjectState` contains session metadata and arrangement state.
 
-The UI projection and Strudel runtime are derived from the source document. Neither is a second persistent store.
+The UI projection and Strudel runtime are derived from the source document.
 
 ### Source-defined tracks
 
-A Strudel track is a labeled source block, not an app-created object. For example:
+A Strudel track is a labeled source block. For example:
 
 ```js
 $: n("<<0 0 -2 -2> 4 7>*16")
@@ -211,7 +211,7 @@ $: n("<<0 0 -2 -2> 4 7>*16")
   .gain(.5)
 ```
 
-The UI derives its track list, block identity, source range, and visual lane from the source document. Adding, removing, or editing a track means adding, removing, or editing a valid source block. The agent does not need a separate `create_track` operation.
+The UI derives its track list, block identity, source range, and visual lane from the source document. Adding, removing, or editing a track means adding, removing, or editing a valid source block.
 
 The source contains enough metadata to render the first DAW surface:
 
@@ -224,7 +224,7 @@ The source contains enough metadata to render the first DAW surface:
 - Visualizer methods such as `_pianoroll()` and `_scope()` provide lane visualization hints.
 - Underscore-prefixed labels such as `_$:` remain source-defined blocks but are muted by Strudel.
 
-The parser produces a source index for the UI. It does not create a competing musical state model.
+The parser produces a source index for the UI.
 
 ## Bidirectional source synchronization
 
@@ -237,7 +237,7 @@ Strudel source edit → source parser → ProjectState → UI
 
 The `StrudelMapper` is the single translation boundary between the UI model and Strudel source.
 
-The mapper supports a defined canonical subset of source constructs first. It preserves source that is outside the subset and reports unmapped values instead of silently rewriting them.
+The mapper supports a defined canonical subset of source constructs first. It preserves source outside the subset and reports unmapped values.
 
 ### Global controls
 
@@ -249,7 +249,7 @@ setcpm(bpm / beatsPerCycle)
 
 For example, 84 BPM in a four-beat cycle becomes `setcpm(84 / 4)`.
 
-Meter is represented by the UI model and by the rhythmic grouping of patterns. Strudel does not impose a global bar or time-signature object, so the mapper must preserve this distinction.
+Meter is represented by the UI model and by the rhythmic grouping of patterns. The mapper preserves this distinction because Strudel expresses meter through pattern structure.
 
 Musical key uses a canonical source declaration:
 
@@ -264,9 +264,9 @@ The mapper must keep the UI value and recognized source declarations synchronize
 - Every update carries a source revision and origin.
 - UI-originated updates serialize through the mapper before runtime evaluation.
 - Source-originated updates parse through the mapper before UI state changes.
-- Equivalent source updates do not create feedback loops.
+- Equivalent source updates collapse to one revision.
 - Unsupported source remains visible and editable.
-- Invalid source produces a visible error without destroying the last valid runtime.
+- Invalid source produces a visible error while the last valid runtime continues playing.
 
 ### Commands
 
@@ -306,7 +306,7 @@ The first version stores project snapshots or reversible commands locally. The i
 
 ## WebMCP tool contract
 
-Tool names describe musical actions, not interface mechanics.
+Tool names describe musical actions.
 
 Initial tools:
 
@@ -330,7 +330,7 @@ Every mutating tool returns:
 - A short human-readable result
 - The current relevant state
 
-All musical edits operate on Strudel source directly at the runtime boundary, with validation before compilation. The WebMCP surface does not duplicate DAW operations as separate state mutations.
+All musical edits operate on Strudel source directly at the runtime boundary, with validation before compilation.
 
 Source tools operate on the source document itself:
 
@@ -338,13 +338,13 @@ Source tools operate on the source document itself:
 - `write_strudel_source` replaces the draft source and validates it atomically.
 - `patch_strudel_source` applies exact, revision-checked text edits and validates the result.
 - `inspect_strudel_state` returns source, parsed source blocks, recognized controls, diagnostics, and runtime status.
-- `validate_strudel_source` checks candidate source without changing the project.
+- `validate_strudel_source` checks candidate source and returns diagnostics.
 - `control_playback` starts, pauses, or stops the derived Strudel runtime.
 - `undo_source_edit` and `redo_source_edit` operate on source revisions.
 
-Invalid writes are not discarded. They remain as an invalid draft with structured diagnostics, while the runtime and playable project remain on the last valid revision. A successful correction promotes the draft and clears the diagnostics.
+Invalid writes remain as drafts with structured diagnostics. The runtime and playable project remain on the last valid revision. A successful correction promotes the draft and clears the diagnostics.
 
-Track creation, removal, patterns, transpose, effects, mixer values, tempo, key, and meter are all represented by source edits. The UI derives its state from the resulting source rather than maintaining parallel tool-owned state.
+Track creation, removal, patterns, transpose, effects, mixer values, tempo, key, and meter are all represented by source edits. The UI derives its state from the resulting source.
 
 The tool registry should grow from real interaction needs rather than expose the entire command dispatcher automatically.
 
@@ -370,7 +370,7 @@ Initial model:
 
 The agent can turn a natural-language description of a sound or song into a playable project. It should create or modify Strudel patterns, select track types, set arrangement metadata, and return a result the user can immediately audition.
 
-The app should support iterative refinement: the user can ask for a closer match, isolate a track, change its pitch or effects, and compare the result without losing the previous state.
+The app should support iterative refinement: the user can ask for a closer match, isolate a track, change its pitch or effects, and compare revisions.
 
 Arrangement, scenes, pattern sections, automation, and multi-project workspaces can extend this model after the first playable slice.
 
@@ -472,7 +472,7 @@ The first playable slice proves the architecture with a small but complete loop:
 - WebMCP tools expose useful musical operations with schemas.
 - The studio UI is derived deterministically from project state.
 - State changes are visible, inspectable, and undoable.
-- The app remains functional without WebMCP support.
+- The app functions as a standalone browser studio and exposes WebMCP when available.
 - `bun run build` succeeds.
 
 ## Open decisions
