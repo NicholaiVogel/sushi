@@ -8,7 +8,7 @@ Status: Draft 0.1
 
 Sushi is an agent-native browser DAW for composing music with Strudel.
 
-A human and an agent share one musical workspace. The human hears, edits, and arranges the music. The agent creates and transforms musical structures through WebMCP tools.
+A human and an agent share one musical workspace. Both can create, hear, edit, and arrange the music. The human uses the visual interface and audio feedback; the agent uses WebMCP to operate the same source and state.
 
 ## Core stack
 
@@ -106,7 +106,7 @@ candidate Strudel source
 → update the UI and audio runtime
 ```
 
-The user editor and WebMCP tools use this pipeline. A failed edit keeps the last valid playable state and exposes the error location and message.
+The user editor and WebMCP source tools use this pipeline. A failed edit keeps the draft source and diagnostics in shared client state while playback continues from `lastValid`. The human sees the diagnostic in the editor and the agent receives the same structured diagnostic in the tool result and through subsequent state reads, so either actor can correct it.
 
 The app includes a versioned, client-side Strudel reference containing common functions, sounds, templates, patterns, and working examples. WebMCP can expose focused reference lookups to the agent when it needs syntax or pattern guidance.
 
@@ -121,6 +121,7 @@ Responsibilities:
 - Register Sushi tools with `document.modelContext`
 - Expose structured input schemas
 - Dispatch tool calls through the shared command layer
+- Read and mutate the shared Strudel source document
 - Return compact, useful results
 - Register tools only when the browser exposes WebMCP
 - Unregister tools through an `AbortController` when the studio unmounts
@@ -142,15 +143,31 @@ interface ProjectState {
   tempo: number;
   swing: number;
   tracks: Track[];
+  strudelSource: SourceState;
   masterVolumeDb: number;
   transport: TransportState;
+}
+
+interface SourceState {
+  draft: string;
+  lastValid: string;
+  revision: number;
+  diagnostics: SourceDiagnostic[];
+}
+
+interface SourceDiagnostic {
+  message: string;
+  line?: number;
+  column?: number;
+  endLine?: number;
+  endColumn?: number;
 }
 
 interface Track {
   id: string;
   name: string;
+  sourceLabel: string;
   type: "drums" | "synth" | "audio" | "other";
-  pattern: string;
   transposeSemitones: number;
   effects: TrackEffects;
   muted: boolean;
@@ -179,9 +196,22 @@ interface TransportState {
 }
 ```
 
-Strudel pattern source is the canonical musical content for each track. Track metadata and arrangement state belong to `ProjectState`.
+The Strudel source document is the canonical musical content. UI lanes are derived from labeled Strudel source blocks. Track metadata and arrangement state belong to `ProjectState` only when they cannot be represented by the source itself.
 
 The Strudel runtime is derived from project state. It is not a second persistent store.
+
+### Source-defined tracks
+
+A Strudel track is a labeled source block, not an app-created object. For example:
+
+```js
+$: n("<<0 0 -2 -2> 4 7>*16")
+  .scale(key)
+  .s("bytebeat")
+  .gain(.5)
+```
+
+The UI derives its track list, block identity, source range, and visual lane from the source document. Adding, removing, or editing a track means adding, removing, or editing a valid source block. The agent does not need a separate `create_track` operation.
 
 ## Bidirectional source synchronization
 
@@ -234,18 +264,10 @@ Initial command set:
 ```text
 createProject
 renameProject
-addTrack
-removeTrack
-renameTrack
-setTrackPattern
-setTrackType
-transposeTrack
-setTrackEqualizer
-setTrackCompressor
-setTrackVolume
-setTrackPan
-setTrackMute
-setTrackSolo
+addSourceBlock
+removeSourceBlock
+editSourceBlock
+setSourceBlockParameter
 setTempo
 setSwing
 setMasterVolume
@@ -278,11 +300,16 @@ Initial tools:
 ```text
 open_studio_session
 get_project_state
-compose_from_description
+read_strudel_source
+write_strudel_source
+patch_strudel_source
+edit_strudel_source
+read_strudel_blocks
+edit_strudel_block
+remove_strudel_block
 validate_strudel_source
 lookup_strudel_reference
-create_track
-set_track_pattern
+compose_from_description
 transpose_track
 set_track_effects
 set_track_parameter
@@ -301,7 +328,20 @@ Every mutating tool returns:
 - A short human-readable result
 - The current relevant state
 
-Pattern tools accept Strudel source directly at the runtime boundary, with validation before compilation.
+Pattern and source-block tools accept Strudel source directly at the runtime boundary, with validation before compilation. Track-oriented controls target the corresponding source-defined block; they do not create a second pattern store.
+
+Source tools operate on the source document itself:
+
+- `read_strudel_source` returns the draft, last-valid source, revision, and diagnostics.
+- `write_strudel_source` replaces the draft source and validates it atomically.
+- `patch_strudel_source` applies exact, revision-checked text edits and validates the result.
+- `edit_strudel_source` applies a structured edit to a recognized source construct through the mapper.
+- `read_strudel_blocks` returns the source-defined tracks with labels, ranges, and recognized controls.
+- `edit_strudel_block` updates one source-defined track without reconstructing unrelated source.
+- `remove_strudel_block` removes one source-defined track after revision checking.
+- `validate_strudel_source` checks candidate source without changing the project.
+
+Invalid writes are not discarded. They remain as an invalid draft with structured diagnostics, while the runtime and playable project remain on the last valid revision. A successful correction promotes the draft and clears the diagnostics.
 
 The tool registry should grow from real interaction needs rather than expose the entire command dispatcher automatically.
 
@@ -312,9 +352,9 @@ Sushi presents a DAW-style visual model while preserving Strudel's pattern-based
 Initial model:
 
 - One project
-- Multiple audio lanes
+- Multiple source-defined audio lanes
 - Drum, synth, and audio-file track types
-- One Strudel pattern per track
+- One or more labeled Strudel source blocks per lane
 - Shared tempo and transport
 - Per-track mixer controls
 - Master volume from -20 dB to +5 dB, with -20 dB mapped to silence in the product UI
@@ -404,7 +444,8 @@ The first playable slice proves the architecture with a small but complete loop:
 - User can play, pause, and stop a project
 - Project contains drum, synth, and audio lanes
 - User can edit a track's Strudel source
-- Invalid Strudel source returns diagnostics and preserves the last valid playback
+- User can read, replace, patch, and semantically edit the Strudel source
+- Invalid Strudel source remains visible as a draft, returns actionable diagnostics to the editing actor, and preserves the last valid playback
 - UI BPM changes update the underlying Strudel source
 - Strudel source changes update the UI BPM state
 - UI and source remain synchronized for the canonical subset
@@ -413,8 +454,8 @@ The first playable slice proves the architecture with a small but complete loop:
 - User can transpose a track
 - User can adjust master volume
 - Agent can inspect project state
-- Agent can create a track
-- Agent can change a pattern
+- Agent can inspect source-defined tracks
+- Agent can add, remove, or change a source block through source tools
 - Agent can compose from a natural-language description
 - UI reflects agent changes
 - Undo restores the previous project state
@@ -438,7 +479,7 @@ The first playable slice proves the architecture with a small but complete loop:
 - Audio sample and sound-bank strategy
 - Project serialization format and share links
 - Tool approval behavior for large or destructive changes
-- Whether collaboration requires a server during the challenge
+- Share and export behavior for client-only projects
 
 ## References
 
