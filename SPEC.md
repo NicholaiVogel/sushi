@@ -626,6 +626,7 @@ The work is staged as progressively complete vertical slices:
 - Transport stops at `songEndCycle`.
 - Saved projects reopen with the same source and local assets.
 - Stale agent edits fail with no mutation.
+- The [Strudel Open Songs](https://github.com/dissonancefm/Strudel-Open-Songs) corpus exercises source loading, parsing, mapping, validation, and playback across complete songs.
 - The app functions as a standalone browser studio and exposes WebMCP when available.
 - `bun run build` succeeds.
 
@@ -643,4 +644,5 @@ The work is staged as progressively complete vertical slices:
 - [WebMCP](https://github.com/webmachinelearning/webmcp)
 - [WebMCP Challenge](https://openai.com/webmcp-challenge/)
 - [Strudel](https://codeberg.org/uzu/strudel)
+- [Strudel Open Songs](https://github.com/dissonancefm/Strudel-Open-Songs)
 - [Using Strudel in your Project](https://strudel.cc/technical-manual/project-start/)
