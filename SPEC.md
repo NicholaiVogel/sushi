@@ -17,19 +17,27 @@ A human and an agent share one musical workspace. The human hears, edits, and ar
 - Strudel: musical runtime, pattern language, scheduling, synthesis, and audio
 - `@strudel/web`: Strudel integration for a custom interface
 - WebMCP: agent-facing tool surface
-- `@json-render/core`: UI specification and catalog primitives
-- `@json-render/react`: rendering agent-generated UI
+- json-render: under evaluation as an optional dynamic UI layer
 - Cloudflare Pages: deployment target
 
 ## Product loop
 
-1. User opens a studio session.
-2. User asks the agent for a musical change.
+1. User or agent opens a studio session.
+2. User describes a sound, song, or theme, or asks for a musical change.
 3. The agent calls a Sushi tool.
 4. The tool updates the canonical composition state.
 5. Sushi compiles the state into Strudel runtime patterns.
 6. The interface updates and the user auditions the result.
 7. The user edits, accepts, or asks for another change.
+
+## Interface direction
+
+- Dark, monochrome undertones
+- Distinctive and professional visual language
+- Friendly, legible controls for beginners
+- Core controls remain visible and usable
+- Resizable panels and sections through mouse dragging
+- Flexible layout with clear visual hierarchy
 
 ## Architecture
 
@@ -38,7 +46,6 @@ Astro page
 └── React Studio island
     ├── Studio state and command dispatcher
     ├── WebMCP tool registration
-    ├── json-render surface and action registry
     └── Strudel adapter
         └── @strudel/web / Web Audio
 ```
@@ -69,7 +76,7 @@ React owns the interactive DAW surface:
 - Agent-generated panels
 - Playback state
 
-The studio uses one command dispatcher for human actions, agent actions, and json-render actions.
+The studio uses one command dispatcher for human actions and agent actions.
 
 ### Strudel adapter
 
@@ -101,21 +108,6 @@ Responsibilities:
 
 Tools operate on musical state and commands. They do not operate on DOM selectors or pixel coordinates.
 
-### json-render surface
-
-json-render provides bounded, dynamic UI generated from structured specifications.
-
-Responsibilities:
-
-- Render agent-generated inspectors, controls, and musical views
-- Constrain generated UI to Sushi's registered component catalog
-- Route generated actions through the shared command dispatcher
-- Render progressive UI specifications when useful
-
-The json-render specification is a view projection. Project state remains the source of truth.
-
-Static studio chrome remains ordinary React UI. json-render is used where the agent needs to create or reshape a useful control surface.
-
 ## State ownership
 
 ### Canonical project state
@@ -130,18 +122,35 @@ interface ProjectState {
   tempo: number;
   swing: number;
   tracks: Track[];
+  masterVolumeDb: number;
   transport: TransportState;
 }
 
 interface Track {
   id: string;
   name: string;
-  role: "drums" | "bass" | "chords" | "melody" | "texture" | "other";
+  type: "drums" | "synth" | "audio" | "other";
   pattern: string;
+  transposeSemitones: number;
+  effects: TrackEffects;
   muted: boolean;
   solo: boolean;
   volume: number;
   pan: number;
+}
+
+interface TrackEffects {
+  equalizer: {
+    low: number;
+    mid: number;
+    high: number;
+  };
+  compressor: {
+    threshold: number;
+    ratio: number;
+    attack: number;
+    release: number;
+  };
 }
 
 interface TransportState {
@@ -167,12 +176,17 @@ addTrack
 removeTrack
 renameTrack
 setTrackPattern
+setTrackType
+transposeTrack
+setTrackEqualizer
+setTrackCompressor
 setTrackVolume
 setTrackPan
 setTrackMute
 setTrackSolo
 setTempo
 setSwing
+setMasterVolume
 play
 stop
 undo
@@ -200,11 +214,16 @@ Tool names describe musical actions, not interface mechanics.
 Initial tools:
 
 ```text
+open_studio_session
 get_project_state
+compose_from_description
 create_track
 set_track_pattern
+transpose_track
+set_track_effects
 set_track_parameter
 set_transport
+set_master_volume
 play_project
 stop_project
 undo_change
@@ -222,39 +241,6 @@ Pattern tools accept Strudel source directly at the runtime boundary, with valid
 
 The tool registry should grow from real interaction needs rather than expose the entire command dispatcher automatically.
 
-## json-render contract
-
-The catalog defines the components and actions that Sushi permits.
-
-Initial component vocabulary:
-
-```text
-TrackList
-Track
-PatternEditor
-Transport
-TempoControl
-Mixer
-Inspector
-Arrangement
-AgentMessage
-```
-
-Initial action vocabulary:
-
-```text
-selectTrack
-setPattern
-setParameter
-toggleMute
-toggleSolo
-setTempo
-play
-stop
-```
-
-Generated UI actions call the same command dispatcher as ordinary React controls.
-
 ## Musical model
 
 Sushi presents a DAW-style visual model while preserving Strudel's pattern-based musical model.
@@ -262,12 +248,22 @@ Sushi presents a DAW-style visual model while preserving Strudel's pattern-based
 Initial model:
 
 - One project
-- Multiple tracks
+- Multiple audio lanes
+- Drum, synth, and audio-file track types
 - One Strudel pattern per track
 - Shared tempo and transport
-- Track-level mute, solo, volume, and pan
+- Per-track mixer controls
+- Master volume from -20 dB to +5 dB, with -20 dB mapped to silence in the product UI
+- Per-track equalizer and compressor controls
+- Per-track transpose from -12 to +12 semitones per operation, with repeated operations supported
 - Pattern editing and replacement
 - Derived visual lanes
+
+### Agent composition
+
+The agent can turn a natural-language description of a sound or song into a playable project. It should create or modify Strudel patterns, select track types, set arrangement metadata, and return a result the user can immediately audition.
+
+The app should support iterative refinement: the user can ask for a closer match, isolate a track, change its pitch or effects, and compare the result without losing the previous state.
 
 Arrangement, scenes, pattern sections, automation, and multi-project workspaces can extend this model after the first playable slice.
 
@@ -317,16 +313,13 @@ src/
       adapter.ts
     webmcp/
       tools.ts
-    json-render/
-      catalog.ts
-      renderer.ts
   pages/
     index.astro
 public/
 SPEC.md
 ```
 
-The exact component split can evolve. The boundaries between project state, Strudel, WebMCP, and json-render should remain explicit.
+The exact component split can evolve. The boundaries between project state, Strudel, and WebMCP should remain explicit.
 
 ## First vertical slice
 
@@ -335,12 +328,17 @@ The first playable slice proves the architecture with a small but complete loop:
 - Studio page loads in Astro
 - React island mounts
 - Strudel initializes through the adapter
+- Agent can open or restore a studio session
 - User can play and stop a project
-- Project contains four tracks
+- Project contains drum, synth, and audio lanes
 - User can edit a track pattern
+- User can adjust per-track mixer and basic effects
+- User can transpose a track
+- User can adjust master volume
 - Agent can inspect project state
 - Agent can create a track
 - Agent can change a pattern
+- Agent can compose from a natural-language description
 - UI reflects agent changes
 - Undo restores the previous project state
 - Project can be saved and loaded locally
@@ -351,7 +349,7 @@ The first playable slice proves the architecture with a small but complete loop:
 - Strudel is the only musical execution engine.
 - Human and agent actions produce the same state transitions.
 - WebMCP tools expose useful musical operations with schemas.
-- json-render can render a bounded agent-generated control surface.
+- The studio UI is derived deterministically from project state.
 - State changes are visible, inspectable, and undoable.
 - The app remains functional without WebMCP support.
 - `bun run build` succeeds.
@@ -362,7 +360,6 @@ The first playable slice proves the architecture with a small but complete loop:
 - Pattern representation for multi-section arrangements
 - Audio sample and sound-bank strategy
 - Project serialization format and share links
-- Whether agent-generated UI should be ephemeral or saveable
 - Tool approval behavior for large or destructive changes
 - Whether collaboration requires a server during the challenge
 
@@ -372,4 +369,3 @@ The first playable slice proves the architecture with a small but complete loop:
 - [WebMCP Challenge](https://openai.com/webmcp-challenge/)
 - [Strudel](https://codeberg.org/uzu/strudel)
 - [Using Strudel in your Project](https://strudel.cc/technical-manual/project-start/)
-- [json-render](https://github.com/vercel-labs/json-render)
