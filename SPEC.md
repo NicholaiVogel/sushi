@@ -226,6 +226,22 @@ The source contains enough metadata to render the first DAW surface:
 
 The parser produces a source index for the UI.
 
+### Temporal arrangement
+
+Live label changes control immediate performance state. Song and track in/out points use Strudel's pattern timing primitives:
+
+- `arrange(...)` sequences sections with explicit cycle durations.
+- `seqPLoop(...)` places patterns at explicit start and stop cycle positions, including overlaps.
+- `mask(...)` and `when(...)` express recurring conditional activation.
+
+Sushi stores timeline positions in seconds in the UI and converts them to Strudel cycles:
+
+```text
+cycles = seconds × BPM / (60 × beatsPerCycle)
+```
+
+At 84 BPM with four beats per cycle, 30 seconds is 10.5 cycles. The source mapper writes the resulting timing expression into the track's source block. The arrangement boundary provides the song duration, and the transport stops at that boundary.
+
 ## Bidirectional source synchronization
 
 The first vertical slice must prove both directions:
@@ -453,6 +469,8 @@ The first playable slice proves the architecture with a small but complete loop:
 - Strudel source changes update the UI BPM state
 - UI and source remain synchronized for the canonical subset
 - User can adjust the BPM
+- User can set song and track in/out points
+- Playback stops at the derived song duration
 - User can adjust per-track mixer and basic effects
 - User can transpose a track
 - User can adjust master volume
