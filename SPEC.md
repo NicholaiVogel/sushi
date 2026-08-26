@@ -14,6 +14,7 @@ A human and an agent share one musical workspace. Both can create, hear, edit, a
 
 - Astro: application shell and static deployment
 - React: interactive studio island
+- `shadcn/ui`: selective React component foundation
 - Strudel: musical runtime, pattern language, scheduling, synthesis, and audio
 - `@strudel/web`: Strudel integration for a custom interface
 - WebMCP: agent-facing tool surface
@@ -37,6 +38,31 @@ A human and an agent share one musical workspace. Both can create, hear, edit, a
 - Core controls remain visible and usable
 - Resizable panels and sections through mouse dragging
 - Flexible layout with clear visual hierarchy
+
+### UI component foundation
+
+Sushi uses `shadcn/ui` selectively for accessible, interaction-focused React components:
+
+- Buttons
+- Sliders
+- Toggles
+- Selects
+- Tooltips
+- Tabs
+- Scroll areas
+- Resizable panels
+- Dialogs and popovers
+- Separators
+
+The component styling follows Sushi's legible visual system and semantic design tokens. DAW-specific surfaces are custom components:
+
+- Timeline
+- Track lanes
+- Piano roll
+- Waveform views
+- Meter displays
+- Transport controls
+- Source-to-control mapping
 
 ## Architecture
 
@@ -435,6 +461,7 @@ Default Strudel templates, sounds, and patterns are loaded and used client-side.
 ```text
 src/
   components/
+    ui/
     Studio.tsx
     studio/
   lib/
