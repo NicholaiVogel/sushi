@@ -16,7 +16,21 @@ import {
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
 import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
-import { StrudelAdapter, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
+import { StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
+import {
+	applyTextEdits,
+	registerWebMcpTools,
+	sourceDiff,
+	type SourceMutationInput,
+	type SourcePatchInput,
+	type WebMcpController,
+	type WebMcpMutationResult,
+	type WebMcpPlaybackAction,
+	type WebMcpPlaybackResult,
+	type WebMcpRegistration,
+	type WebMcpStateSnapshot,
+	type WebMcpValidationResult,
+} from '../lib/webmcp/tools';
 
 type StudioPhase = 'booting' | 'ready' | 'validating' | 'error';
 type PersistenceState = 'loading' | 'ready' | 'unavailable';
@@ -40,6 +54,30 @@ type StudioCommand =
 	| { type: 'pause' }
 	| { type: 'seek'; cycle: number }
 	| { type: 'stop' };
+
+type DispatchResult = { ok: true } | { ok: false; error?: unknown };
+
+interface SourceHistoryEntry {
+	before: string;
+	after: string;
+	beforeRevision: number;
+	afterRevision: number;
+}
+
+interface SourceHistoryState {
+	cursorSource: string;
+	undo: SourceHistoryEntry[];
+	redo: SourceHistoryEntry[];
+}
+
+interface CommitSourceResult {
+	ok: boolean;
+	changed: boolean;
+	previousSource: string;
+	source: string;
+	revision: number;
+	error?: SourceDiagnostic;
+}
 
 function createInitialStudioState(): StudioState {
 	const project = createInitialProject();
@@ -105,6 +143,7 @@ function getDiagnosticLocation(diagnostic: SourceDiagnostic): string {
 const BEAT_LABELS = ['1', '1.1', '1.2', '1.3', '2', '2.1', '2.2', '2.3', '3', '3.1', '3.2', '3.3', '4', '4.1', '4.2', '4.3'];
 const TRACK_COLORS = ['#d9ff68', '#8fe1ff', '#f0a3c7', '#c7a6ff'];
 const TRACK_LEVELS = [72, 46, 61, 38, 57, 68, 44, 76, 50, 64, 40, 70, 55, 47, 63, 42];
+const SOURCE_HISTORY_LIMIT = 100;
 
 function getLineNumbers(source: string): number[] {
 	return Array.from({ length: Math.max(1, source.split('\n').length) }, (_, index) => index + 1);
@@ -138,6 +177,35 @@ function formatKey(key: string): string {
 	return key.replace(':', ' ').toUpperCase();
 }
 
+function sourceEntityIds(state: WebMcpStateSnapshot): string[] {
+	return ['source', ...state.tracks.map((track) => track.id)];
+}
+
+function makeMutationResult(
+	state: WebMcpStateSnapshot,
+	action: string,
+	transactionId: string,
+	beforeSource: string,
+	beforeRevision: number,
+	ok: boolean,
+	message: string,
+	error?: { code: string; message: string; details?: Record<string, unknown> },
+): WebMcpMutationResult {
+	const diff = sourceDiff(beforeSource, state.source.draft, beforeRevision, state.source.revision);
+	return {
+		ok,
+		action,
+		affectedEntityIds: sourceEntityIds(state),
+		message,
+		state,
+		revision: state.source.revision,
+		activeRevision: state.source.activeRevision,
+		transactionId,
+		...(diff ? { diff } : {}),
+		...(error ? { error } : {}),
+	};
+}
+
 export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
 	const studioRef = useRef(studio);
@@ -148,6 +216,14 @@ export default function Studio() {
 	const timingDragRef = useRef<{ trackId: string; edge: 'start' | 'end'; lane: HTMLElement } | null>(null);
 	const timelineSeekDragRef = useRef<HTMLElement | null>(null);
 	const timelineSeekCycleRef = useRef<number | null>(null);
+	const sourceHistoryRef = useRef<SourceHistoryState>({
+		cursorSource: createInitialProject().source.draft,
+		undo: [],
+		redo: [],
+	});
+	const sourceTransactionsRef = useRef(new Map<string, WebMcpMutationResult>());
+	const webmcpRegistrationRef = useRef<WebMcpRegistration | null>(null);
+	const webmcpAvailableRef = useRef(false);
 
 	const patchStudio = useCallback((patch: Partial<StudioState>) => {
 		const next = { ...studioRef.current, ...patch };
@@ -182,6 +258,12 @@ export default function Studio() {
 			if (!mountedRef.current) return;
 			const project = stored?.project ?? fallbackProject;
 			const activeRevision = stored?.activeRevision ?? project.source.revision;
+			sourceHistoryRef.current = {
+				cursorSource: project.source.draft,
+				undo: [],
+				redo: [],
+			};
+			sourceTransactionsRef.current.clear();
 			patchStudio({
 				projectName: project.name,
 				draft: project.source.draft,
@@ -257,19 +339,30 @@ export default function Studio() {
 	}, [patchStudio, studio.activeRevision, studio.draft, studio.lastValid, studio.persistenceState, studio.projectName, studio.revision, studio.songEndCycle]);
 
 	const commitSource = useCallback(
-		async (source: string): Promise<boolean> => {
+		async (source: string, options: { recordHistory?: boolean } = {}): Promise<CommitSourceResult> => {
 			const adapter = adapterRef.current;
-			if (!adapter) return false;
+			const current = studioRef.current;
+			const previousSource = sourceHistoryRef.current.cursorSource;
+			if (!adapter) return { ok: false, changed: false, previousSource, source, revision: current.revision, error: diagnosticFromError(current.revision, new Error('The Strudel runtime is not ready.'), source) };
+			if (source === current.lastValid && current.diagnostics.length === 0 && source === current.draft) {
+				sourceHistoryRef.current.cursorSource = source;
+				return { ok: true, changed: false, previousSource, source, revision: current.revision };
+			}
 
-			const baseRevision = studioRef.current.revision;
+			const baseRevision = current.revision;
 			const revision = baseRevision + 1;
 			patchStudio({ draft: source, revision, phase: 'validating', diagnostics: [] });
-			const result = await adapter.evaluateSource(source, {
-				autoplay: false,
-				restoreSource: studioRef.current.lastValid,
-			});
+			let result: AdapterResult;
+			try {
+				result = await adapter.evaluateSource(source, {
+					autoplay: false,
+					restoreSource: current.lastValid,
+				});
+			} catch (error) {
+				result = { ok: false, error };
+			}
 
-			if (!mountedRef.current || studioRef.current.revision !== revision) return false;
+			if (!mountedRef.current || studioRef.current.revision !== revision) return { ok: false, changed: false, previousSource, source, revision };
 			if (result.ok) {
 				patchStudio({
 					lastValid: source,
@@ -278,15 +371,28 @@ export default function Studio() {
 					phase: 'ready',
 					runtime: { ...studioRef.current.runtime, activeRevision: revision },
 				});
-				return true;
+				sourceHistoryRef.current.cursorSource = source;
+				if (options.recordHistory !== false && source !== previousSource) {
+					sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
+					if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
+					sourceHistoryRef.current.redo = [];
+				}
+				return { ok: true, changed: source !== previousSource, previousSource, source, revision };
 			}
 
+			const diagnostic = diagnosticFromError(revision, result.error, source);
 			patchStudio({
 				phase: 'error',
-				diagnostics: [diagnosticFromError(revision, result.error, source)],
+				diagnostics: [diagnostic],
 				runtime: { ...studioRef.current.runtime, activeRevision: studioRef.current.activeRevision },
 			});
-			return false;
+			sourceHistoryRef.current.cursorSource = source;
+			if (options.recordHistory !== false && source !== previousSource) {
+				sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
+				if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
+				sourceHistoryRef.current.redo = [];
+			}
+			return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
 		},
 		[patchStudio],
 	);
@@ -398,15 +504,15 @@ export default function Studio() {
 	);
 
 	const dispatch = useCallback(
-		async (command: StudioCommand) => {
+		async (command: StudioCommand): Promise<DispatchResult> => {
 			if (command.type === 'writeSource') {
 				cancelPendingTrackCommit();
-				await commitSource(command.source);
-				return;
+				const result = await commitSource(command.source);
+				return result.ok ? { ok: true } : { ok: false, error: result.error };
 			}
 
 			const adapter = adapterRef.current;
-			if (!adapter || studioRef.current.phase === 'booting' || studioRef.current.phase === 'validating') return;
+			if (!adapter || studioRef.current.phase === 'booting' || studioRef.current.phase === 'validating') return { ok: false, error: new Error('The Strudel runtime is not ready.') };
 
 			if (command.type === 'play') {
 				cancelPendingTrackCommit();
@@ -414,7 +520,7 @@ export default function Studio() {
 				const draftHasNotBeenEvaluated = current.diagnostics.length === 0;
 				if ((current.draft !== current.lastValid && draftHasNotBeenEvaluated) || current.activeRevision === null) {
 					const committed = await commitSource(current.draft);
-					if (!committed) return;
+					if (!committed.ok) return { ok: false, error: committed.error };
 				}
 
 				const result = await adapter.play(current.songEndCycle);
@@ -434,8 +540,9 @@ export default function Studio() {
 						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
 						runtime: { ...studioRef.current.runtime, audioState: 'error', transport: 'stopped' },
 					});
+					return { ok: false, error: result.error };
 				}
-				return;
+				return { ok: true };
 			}
 
 			if (command.type === 'pause') {
@@ -451,8 +558,9 @@ export default function Studio() {
 						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
 						runtime: { ...studioRef.current.runtime, audioState: 'error' },
 					});
+					return { ok: false, error: result.error };
 				}
-				return;
+				return { ok: true };
 			}
 
 			if (command.type === 'seek') {
@@ -465,8 +573,9 @@ export default function Studio() {
 						phase: 'error',
 						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
 					});
+					return { ok: false, error: result.error };
 				}
-				return;
+				return { ok: true };
 			}
 
 			const result = await adapter.stop();
@@ -478,13 +587,267 @@ export default function Studio() {
 			} else {
 				patchStudio({
 					phase: 'error',
-					diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
+						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
 					runtime: { ...studioRef.current.runtime, audioState: 'error', transport: 'stopped' },
 				});
+				return { ok: false, error: result.error };
 			}
+			return { ok: true };
 		},
 		[cancelPendingTrackCommit, commitSource, patchStudio],
 	);
+
+	const getWebMcpState = useCallback((): WebMcpStateSnapshot => {
+		const current = studioRef.current;
+		const project = createInitialProject();
+		const globals = getSourceGlobals(current.lastValid);
+		const tracks = getSourceBlockDetails(current.lastValid).map((track) => ({
+			id: track.id,
+			name: track.name,
+			type: track.type,
+			line: track.line,
+			...(track.label === undefined ? {} : { label: track.label }),
+			...(track.expression === undefined ? {} : { expression: track.expression }),
+			timing: track.timing,
+			gain: { ...(track.gain === undefined ? {} : { value: track.gain }), editable: track.gainEditable },
+			pan: { ...(track.pan === undefined ? {} : { value: track.pan }), editable: track.panEditable },
+			muted: track.muted,
+			soloed: track.soloed,
+		}));
+		return {
+			project: { id: project.id, name: current.projectName },
+			source: {
+				draft: current.draft,
+				lastValid: current.lastValid,
+				revision: current.revision,
+				activeRevision: current.activeRevision,
+			},
+			timeline: {
+				bpm: globals.bpm,
+				quarterNotesPerCycle: globals.quarterNotesPerCycle,
+				key: globals.key,
+				songEndCycle: current.songEndCycle,
+			},
+			tracks,
+			diagnostics: current.diagnostics,
+			runtime: current.runtime,
+			phase: current.phase,
+			persistenceState: current.persistenceState,
+			webmcp: { available: webmcpAvailableRef.current },
+		};
+	}, []);
+
+	const rememberMutation = useCallback((result: WebMcpMutationResult): WebMcpMutationResult => {
+		if (result.transactionId) {
+			sourceTransactionsRef.current.set(result.transactionId, result);
+			while (sourceTransactionsRef.current.size > SOURCE_HISTORY_LIMIT) {
+				const first = sourceTransactionsRef.current.keys().next().value as string | undefined;
+				if (first === undefined) break;
+				sourceTransactionsRef.current.delete(first);
+			}
+		}
+		return result;
+	}, []);
+
+	const sourceMutationForWebMcp = useCallback(
+		async (action: string, input: SourceMutationInput): Promise<WebMcpMutationResult> => {
+			const cached = sourceTransactionsRef.current.get(input.transactionId);
+			if (cached) return cached;
+
+			const current = studioRef.current;
+			if (input.baseRevision !== current.revision) {
+				const state = getWebMcpState();
+				return {
+					ok: false,
+					action,
+					affectedEntityIds: sourceEntityIds(state),
+					message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+					state,
+					revision: state.source.revision,
+					activeRevision: state.source.activeRevision,
+					transactionId: input.transactionId,
+					error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
+					conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
+				};
+			}
+
+			const beforeSource = current.draft;
+			let result: CommitSourceResult;
+			try {
+				result = await commitSource(input.source);
+			} catch (error) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The source transaction could not be completed.', { code: 'SOURCE_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) }));
+			}
+
+			const state = getWebMcpState();
+			if (result.ok) {
+				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, `Source accepted at ${formatRevision(state.source.revision)}.`));
+			}
+
+			const diagnostic = result.error;
+			return rememberMutation(makeMutationResult(
+				state,
+				action,
+				input.transactionId,
+				beforeSource,
+				input.baseRevision,
+				false,
+				`Source draft updated, but Strudel rejected it; ${formatRevision(state.source.activeRevision)} remains active.`,
+				{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the source.', details: diagnostic ? { diagnostic } : undefined },
+			));
+		},
+		[commitSource, getWebMcpState, rememberMutation],
+	);
+
+	const patchSourceForWebMcp = useCallback(
+		async (input: SourcePatchInput): Promise<WebMcpMutationResult> => {
+			const cached = sourceTransactionsRef.current.get(input.transactionId);
+			if (cached) return cached;
+			const current = studioRef.current;
+			if (input.baseRevision !== current.revision) {
+				return sourceMutationForWebMcp('patch_strudel_source', { source: current.draft, baseRevision: input.baseRevision, transactionId: input.transactionId });
+			}
+			const applied = applyTextEdits(current.draft, input.edits);
+			if (!applied.ok) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, 'patch_strudel_source', input.transactionId, current.draft, current.revision, false, 'Patch rejected before validation; the source was not changed.', applied.error));
+			}
+			if (applied.source === current.draft) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, 'patch_strudel_source', input.transactionId, current.draft, current.revision, true, 'No source changes were requested.'));
+			}
+			return sourceMutationForWebMcp('patch_strudel_source', { source: applied.source, baseRevision: input.baseRevision, transactionId: input.transactionId });
+		},
+		[getWebMcpState, rememberMutation, sourceMutationForWebMcp],
+	);
+
+	const validateSourceForWebMcp = useCallback(
+		async (source?: string): Promise<WebMcpValidationResult> => {
+			const candidate = source ?? studioRef.current.draft;
+			const revision = studioRef.current.revision;
+			const adapter = adapterRef.current;
+			if (!adapter) {
+				const diagnostic = diagnosticFromError(revision, new Error('The Strudel runtime is not ready.'), candidate);
+				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision, state: getWebMcpState(), error: { code: 'VALIDATION_UNAVAILABLE', message: diagnostic.message } };
+			}
+
+			try {
+				const result = await adapter.validateSource(candidate, studioRef.current.lastValid);
+				if (result.ok) return { ok: true, action: 'validate_strudel_source', source: candidate, diagnostics: [], message: 'Strudel accepted the candidate source.', revision, state: getWebMcpState() };
+				const diagnostic = diagnosticFromError(revision, result.error, candidate);
+				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision, state: getWebMcpState(), error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
+			} catch (error) {
+				const diagnostic = diagnosticFromError(revision, error, candidate);
+				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision, state: getWebMcpState(), error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
+			}
+		},
+		[getWebMcpState],
+	);
+
+	const controlPlaybackForWebMcp = useCallback(
+		async (input: { action: WebMcpPlaybackAction; cycle?: number }): Promise<WebMcpPlaybackResult> => {
+			const command: StudioCommand = input.action === 'seek'
+				? { type: 'seek', cycle: input.cycle ?? 0 }
+				: input.action === 'pause' ? { type: 'pause' } : input.action === 'stop' ? { type: 'stop' } : { type: 'play' };
+			const result = await dispatch(command);
+			const state = getWebMcpState();
+			if (result.ok) {
+				const message = input.action === 'seek' ? `Playhead moved to cycle ${formatCycle(state.runtime.currentCycle)}.` : `Playback ${input.action === 'resume' ? 'resumed' : `${input.action}ed`}.`;
+				return { ok: true, action: `control_playback:${input.action}`, affectedEntityIds: ['transport'], message, state, revision: state.source.revision, activeRevision: state.source.activeRevision };
+			}
+			const message = result.error instanceof Error ? result.error.message : String(result.error ?? 'Playback command failed.');
+			return { ok: false, action: `control_playback:${input.action}`, affectedEntityIds: ['transport'], message, state, revision: state.source.revision, activeRevision: state.source.activeRevision, error: { code: 'PLAYBACK_FAILED', message } };
+		},
+		[dispatch, getWebMcpState],
+	);
+
+	const undoSourceForWebMcp = useCallback(
+		async (input: Omit<SourceMutationInput, 'source'>): Promise<WebMcpMutationResult> => {
+			const cached = sourceTransactionsRef.current.get(input.transactionId);
+			if (cached) return cached;
+			const current = studioRef.current;
+			if (input.baseRevision !== current.revision) {
+				const state = getWebMcpState();
+				return { ok: false, action: 'undo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' }, conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision } };
+			}
+			const entry = sourceHistoryRef.current.undo[sourceHistoryRef.current.undo.length - 1];
+			if (!entry) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to undo.', { code: 'NO_UNDO', message: 'The shared source history is already at its oldest revision.' }));
+			}
+			const result = await commitSource(entry.before, { recordHistory: false });
+			if (!result.ok) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Undo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Undo source was rejected.' }));
+			}
+			sourceHistoryRef.current.undo.pop();
+			sourceHistoryRef.current.redo.push(entry);
+			if (sourceHistoryRef.current.redo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.redo.shift();
+			const state = getWebMcpState();
+			return rememberMutation(makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Undid source edit; now at ${formatRevision(state.source.revision)}.`));
+		},
+		[commitSource, getWebMcpState, rememberMutation],
+	);
+
+	const redoSourceForWebMcp = useCallback(
+		async (input: Omit<SourceMutationInput, 'source'>): Promise<WebMcpMutationResult> => {
+			const cached = sourceTransactionsRef.current.get(input.transactionId);
+			if (cached) return cached;
+			const current = studioRef.current;
+			if (input.baseRevision !== current.revision) {
+				const state = getWebMcpState();
+				return { ok: false, action: 'redo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' }, conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision } };
+			}
+			const entry = sourceHistoryRef.current.redo[sourceHistoryRef.current.redo.length - 1];
+			if (!entry) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to redo.', { code: 'NO_REDO', message: 'The shared source history is already at its newest revision.' }));
+			}
+			const result = await commitSource(entry.after, { recordHistory: false });
+			if (!result.ok) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Redo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Redo source was rejected.' }));
+			}
+			sourceHistoryRef.current.redo.pop();
+			sourceHistoryRef.current.undo.push(entry);
+			if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
+			const state = getWebMcpState();
+			return rememberMutation(makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Redid source edit; now at ${formatRevision(state.source.revision)}.`));
+		},
+		[commitSource, getWebMcpState, rememberMutation],
+	);
+
+	const webmcpController = useMemo<WebMcpController>(() => ({
+		getState: getWebMcpState,
+		writeSource: (input) => sourceMutationForWebMcp('write_strudel_source', input),
+		patchSource: patchSourceForWebMcp,
+		validateSource: validateSourceForWebMcp,
+		controlPlayback: controlPlaybackForWebMcp,
+		undoSourceEdit: undoSourceForWebMcp,
+		redoSourceEdit: redoSourceForWebMcp,
+	}), [controlPlaybackForWebMcp, getWebMcpState, patchSourceForWebMcp, redoSourceForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
+
+	useEffect(() => {
+		let disposed = false;
+		let registration: WebMcpRegistration | null = null;
+		void registerWebMcpTools(webmcpController).then((nextRegistration) => {
+			if (disposed) {
+				nextRegistration.dispose();
+				return;
+			}
+			registration = nextRegistration;
+			webmcpRegistrationRef.current = nextRegistration;
+			webmcpAvailableRef.current = nextRegistration.available;
+		});
+		return () => {
+			disposed = true;
+			registration?.dispose();
+			webmcpRegistrationRef.current?.dispose();
+			webmcpRegistrationRef.current = null;
+			webmcpAvailableRef.current = false;
+		};
+	}, [webmcpController]);
 
 	const seekTimelineAtClientX = useCallback(
 		(clientX: number, ruler: HTMLElement) => {
@@ -595,7 +958,7 @@ export default function Studio() {
 					</div>
 					<div className="topbar-transport" aria-label="Transport controls">
 						<div className="topbar-source-actions" aria-label="Source actions">
-							<button className="transport-button source-action-button source-action-revert" type="button" onClick={() => { cancelPendingTrackCommit(); patchStudio({ draft: studioRef.current.lastValid }); }} disabled={!isDirty || isBusy} aria-label="Revert source draft" title="Revert source draft">
+							<button className="transport-button source-action-button source-action-revert" type="button" onClick={() => { cancelPendingTrackCommit(); sourceHistoryRef.current.cursorSource = studioRef.current.lastValid; patchStudio({ draft: studioRef.current.lastValid, diagnostics: [], phase: 'ready' }); }} disabled={!isDirty || isBusy} aria-label="Revert source draft" title="Revert source draft">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v4" /><path d="M5.2 11A7.5 7.5 0 1 0 7.4 5.6L5 7" /></svg>
 							</button>
 							<button className="transport-button source-action-button source-action-commit" type="button" onClick={() => void dispatch({ type: 'writeSource', source: studioRef.current.draft })} disabled={!isDirty || isBusy} aria-label="Commit source" title="Commit source">

@@ -115,6 +115,17 @@ export class StrudelAdapter {
 		return evaluation;
 	}
 
+	/**
+	 * Check a candidate through the same Strudel evaluator without promoting it
+	 * to project state. The accepted source is evaluated again afterwards so a
+	 * validation request cannot leave a candidate pattern running.
+	 */
+	public async validateSource(source: string, restoreSource: string): Promise<AdapterResult> {
+		const validation = this.evaluationQueue.then(() => this.validateSourceNow(source, restoreSource));
+		this.evaluationQueue = validation.then(() => undefined, () => undefined);
+		return validation;
+	}
+
 	private async evaluateSourceNow(
 		source: string,
 		options: { autoplay?: boolean; restoreSource?: string },
@@ -124,6 +135,18 @@ export class StrudelAdapter {
 		if (!result.ok && options.restoreSource && options.restoreSource !== source) {
 			await this.evaluateRaw(options.restoreSource, false);
 		}
+		return result;
+	}
+
+	private async validateSourceNow(source: string, restoreSource: string): Promise<AdapterResult> {
+		await this.init();
+		const previousTransport = this.runtime.transport ?? 'stopped';
+		const previousCycle = this.runtime.currentCycle ?? 0;
+		const result = await this.evaluateRaw(source, false);
+
+		if (restoreSource !== source) await this.evaluateRaw(restoreSource, false);
+		await this.restoreTransport(previousTransport, previousCycle);
+
 		return result;
 	}
 
@@ -149,6 +172,31 @@ export class StrudelAdapter {
 		} finally {
 			if (this.activeEvaluation === currentEvaluation) this.activeEvaluation = undefined;
 		}
+	}
+
+	private async restoreTransport(transport: TransportState, cycle: number): Promise<void> {
+		if (!this.repl) return;
+
+		try {
+			this.setSchedulerCycle(cycle);
+		} catch {
+			// Validation still restores the source if this scheduler does not expose
+			// a writable cursor. The next explicit seek can establish its position.
+		}
+
+		if (transport === 'playing') {
+			await this.repl.start();
+			this.startCycleTimer();
+		} else if (transport === 'paused') {
+			this.repl.pause();
+			this.stopCycleTimer();
+		} else {
+			this.repl.stop();
+			this.module?.hush?.();
+			this.stopCycleTimer();
+		}
+
+		this.setRuntime({ transport, currentCycle: cycle });
 	}
 
 	public async play(songEndCycle?: number): Promise<AdapterResult> {
@@ -216,20 +264,7 @@ export class StrudelAdapter {
 			const wasPaused = this.runtime.transport === 'paused';
 			if (wasPlaying) this.repl.pause();
 
-			const scheduler = this.repl.scheduler;
-			if (typeof scheduler.setCycle === 'function') {
-				scheduler.setCycle(targetCycle);
-			} else if (typeof scheduler.stop === 'function' && 'lastEnd' in scheduler) {
-				// Cyclist (the default @strudel/web scheduler) keeps its current
-				// cycle in lastEnd but does not expose setCycle publicly. Resetting
-				// that scheduler cursor preserves Strudel's own event scheduling and
-				// lets the next start begin at the requested cycle.
-				scheduler.stop();
-				scheduler.lastEnd = targetCycle;
-				scheduler.lastBegin = targetCycle;
-			} else {
-				throw new Error('This Strudel scheduler does not support cycle seeking.');
-			}
+			this.setSchedulerCycle(targetCycle);
 
 			this.setRuntime({
 				currentCycle: targetCycle,
@@ -242,6 +277,24 @@ export class StrudelAdapter {
 			return { ok: true };
 		} catch (error) {
 			return { ok: false, error };
+		}
+	}
+
+	private setSchedulerCycle(targetCycle: number): void {
+		if (!this.repl) throw new Error('Strudel did not return a browser REPL.');
+		const scheduler = this.repl.scheduler;
+		if (typeof scheduler.setCycle === 'function') {
+			scheduler.setCycle(targetCycle);
+		} else if (typeof scheduler.stop === 'function' && 'lastEnd' in scheduler) {
+			// Cyclist (the default @strudel/web scheduler) keeps its current
+			// cycle in lastEnd but does not expose setCycle publicly. Resetting
+			// that scheduler cursor preserves Strudel's own event scheduling and
+			// lets the next start begin at the requested cycle.
+			scheduler.stop();
+			scheduler.lastEnd = targetCycle;
+			scheduler.lastBegin = targetCycle;
+		} else {
+			throw new Error('This Strudel scheduler does not support cycle seeking.');
 		}
 	}
 

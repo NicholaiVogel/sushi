@@ -8,7 +8,7 @@ A human and an agent share the same client-side studio. Both can create, edit, a
 
 - Astro shell with a React studio island
 - Strudel via `@strudel/web`
-- WebMCP adapter boundary (planned for the agent-surface slice)
+- Feature-detected WebMCP adapter for agent-facing source and transport tools
 - IndexedDB for local projects and audio assets
 - Cloudflare Pages for static deployment
 
@@ -28,13 +28,14 @@ The current vertical slice is a source-first DAW workstation at `/`:
 - Project name, draft source, last-valid source, and revisions autosave to IndexedDB and restore before the initial Strudel evaluation.
 - Tempo, key, track ranges, and derived seconds are projected from committed Strudel source. Dragging a clip edge writes a `seqPLoop(...)` range back into that track's source block.
 - `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns play, pause, resume, stop, seek, cycle progress, and song-end handling.
+- When the browser exposes `document.modelContext`, the studio registers the Slice 3 WebMCP tools for state inspection, source read/write/patch, validation, local reference lookup, playback, and revision-aware undo/redo. Transactions are idempotent, stale revisions return structured conflicts, and agent edits share the human source history.
 - Source edits stay in a draft until **Commit source** evaluates them through Strudel.
 - Failed evaluations remain visible as diagnostics while the last-valid source and active revision stay playable.
 - Audio waits for an explicit Play gesture to satisfy browser autoplay policy.
 
 The source fixture and project state live in `src/lib/project/model.ts`. The visual execution contract for this slice is recorded in [DESIGN-BRIEF.md](./DESIGN-BRIEF.md).
 
-WebMCP is not registered yet. The project includes `webmcp-types`, but no client-side `document.modelContext` tool registry has been added; that is scoped to Slice 3 in [SPEC.md](./SPEC.md).
+WebMCP is an optional browser enhancement. The client feature-detects `document.modelContext`, registers the Slice 3 tool set when it is available, and leaves the normal browser studio unchanged when it is not.
 
 ## Commands
 
