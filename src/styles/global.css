@@ -215,6 +215,8 @@ a { color: inherit; }
 
 .source-action-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 
+.project-import-input { display: none; }
+
 .source-action-commit { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
 
 .source-action-commit:hover:not(:disabled) { border-color: #e8ff9a; background: #e8ff9a; color: var(--accent-ink); }
@@ -246,6 +248,31 @@ a { color: inherit; }
 .topbar-right { justify-content: flex-end; gap: 20px; min-width: 0; }
 
 .topbar-metrics { gap: 12px; color: var(--ink-muted); white-space: nowrap; }
+
+.topbar-metric-control { display: inline-flex; align-items: baseline; gap: 3px; color: var(--ink-muted); }
+
+.topbar-metric-control input {
+	width: 32px;
+	padding: 0;
+	border: 0;
+	border-bottom: 1px solid transparent;
+	outline: 0;
+	background: transparent;
+	color: var(--ink-soft);
+	font: inherit;
+	font-variant-numeric: tabular-nums;
+	text-align: right;
+}
+
+.topbar-metric-control input:hover,
+.topbar-metric-control input:focus { border-bottom-color: var(--accent); color: var(--accent); }
+
+.topbar-metric-control input::-webkit-inner-spin-button,
+.topbar-metric-control input::-webkit-outer-spin-button { margin: 0; opacity: 0.4; }
+
+.topbar-key-control input { width: 62px; text-align: left; }
+
+.topbar-metric-duration { color: var(--ink-muted); font-variant-numeric: tabular-nums; }
 
 .studio-body {
 	display: grid;
@@ -896,8 +923,8 @@ a { color: inherit; }
 @media (max-width: 1180px) {
 	:root { --track-label-width: 270px; }
 	.studio-topbar { grid-template-columns: minmax(250px, 1fr) auto minmax(260px, 1fr); }
-	.topbar-metrics { display: none; }
-	.topbar-right { min-width: 260px; }
+	.topbar-metrics { gap: 7px; font-size: 8px; }
+	.topbar-right { min-width: 0; }
 }
 
 @media (max-width: 980px) {
@@ -916,6 +943,7 @@ a { color: inherit; }
 	.studio-topbar { grid-template-columns: 1fr auto; grid-template-rows: 56px auto; gap: 0 12px; min-height: 92px; padding: 0 12px; }
 	.topbar-brand-group { gap: 10px; }
 	.topbar-right { min-width: 0; }
+	.topbar-metrics { display: none; }
 	.topbar-session { grid-column: 1 / -1; grid-row: 2; flex-direction: row; justify-content: space-between; min-height: 36px; border-top: 1px solid var(--line-soft); }
 	.session-name-row { justify-content: flex-start; }
 	.studio-body { min-height: calc(100svh - 92px); }

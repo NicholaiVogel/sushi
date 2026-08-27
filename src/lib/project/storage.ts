@@ -1,8 +1,10 @@
-import type { ProjectDocumentV1 } from './model';
+import type { AssetManifestEntry, ProjectDocumentV1 } from './model';
 
 const DATABASE_NAME = 'sushi-projects';
 const DATABASE_VERSION = 1;
 const PROJECT_STORE = 'projects';
+const EXPORT_FORMAT = 'sushi-project';
+const EXPORT_VERSION = 1;
 
 export interface StoredProjectSnapshot {
 	project: ProjectDocumentV1;
@@ -13,6 +15,13 @@ export type StoredProjectRecord = ProjectDocumentV1 & {
 	activeRevision: number | null;
 	savedAt: number;
 };
+
+export interface ProjectExportV1 {
+	format: 'sushi-project';
+	formatVersion: 1;
+	exportedAt: string;
+	snapshot: StoredProjectSnapshot;
+}
 
 let lastSaveStamp = 0;
 
@@ -67,14 +76,59 @@ function isPositiveNumber(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
+function isAssetManifestEntry(value: unknown): value is AssetManifestEntry {
+	if (!isRecord(value)) return false;
+	const requiredStrings = ['id', 'alias', 'originalName', 'contentHash', 'mimeType', 'storageKey'];
+	if (requiredStrings.some((key) => typeof value[key] !== 'string' || !(value[key] as string).trim())) return false;
+	if (!isNonNegativeInteger(value.byteLength)) return false;
+	return ['sourceUrl', 'license', 'attribution'].every((key) => value[key] === undefined || typeof value[key] === 'string');
+}
+
 function isProjectDocument(value: unknown): value is ProjectDocumentV1 {
-	if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.id !== 'string' || typeof value.name !== 'string' || !Array.isArray(value.assets)) return false;
+	if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.id !== 'string' || !value.id.trim() || typeof value.name !== 'string' || !value.name.trim() || !Array.isArray(value.assets)) return false;
+	if (!value.assets.every((asset) => isAssetManifestEntry(asset))) return false;
 	const source = value.source;
 	const timeline = value.timeline;
 	if (!isRecord(source) || typeof source.draft !== 'string' || typeof source.lastValid !== 'string' || !isNonNegativeInteger(source.revision) || typeof source.strudelVersion !== 'string') return false;
 	if (!isRecord(timeline) || !isRecord(timeline.quarterNotesPerCycle) || !isPositiveNumber(timeline.quarterNotesPerCycle.numerator) || !isPositiveNumber(timeline.quarterNotesPerCycle.denominator)) return false;
 	if (timeline.songEndCycleVersion !== undefined && timeline.songEndCycleVersion !== 1) return false;
 	return timeline.songEndCycle === undefined || isPositiveNumber(timeline.songEndCycle);
+}
+
+function readSnapshot(value: unknown): StoredProjectSnapshot | undefined {
+	if (!isRecord(value) || !isProjectDocument(value.project)) return undefined;
+	const project = value.project;
+	const activeRevision = value.activeRevision;
+	if (!(activeRevision === null || isNonNegativeInteger(activeRevision)) || (activeRevision !== null && activeRevision > project.source.revision)) return undefined;
+	return { project, activeRevision };
+}
+
+/** Serialize a portable, versioned project envelope for local export. */
+export function serializeProjectSnapshot(snapshot: StoredProjectSnapshot): string {
+	const exportRecord: ProjectExportV1 = {
+		format: EXPORT_FORMAT,
+		formatVersion: EXPORT_VERSION,
+		exportedAt: new Date().toISOString(),
+		snapshot,
+	};
+	return JSON.stringify(exportRecord, null, 2);
+}
+
+/** Parse and validate a project export before it can enter IndexedDB or Strudel. */
+export function parseProjectExport(serialized: string): { ok: true; snapshot: StoredProjectSnapshot } | { ok: false; error: Error } {
+	if (typeof serialized !== 'string' || !serialized.trim()) return { ok: false, error: new Error('The selected project file is empty.') };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(serialized) as unknown;
+	} catch (error) {
+		return { ok: false, error: new Error(`The selected project file is not valid JSON: ${error instanceof Error ? error.message : String(error)}`) };
+	}
+	if (!isRecord(parsed) || parsed.format !== EXPORT_FORMAT || parsed.formatVersion !== EXPORT_VERSION || typeof parsed.exportedAt !== 'string' || Number.isNaN(Date.parse(parsed.exportedAt))) {
+		return { ok: false, error: new Error('The selected file is not a Sushi project export.') };
+	}
+	const snapshot = readSnapshot(parsed.snapshot);
+	if (!snapshot) return { ok: false, error: new Error('The Sushi project export is missing a valid project snapshot.') };
+	return { ok: true, snapshot };
 }
 
 function readStoredRecord(value: unknown): StoredProjectRecord | undefined {

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent as ReactChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
 	createInitialProject,
 	DEFAULT_SONG_END_CYCLE,
 	diagnosticFromError,
 	getSourceBlocks,
 	getSourceIdentityDiagnostics,
+	type AssetManifestEntry,
 	type RuntimeState,
 	type SourceDiagnostic,
 } from '../lib/project/model';
@@ -13,6 +14,9 @@ import {
 	getSourceGlobals,
 	getTrackDisplayTiming,
 	cyclesToSeconds,
+	updateSourceKey,
+	updateSourceQuarterNotesPerCycle,
+	updateSourceTempo,
 	updateTrackGain,
 	updateTrackMode,
 	updateTrackPan,
@@ -29,7 +33,7 @@ import {
 	TIMELINE_ZOOM_STEP,
 } from '../lib/project/timeline';
 import { highlightStrudel } from '../lib/project/syntax-highlight';
-import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
+import { loadProjectSnapshot, parseProjectExport, saveProjectSnapshot, serializeProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
 import { isAudioLockedError, StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
 import {
 	applyTextEdits,
@@ -53,6 +57,7 @@ type PersistenceState = 'loading' | 'ready' | 'unavailable';
 
 interface StudioState {
 	projectName: string;
+	assets: AssetManifestEntry[];
 	draft: string;
 	lastValid: string;
 	revision: number;
@@ -103,6 +108,7 @@ function createInitialStudioState(): StudioState {
 	const project = createInitialProject();
 	return {
 		projectName: project.name,
+		assets: project.assets,
 		draft: project.source.draft,
 		lastValid: project.source.lastValid,
 		revision: project.source.revision,
@@ -126,6 +132,7 @@ function snapshotFromStudio(studio: StudioState): StoredProjectSnapshot {
 		project: {
 			...project,
 			name: studio.projectName,
+			assets: studio.assets.map((asset) => ({ ...asset })),
 			source: {
 				...project.source,
 				draft: studio.draft,
@@ -199,6 +206,34 @@ function getExplicitSourceEndCycle(source: string): number {
 		.reduce((endCycle, block) => Math.max(endCycle, block.timing.endCycle), 0);
 }
 
+function normalizeImportedSnapshot(snapshot: StoredProjectSnapshot): StoredProjectSnapshot {
+	const project = createInitialProject();
+	const imported = snapshot.project;
+	const importedEndCycle = imported.timeline.songEndCycle;
+	const configuredEndCycle = typeof importedEndCycle === 'number' && Number.isFinite(importedEndCycle) && importedEndCycle > 0
+		? importedEndCycle
+		: DEFAULT_SONG_END_CYCLE;
+	const songEndCycle = Math.max(configuredEndCycle, getExplicitSourceEndCycle(imported.source.lastValid));
+	return {
+		project: {
+			...project,
+			...imported,
+			// Sushi currently opens one local project. Keep an imported document in
+			// that project slot while preserving all portable authoring data.
+			id: project.id,
+			source: { ...imported.source },
+			timeline: { ...imported.timeline, songEndCycle, songEndCycleVersion: 1 },
+			assets: imported.assets.map((asset) => ({ ...asset })),
+		},
+		activeRevision: snapshot.activeRevision ?? imported.source.revision,
+	};
+}
+
+function projectFileName(name: string): string {
+	const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+	return `${slug || 'sushi-project'}.sushi.json`;
+}
+
 function getSourceCycleStep(source: string): number {
 	const quarterNotesPerCycle = getSourceGlobals(source).quarterNotesPerCycle;
 	return 1 / Math.max(1, Math.round(quarterNotesPerCycle));
@@ -237,6 +272,7 @@ export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
 	const [editorWidth, setEditorWidth] = useState(350);
 	const [arrangementZoom, setArrangementZoom] = useState(DEFAULT_TIMELINE_ZOOM);
+	const [, setSourceHistoryVersion] = useState(0);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
@@ -244,6 +280,7 @@ export default function Studio() {
 	const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
 	const sourceHighlightRef = useRef<HTMLPreElement | null>(null);
 	const editorGutterRef = useRef<HTMLDivElement | null>(null);
+	const projectImportInputRef = useRef<HTMLInputElement | null>(null);
 	const editorResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 	const pendingTrackSourceRef = useRef<{ source: string; baseRevision: number } | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -323,6 +360,10 @@ export default function Studio() {
 		[patchStudio],
 	);
 
+	const bumpSourceHistory = useCallback(() => {
+		setSourceHistoryVersion((version) => version + 1);
+	}, []);
+
 	useEffect(() => {
 		const generation = studioGenerationRef.current + 1;
 		studioGenerationRef.current = generation;
@@ -365,6 +406,7 @@ export default function Studio() {
 			sourceTransactionsRef.current.clear();
 			patchStudio({
 				projectName: project.name,
+				assets: project.assets.map((asset) => ({ ...asset })),
 				draft: project.source.draft,
 				lastValid: project.source.lastValid,
 				revision: project.source.revision,
@@ -535,9 +577,10 @@ export default function Studio() {
 						sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
 						if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
 						sourceHistoryRef.current.redo = [];
+						bumpSourceHistory();
 					}
-						if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
-						return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
+					if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
+					return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
 				}
 				let result: AdapterResult;
 				try {
@@ -567,8 +610,9 @@ export default function Studio() {
 						sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
 						if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
 						sourceHistoryRef.current.redo = [];
+						bumpSourceHistory();
 					}
-						if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
+					if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
 					return { ok: true, changed: source !== previousSource, previousSource, source, revision };
 				}
 
@@ -583,6 +627,7 @@ export default function Studio() {
 					sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
 					if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
 					sourceHistoryRef.current.redo = [];
+					bumpSourceHistory();
 				}
 				if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
 				return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
@@ -590,7 +635,7 @@ export default function Studio() {
 			sourceCommitQueueRef.current = operation.then(() => undefined, () => undefined);
 			return operation;
 		},
-		[patchStudio, persistStudioSnapshot],
+		[bumpSourceHistory, patchStudio, persistStudioSnapshot],
 	);
 
 	const cancelPendingTrackCommit = useCallback(() => {
@@ -634,8 +679,8 @@ export default function Studio() {
 		await commitSource(nextSource, { expectedRevision: baseRevision });
 	}, [cancelPendingTrackCommit, commitSource]);
 
-	const updateTrackSource = useCallback(
-		(trackId: string, update: (source: string) => string) => {
+	const updateSourceDraft = useCallback(
+		(update: (source: string) => string) => {
 			const currentSource = studioRef.current.draft;
 			const nextSource = update(currentSource);
 			if (nextSource === currentSource) return;
@@ -647,6 +692,11 @@ export default function Studio() {
 			queueTrackCommit(nextSource, baseRevision);
 		},
 		[patchStudio, queueTrackCommit],
+	);
+
+	const updateTrackSource = useCallback(
+		(trackId: string, update: (source: string) => string) => updateSourceDraft((source) => update(source)),
+		[updateSourceDraft],
 	);
 
 	const setTrackRange = useCallback(
@@ -739,6 +789,139 @@ export default function Studio() {
 		(trackId: string, value: number) => updateTrackSource(trackId, (source) => updateTrackPan(source, trackId, value)),
 		[updateTrackSource],
 	);
+
+	const setTempo = useCallback(
+		(value: number) => updateSourceDraft((source) => updateSourceTempo(source, value)),
+		[updateSourceDraft],
+	);
+
+	const setQuarterNotesPerCycle = useCallback(
+		(value: number) => updateSourceDraft((source) => updateSourceQuarterNotesPerCycle(source, value)),
+		[updateSourceDraft],
+	);
+
+	const setKey = useCallback(
+		(value: string) => updateSourceDraft((source) => updateSourceKey(source, value)),
+		[updateSourceDraft],
+	);
+
+	const undoSourceEdit = useCallback(async () => {
+		cancelPendingTrackCommit();
+		const current = studioRef.current;
+		const entry = sourceHistoryRef.current.undo[sourceHistoryRef.current.undo.length - 1];
+		// A draft that has not been committed is deliberately left alone. Revert
+		// remains the explicit action for discarding that draft; undo only walks the
+		// shared, validated source history.
+		if (!entry || current.draft !== entry.after) return;
+		const result = await commitSource(entry.before, { recordHistory: false, expectedRevision: current.revision });
+		if (!result.ok) return;
+		sourceHistoryRef.current.undo.pop();
+		sourceHistoryRef.current.redo.push(entry);
+		if (sourceHistoryRef.current.redo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.redo.shift();
+		bumpSourceHistory();
+	}, [bumpSourceHistory, cancelPendingTrackCommit, commitSource]);
+
+	const redoSourceEdit = useCallback(async () => {
+		cancelPendingTrackCommit();
+		const current = studioRef.current;
+		const entry = sourceHistoryRef.current.redo[sourceHistoryRef.current.redo.length - 1];
+		if (!entry || current.draft !== entry.before) return;
+		const result = await commitSource(entry.after, { recordHistory: false, expectedRevision: current.revision });
+		if (!result.ok) return;
+		sourceHistoryRef.current.redo.pop();
+		sourceHistoryRef.current.undo.push(entry);
+		if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
+		bumpSourceHistory();
+	}, [bumpSourceHistory, cancelPendingTrackCommit, commitSource]);
+
+	const exportProject = useCallback(() => {
+		if (typeof document === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
+		const blob = new Blob([serializeProjectSnapshot(snapshotFromStudio(studioRef.current))], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const link = document.createElement('a');
+		link.href = url;
+		link.download = projectFileName(studioRef.current.projectName);
+		link.click();
+		window.setTimeout(() => URL.revokeObjectURL(url), 0);
+	}, []);
+
+	const importProject = useCallback(async (event: ReactChangeEvent<HTMLInputElement>) => {
+		const file = event.currentTarget.files?.[0];
+		event.currentTarget.value = '';
+		if (!file) return;
+		const generation = studioGenerationRef.current;
+		let parsed: ReturnType<typeof parseProjectExport>;
+		try {
+			parsed = parseProjectExport(await file.text());
+		} catch (error) {
+			parsed = { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
+		}
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		if (!parsed.ok) {
+			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, parsed.error, 'parse', studioRef.current.draft)] });
+			return;
+		}
+
+		const imported = normalizeImportedSnapshot(parsed.snapshot);
+		const identityDiagnostics = getSourceIdentityDiagnostics(imported.project.source.revision, imported.project.source.lastValid);
+		if (identityDiagnostics.length) {
+			patchStudio({ phase: 'error', diagnostics: identityDiagnostics });
+			return;
+		}
+		const adapter = adapterRef.current;
+		if (!adapter) {
+			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, new Error('The Strudel runtime is not ready.'), 'audio', studioRef.current.draft)] });
+			return;
+		}
+
+		cancelPendingTrackCommit();
+		patchStudio({ phase: 'validating', diagnostics: [] });
+		const stopped = await adapter.stop();
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		if (!stopped.ok) {
+			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, stopped.error, 'audio', studioRef.current.draft)] });
+			return;
+		}
+		const evaluated = await adapter.evaluateSource(imported.project.source.lastValid, { autoplay: false, restoreSource: studioRef.current.lastValid });
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		if (!evaluated.ok) {
+			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(imported.project.source.revision, evaluated.error, 'evaluate', imported.project.source.lastValid)] });
+			return;
+		}
+
+		let draftDiagnostics: SourceDiagnostic[] = [];
+		if (imported.project.source.draft !== imported.project.source.lastValid) {
+			const draftIdentityDiagnostics = getSourceIdentityDiagnostics(imported.project.source.revision, imported.project.source.draft);
+			if (draftIdentityDiagnostics.length) {
+				draftDiagnostics = draftIdentityDiagnostics;
+			} else {
+				try {
+					const draftValidation = await adapter.validateSource(imported.project.source.draft, imported.project.source.lastValid);
+					if (!draftValidation.ok) draftDiagnostics = [diagnosticFromError(imported.project.source.revision, draftValidation.error, imported.project.source.draft)];
+				} catch (error) {
+					draftDiagnostics = [diagnosticFromError(imported.project.source.revision, error, imported.project.source.draft)];
+				}
+			}
+		}
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		adapter.setSongEndCycle(imported.project.timeline.songEndCycle);
+		sourceHistoryRef.current = { cursorSource: imported.project.source.draft, undo: [], redo: [] };
+		sourceTransactionsRef.current.clear();
+		bumpSourceHistory();
+		patchStudio({
+			projectName: imported.project.name,
+			assets: imported.project.assets.map((asset) => ({ ...asset })),
+			draft: imported.project.source.draft,
+			lastValid: imported.project.source.lastValid,
+			revision: imported.project.source.revision,
+			activeRevision: imported.activeRevision,
+			songEndCycle: imported.project.timeline.songEndCycle ?? DEFAULT_SONG_END_CYCLE,
+			phase: draftDiagnostics.length ? 'error' : 'ready',
+			diagnostics: draftDiagnostics,
+			runtime: { ...studioRef.current.runtime, audioState: 'locked', transport: 'stopped', currentCycle: 0, activeRevision: imported.activeRevision },
+		});
+		await persistStudioSnapshot(imported, generation);
+	}, [bumpSourceHistory, cancelPendingTrackCommit, patchStudio, persistStudioSnapshot]);
 
 	const toggleTrackMode = useCallback(
 		(trackId: string, mode: 'mute' | 'solo', active: boolean) => updateTrackSource(trackId, (source) => updateTrackMode(source, trackId, mode, active)),
@@ -1057,16 +1240,16 @@ export default function Studio() {
 			'undo_source_edit',
 			input.transactionId,
 			async () => {
-			const current = studioRef.current;
-			if (input.baseRevision !== current.revision) {
-				const state = getWebMcpState();
-				return { ok: false, action: 'undo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' }, conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision } };
-			}
-			const entry = sourceHistoryRef.current.undo[sourceHistoryRef.current.undo.length - 1];
-			if (!entry) {
-				const state = getWebMcpState();
-				return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to undo.', { code: 'NO_UNDO', message: 'The shared source history is already at its oldest revision.' });
-			}
+				const current = studioRef.current;
+				if (input.baseRevision !== current.revision) {
+					const state = getWebMcpState();
+					return { ok: false, action: 'undo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' }, conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision } };
+				}
+				const entry = sourceHistoryRef.current.undo[sourceHistoryRef.current.undo.length - 1];
+				if (!entry) {
+					const state = getWebMcpState();
+					return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to undo.', { code: 'NO_UNDO', message: 'The shared source history is already at its oldest revision.' });
+				}
 				const result = await commitSource(entry.before, { recordHistory: false, expectedRevision: input.baseRevision });
 				if (!result.ok) {
 					const state = getWebMcpState();
@@ -1075,11 +1258,12 @@ export default function Studio() {
 					}
 					return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Undo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Undo source was rejected.' });
 				}
-			sourceHistoryRef.current.undo.pop();
-			sourceHistoryRef.current.redo.push(entry);
-			if (sourceHistoryRef.current.redo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.redo.shift();
-			const state = getWebMcpState();
-			return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Undid source edit; now at ${formatRevision(state.source.revision)}.`);
+				sourceHistoryRef.current.undo.pop();
+				sourceHistoryRef.current.redo.push(entry);
+				if (sourceHistoryRef.current.redo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.redo.shift();
+				bumpSourceHistory();
+				const state = getWebMcpState();
+				return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Undid source edit; now at ${formatRevision(state.source.revision)}.`);
 			},
 			stableSerialize(input),
 			).catch((error) => {
@@ -1087,7 +1271,7 @@ export default function Studio() {
 				const state = getWebMcpState();
 				return makeMutationResult(state, 'undo_source_edit', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
 			}),
-		[commitSource, getWebMcpState],
+		[bumpSourceHistory, commitSource, getWebMcpState],
 	);
 
 	const redoSourceForWebMcp = useCallback(
@@ -1095,16 +1279,16 @@ export default function Studio() {
 			'redo_source_edit',
 			input.transactionId,
 			async () => {
-			const current = studioRef.current;
-			if (input.baseRevision !== current.revision) {
-				const state = getWebMcpState();
-				return { ok: false, action: 'redo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' }, conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision } };
-			}
-			const entry = sourceHistoryRef.current.redo[sourceHistoryRef.current.redo.length - 1];
-			if (!entry) {
-				const state = getWebMcpState();
-				return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to redo.', { code: 'NO_REDO', message: 'The shared source history is already at its newest revision.' });
-			}
+				const current = studioRef.current;
+				if (input.baseRevision !== current.revision) {
+					const state = getWebMcpState();
+					return { ok: false, action: 'redo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' }, conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision } };
+				}
+				const entry = sourceHistoryRef.current.redo[sourceHistoryRef.current.redo.length - 1];
+				if (!entry) {
+					const state = getWebMcpState();
+					return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to redo.', { code: 'NO_REDO', message: 'The shared source history is already at its newest revision.' });
+				}
 				const result = await commitSource(entry.after, { recordHistory: false, expectedRevision: input.baseRevision });
 				if (!result.ok) {
 					const state = getWebMcpState();
@@ -1113,11 +1297,12 @@ export default function Studio() {
 					}
 					return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Redo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Redo source was rejected.' });
 				}
-			sourceHistoryRef.current.redo.pop();
-			sourceHistoryRef.current.undo.push(entry);
-			if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
-			const state = getWebMcpState();
-			return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Redid source edit; now at ${formatRevision(state.source.revision)}.`);
+				sourceHistoryRef.current.redo.pop();
+				sourceHistoryRef.current.undo.push(entry);
+				if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
+				bumpSourceHistory();
+				const state = getWebMcpState();
+				return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Redid source edit; now at ${formatRevision(state.source.revision)}.`);
 			},
 			stableSerialize(input),
 			).catch((error) => {
@@ -1125,7 +1310,7 @@ export default function Studio() {
 				const state = getWebMcpState();
 				return makeMutationResult(state, 'redo_source_edit', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
 			}),
-		[commitSource, getWebMcpState],
+		[bumpSourceHistory, commitSource, getWebMcpState],
 	);
 
 	const webmcpController = useMemo<WebMcpController>(() => ({
@@ -1296,6 +1481,19 @@ export default function Studio() {
 							<button className="transport-button source-action-button source-action-commit" type="button" onClick={() => void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studio.revision })} disabled={!isDirty || isBusy} aria-label="Commit source" title="Commit source">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>
 							</button>
+							<button className="transport-button source-action-button" type="button" onClick={() => void undoSourceEdit()} disabled={isBusy || isDirty || sourceHistoryRef.current.undo.length === 0} aria-label="Undo source edit" title="Undo source edit">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h8a6 6 0 0 1 6 6" /></svg>
+							</button>
+							<button className="transport-button source-action-button" type="button" onClick={() => void redoSourceEdit()} disabled={isBusy || isDirty || sourceHistoryRef.current.redo.length === 0} aria-label="Redo source edit" title="Redo source edit">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 8 5 4-5 4" /><path d="M20 12h-8a6 6 0 0 0-6 6" /></svg>
+							</button>
+							<button className="transport-button source-action-button" type="button" onClick={exportProject} disabled={isBusy} aria-label="Export Sushi project" title="Export project">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11" /><path d="m8 8 4-4 4 4" /><path d="M5 14v5h14v-5" /></svg>
+							</button>
+							<button className="transport-button source-action-button" type="button" onClick={() => projectImportInputRef.current?.click()} disabled={isBusy} aria-label="Import Sushi project" title="Import project">
+								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V9" /><path d="m8 16 4 4 4-4" /><path d="M5 10V5h14v5" /></svg>
+							</button>
+							<input ref={projectImportInputRef} className="project-import-input" type="file" accept="application/json,.json" onChange={importProject} aria-label="Import Sushi project file" />
 						</div>
 						<span className="topbar-action-divider" aria-hidden="true" />
 						<button className="transport-button transport-stop" type="button" onClick={() => void dispatch({ type: 'stop' })} disabled={!canPlay || (studio.runtime.transport === 'stopped' && studio.runtime.currentCycle === 0)} aria-label="Stop playback" title="Stop and return to cycle zero">■</button>
@@ -1308,7 +1506,23 @@ export default function Studio() {
 					</div>
 				</div>
 				<div className="topbar-right">
-					<div className="topbar-metrics" aria-label="Project settings"><span>{formatCycle(sourceGlobals.bpm)} BPM</span><span>{formatCycle(sourceGlobals.quarterNotesPerCycle)} Q/C</span><span>{formatKey(sourceGlobals.key)}</span><span>{formatCycle(songEndSeconds)}s</span></div>
+					<div className="topbar-metrics" aria-label="Project settings">
+						<label className="topbar-metric-control">
+							<span className="sr-only">Tempo in beats per minute</span>
+							<input type="number" min="1" max="400" step="1" value={formatCycle(sourceGlobals.bpm)} onChange={(event) => setTempo(Number(event.target.value))} aria-label="Tempo in beats per minute" title="Set tempo" />
+							<span>BPM</span>
+						</label>
+						<label className="topbar-metric-control">
+							<span className="sr-only">Quarter notes per Strudel cycle</span>
+							<input type="number" min="1" max="32" step="1" value={formatCycle(sourceGlobals.quarterNotesPerCycle)} onChange={(event) => setQuarterNotesPerCycle(Number(event.target.value))} aria-label="Quarter notes per Strudel cycle" title="Set quarter notes per cycle" />
+							<span>Q/C</span>
+						</label>
+						<label className="topbar-metric-control topbar-key-control">
+							<span className="sr-only">Musical key</span>
+							<input type="text" value={sourceGlobals.key} onChange={(event) => setKey(event.target.value)} aria-label="Musical key" title="Set musical key" />
+						</label>
+						<span className="topbar-metric-duration">{formatCycle(songEndSeconds)}s</span>
+					</div>
 				</div>
 			</header>
 

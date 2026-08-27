@@ -29,6 +29,19 @@ export interface RuntimeState {
 	currentCycle: number;
 }
 
+export interface AssetManifestEntry {
+	id: string;
+	alias: string;
+	originalName: string;
+	contentHash: string;
+	mimeType: string;
+	byteLength: number;
+	storageKey: string;
+	sourceUrl?: string;
+	license?: string;
+	attribution?: string;
+}
+
 export interface ProjectDocumentV1 {
 	schemaVersion: 1;
 	id: string;
@@ -45,7 +58,7 @@ export interface ProjectDocumentV1 {
 		/** Set when the editable arrangement boundary was introduced. */
 		songEndCycleVersion?: 1;
 	};
-	assets: [];
+	assets: AssetManifestEntry[];
 }
 
 /** Default working range for a new arrangement, expressed in Strudel cycles. */

@@ -27,6 +27,8 @@ The current vertical slice is a source-first DAW workstation at `/`:
 - Mute and solo use Strudel's source labels (`_$:` and `S$:`), so their state is visible and editable in the source editor. Unsupported chain values remain source-visible and are not presented as editable scalar controls.
 - Project name, draft source, last-valid source, and revisions autosave to IndexedDB and restore before the initial Strudel evaluation.
 - Tempo, key, track ranges, and derived seconds are projected from committed Strudel source. Dragging a clip edge writes a `seqPLoop(...)` range back into that track's source block.
+- The header BPM, quarter-notes-per-cycle, and key fields are source-backed controls: each edit rewrites the canonical declaration and re-enters the same validated Strudel commit path.
+- Undo and redo buttons share the bounded source history with WebMCP transactions. The export and import buttons use a versioned `.sushi.json` envelope, validate it before evaluation, and preserve project asset metadata.
 - `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns play, pause, resume, stop, seek, cycle progress, and song-end handling.
 - When the browser exposes a usable `document.modelContext`, the studio waits briefly for late host injection before registering the Slice 3 WebMCP tools for state inspection, source read/write/patch, validation, local reference lookup, playback, and revision-aware undo/redo. Transactions are idempotent, stale revisions return structured conflicts, and agent edits share the human source history.
 - Source edits stay in a draft until **Commit source** evaluates them through Strudel.

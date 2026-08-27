@@ -45,6 +45,10 @@ const DEFAULT_BPM = 84;
 const DEFAULT_QUARTER_NOTES_PER_CYCLE = 4;
 const DEFAULT_TRACK_END_CYCLE = 4;
 
+const setcpmWithDivisionPattern = new RegExp(`(\\bsetcpm\\s*\\(\\s*)(${numericLiteral})(\\s*\\/\\s*)(${numericLiteral})(\\s*\\))`);
+const setcpmSingleValuePattern = new RegExp(`(\\bsetcpm\\s*\\(\\s*)(${numericLiteral})(\\s*\\))`);
+const keyDeclarationPattern = /^(\s*(?:const|let|var)\s+key\s*=\s*)(["'])([^"'\r\n]*)(\2)(\s*;?)/m;
+
 export function getSourceGlobals(source: string): SourceGlobals {
 	const tempoMatch = source.match(new RegExp(`\\bsetcpm\\s*\\(\\s*(${numericLiteral})(?:\\s*\\/\\s*(${numericLiteral}))?\\s*\\)`));
 	const parsedBpm = tempoMatch ? Number(tempoMatch[1]) : DEFAULT_BPM;
@@ -63,6 +67,61 @@ export function cyclesToSeconds(cycles: number, globals: SourceGlobals): number 
 
 export function secondsToCycles(seconds: number, globals: SourceGlobals): number {
 	return seconds * globals.bpm / (60 * globals.quarterNotesPerCycle);
+}
+
+function prependGlobalDeclaration(source: string, declaration: string): string {
+	return source.length ? `${declaration}\n${source}` : `${declaration}\n`;
+}
+
+/**
+ * Update the canonical setcpm declaration while preserving the author's
+ * spacing and whether they used the short single-value form. If a source has
+ * no tempo declaration yet, add the canonical ratio form at the top.
+ */
+export function updateSourceTempo(source: string, bpm: number): string {
+	if (!Number.isFinite(bpm) || bpm <= 0) return source;
+	const formatted = formatNumber(bpm);
+	if (setcpmWithDivisionPattern.test(source)) {
+		return source.replace(setcpmWithDivisionPattern, (_match, prefix: string, _oldBpm: string, separator: string, _oldQuarterNotes: string, suffix: string) => `${prefix}${formatted}${separator}${_oldQuarterNotes}${suffix}`);
+	}
+	if (setcpmSingleValuePattern.test(source)) {
+		return source.replace(setcpmSingleValuePattern, (_match, prefix: string, _oldBpm: string, suffix: string) => `${prefix}${formatted}${suffix}`);
+	}
+	return prependGlobalDeclaration(source, `setcpm(${formatted} / ${DEFAULT_QUARTER_NOTES_PER_CYCLE})`);
+}
+
+/**
+ * Update the quarter-note divisor in setcpm. A source using setcpm(bpm)
+ * receives the explicit ratio form so the UI's cycle model remains
+ * round-trippable through source parsing.
+ */
+export function updateSourceQuarterNotesPerCycle(source: string, quarterNotesPerCycle: number): string {
+	if (!Number.isFinite(quarterNotesPerCycle) || quarterNotesPerCycle <= 0) return source;
+	const formatted = formatNumber(quarterNotesPerCycle);
+	if (setcpmWithDivisionPattern.test(source)) {
+		return source.replace(setcpmWithDivisionPattern, (_match, prefix: string, oldBpm: string, separator: string, _oldQuarterNotes: string, suffix: string) => `${prefix}${oldBpm}${separator}${formatted}${suffix}`);
+	}
+	if (setcpmSingleValuePattern.test(source)) {
+		return source.replace(setcpmSingleValuePattern, (_match, prefix: string, oldBpm: string, suffix: string) => `${prefix}${oldBpm} / ${formatted}${suffix}`);
+	}
+	return prependGlobalDeclaration(source, `setcpm(${DEFAULT_BPM} / ${formatted})`);
+}
+
+/** Update the canonical key declaration, preserving its quote style. */
+export function updateSourceKey(source: string, key: string): string {
+	if (typeof key !== 'string' || !key.trim() || /[\r\n]/.test(key)) return source;
+	if (keyDeclarationPattern.test(source)) {
+		return source.replace(keyDeclarationPattern, (_match, prefix: string, quote: string, _oldKey: string, _closingQuote: string, suffix: string) => `${prefix}${quote}${key}${quote}${suffix}`);
+	}
+	const declaration = `const key = ${JSON.stringify(key)}`;
+	const tempo = source.match(/\bsetcpm\s*\([^\n\r]*\)/);
+	if (tempo?.index !== undefined) {
+		const lineEnd = source.indexOf('\n', tempo.index + tempo[0].length);
+		if (lineEnd === -1) return `${source}\n${declaration}\n`;
+		const insertAt = lineEnd + 1;
+		return `${source.slice(0, insertAt)}${declaration}\n${source.slice(insertAt)}`;
+	}
+	return prependGlobalDeclaration(source, declaration);
 }
 
 export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAULT_TRACK_END_CYCLE): TrackTiming {

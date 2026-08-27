@@ -6,6 +6,9 @@ import {
 	getSourceGlobals,
 	getTrackDisplayTiming,
 	secondsToCycles,
+	updateSourceKey,
+	updateSourceQuarterNotesPerCycle,
+	updateSourceTempo,
 	updateTrackGain,
 	updateTrackMode,
 	updateTrackPan,
@@ -91,6 +94,35 @@ describe('source mapper', () => {
 		expect(globals).toEqual({ bpm: 84, quarterNotesPerCycle: 4, key: 'E:minor' });
 		expect(cyclesToSeconds(10.5, globals)).toBe(30);
 		expect(secondsToCycles(30, globals)).toBe(10.5);
+	});
+
+	test('updates global tempo and cycle divisor without rewriting the source body', () => {
+		const source = '  setcpm(84 / 4)\n\n$: s("bd")\n';
+		const tempo = updateSourceTempo(source, 92);
+		const divisor = updateSourceQuarterNotesPerCycle(tempo, 8);
+
+		expect(divisor).toBe('  setcpm(92 / 8)\n\n$: s("bd")\n');
+		expect(getSourceGlobals(divisor)).toEqual({ bpm: 92, quarterNotesPerCycle: 8, key: 'E:minor' });
+	});
+
+	test('adds missing global declarations and preserves key quote style', () => {
+		const source = '$: s("bd")\n';
+		const withTempo = updateSourceTempo(source, 100);
+		const withDivisor = updateSourceQuarterNotesPerCycle(withTempo, 2);
+		const withKey = updateSourceKey(withDivisor, 'D:minor');
+
+		expect(withKey).toBe('setcpm(100 / 2)\nconst key = "D:minor"\n$: s("bd")\n');
+		const singleValue = updateSourceQuarterNotesPerCycle("setcpm(90)\n$: s('bd')", 3);
+		expect(singleValue).toBe("setcpm(90 / 3)\n$: s('bd')");
+
+		const singleQuotedKey = updateSourceKey("const key = 'E:minor';\n$: s('bd')", 'A:major');
+		expect(singleQuotedKey).toContain("const key = 'A:major';");
+	});
+
+	test('ignores invalid global control values', () => {
+		expect(updateSourceTempo(DEFAULT_SOURCE, 0)).toBe(DEFAULT_SOURCE);
+		expect(updateSourceQuarterNotesPerCycle(DEFAULT_SOURCE, Number.NaN)).toBe(DEFAULT_SOURCE);
+		expect(updateSourceKey(DEFAULT_SOURCE, 'bad\nkey')).toBe(DEFAULT_SOURCE);
 	});
 
 	test('writes and reads explicit seqPLoop track ranges', () => {
