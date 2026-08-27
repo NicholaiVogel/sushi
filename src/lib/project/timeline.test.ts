@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { getTimelineCells } from './timeline';
+import { clampTimelineZoom, getTimelineCellWidth, getTimelineCells } from './timeline';
 
 describe('arrangement timeline cells', () => {
 	test('expands the ruler beyond the default four cycles', () => {
@@ -12,5 +12,12 @@ describe('arrangement timeline cells', () => {
 
 	test('rounds a partial final cycle up to its visible quarter-note cell', () => {
 		expect(getTimelineCells(2.25)).toHaveLength(9);
+	});
+
+	test('clamps arrangement zoom to usable quarter-note widths', () => {
+		expect(clampTimelineZoom(0)).toBe(0.25);
+		expect(clampTimelineZoom(1.12)).toBe(1);
+		expect(clampTimelineZoom(9)).toBe(2);
+		expect(getTimelineCellWidth(0.5)).toBe(32);
 	});
 });

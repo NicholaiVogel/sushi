@@ -5,6 +5,20 @@ export interface TimelineCell {
 
 /** Pixel width of one quarter-note cell in the horizontal arrangement. */
 export const TIMELINE_CELL_WIDTH = 64;
+export const DEFAULT_TIMELINE_ZOOM = 1;
+export const MIN_TIMELINE_ZOOM = 0.25;
+export const MAX_TIMELINE_ZOOM = 2;
+export const TIMELINE_ZOOM_STEP = 0.25;
+
+export function clampTimelineZoom(value: number): number {
+	const safeValue = Number.isFinite(value) ? value : DEFAULT_TIMELINE_ZOOM;
+	const clamped = Math.max(MIN_TIMELINE_ZOOM, Math.min(MAX_TIMELINE_ZOOM, safeValue));
+	return Math.round(clamped / TIMELINE_ZOOM_STEP) * TIMELINE_ZOOM_STEP;
+}
+
+export function getTimelineCellWidth(zoom: number): number {
+	return TIMELINE_CELL_WIDTH * clampTimelineZoom(zoom);
+}
 
 /**
  * Build quarter-note cells for the arrangement ruler. A cycle is one bar in

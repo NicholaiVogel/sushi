@@ -4,6 +4,7 @@ import {
 	cyclesToSeconds,
 	getSourceBlockDetails,
 	getSourceGlobals,
+	getTrackDisplayTiming,
 	secondsToCycles,
 	updateTrackGain,
 	updateTrackMode,
@@ -147,5 +148,13 @@ describe('source mapper', () => {
 		const [track] = getSourceBlockDetails(DEFAULT_SOURCE, 16);
 
 		expect(track.timing).toEqual({ mode: 'full', startCycle: 0, endCycle: 16 });
+	});
+
+	test('projects repeating seqPLoop lanes through the project boundary', () => {
+		const display = getTrackDisplayTiming({ mode: 'seqPLoop', startCycle: 0, endCycle: 4 }, 16);
+		const arranged = getTrackDisplayTiming({ mode: 'arrange', startCycle: 0, endCycle: 5 }, 16);
+
+		expect(display).toEqual({ mode: 'seqPLoop', startCycle: 0, endCycle: 4, displayEndCycle: 16, repeating: true });
+		expect(arranged).toEqual({ mode: 'arrange', startCycle: 0, endCycle: 5, displayEndCycle: 5, repeating: false });
 	});
 });

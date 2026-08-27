@@ -34,6 +34,11 @@ export interface TrackTiming {
 	endCycle: number;
 }
 
+export interface TrackDisplayTiming extends TrackTiming {
+	displayEndCycle: number;
+	repeating: boolean;
+}
+
 const labelPattern = /^(\s*)([A-Za-z_$][\w$]*)(\s*):(\s*)(.*)$/;
 const numericLiteral = '[-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?';
 const DEFAULT_BPM = 84;
@@ -85,6 +90,24 @@ export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAU
 	}
 
 	return { mode: 'full', startCycle: 0, endCycle: defaultEndCycle };
+}
+
+/**
+ * Project the visual span of a source timing expression without changing the
+ * source-defined in/out range. seqPLoop patterns repeat their range, so the
+ * lane should remain visible through the finite project boundary while its
+ * editable loop end stays at the source-defined stop cycle.
+ */
+export function getTrackDisplayTiming(timing: TrackTiming, projectEndCycle: number): TrackDisplayTiming {
+	const safeProjectEnd = Number.isFinite(projectEndCycle) && projectEndCycle > 0
+		? projectEndCycle
+		: timing.endCycle;
+	const repeating = timing.mode === 'seqPLoop';
+	return {
+		...timing,
+		displayEndCycle: repeating ? Math.max(timing.endCycle, safeProjectEnd) : timing.endCycle,
+		repeating,
+	};
 }
 
 function withoutCarriageReturn(line: string): { body: string; ending: string } {

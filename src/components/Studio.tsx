@@ -10,6 +10,7 @@ import {
 import {
 	getSourceBlockDetails,
 	getSourceGlobals,
+	getTrackDisplayTiming,
 	cyclesToSeconds,
 	updateTrackGain,
 	updateTrackMode,
@@ -17,7 +18,15 @@ import {
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
 import { getSourceLineNumbers } from '../lib/project/editor';
-import { getTimelineCells, TIMELINE_CELL_WIDTH } from '../lib/project/timeline';
+import {
+	clampTimelineZoom,
+	DEFAULT_TIMELINE_ZOOM,
+	getTimelineCellWidth,
+	getTimelineCells,
+	MAX_TIMELINE_ZOOM,
+	MIN_TIMELINE_ZOOM,
+	TIMELINE_ZOOM_STEP,
+} from '../lib/project/timeline';
 import { highlightStrudel } from '../lib/project/syntax-highlight';
 import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
 import { StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
@@ -216,6 +225,7 @@ function makeMutationResult(
 export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
 	const [editorWidth, setEditorWidth] = useState(350);
+	const [arrangementZoom, setArrangementZoom] = useState(DEFAULT_TIMELINE_ZOOM);
 	const studioRef = useRef(studio);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
 	const mountedRef = useRef(true);
@@ -228,6 +238,8 @@ export default function Studio() {
 	const timingDragRef = useRef<{ trackId: string; edge: 'start' | 'end'; lane: HTMLElement } | null>(null);
 	const timelineSeekDragRef = useRef<HTMLElement | null>(null);
 	const timelineSeekCycleRef = useRef<number | null>(null);
+	const timelineShellRef = useRef<HTMLElement | null>(null);
+	const timelineZoomAnchorRef = useRef<number | null>(null);
 	const sourceHistoryRef = useRef<SourceHistoryState>({
 		cursorSource: createInitialProject().source.draft,
 		undo: [],
@@ -530,6 +542,26 @@ export default function Studio() {
 		patchStudio({ songEndCycle: nextSongEndCycle });
 	}, [patchStudio]);
 
+	const adjustArrangementZoom = useCallback((delta: number) => {
+		const shell = timelineShellRef.current;
+		if (shell && shell.scrollWidth > 0) {
+			timelineZoomAnchorRef.current = (shell.scrollLeft + shell.clientWidth / 2) / shell.scrollWidth;
+		}
+		setArrangementZoom((current) => clampTimelineZoom(current + delta));
+	}, []);
+
+	useEffect(() => {
+		const anchor = timelineZoomAnchorRef.current;
+		if (anchor === null) return;
+		timelineZoomAnchorRef.current = null;
+		const frame = requestAnimationFrame(() => {
+			const shell = timelineShellRef.current;
+			if (!shell) return;
+			shell.scrollLeft = Math.max(0, anchor * shell.scrollWidth - shell.clientWidth / 2);
+		});
+		return () => cancelAnimationFrame(frame);
+	}, [arrangementZoom]);
+
 	const handleTimingPointerMove = useCallback(
 		(event: PointerEvent) => {
 			const drag = timingDragRef.current;
@@ -538,7 +570,7 @@ export default function Studio() {
 			const rect = drag.lane.getBoundingClientRect();
 			if (!rect.width) return;
 			const nextCycle = clamp(Math.round(((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle * 4) / 4, 0, studioRef.current.songEndCycle);
-			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === drag.trackId);
+			const details = getSourceBlockDetails(studioRef.current.draft, studioRef.current.songEndCycle).find((block) => block.id === drag.trackId);
 			if (!details) return;
 			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, details.timing.endCycle - 0.25) : details.timing.startCycle;
 			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, details.timing.startCycle + 0.25) : details.timing.endCycle;
@@ -1023,6 +1055,7 @@ export default function Studio() {
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
 	const timelineCells = useMemo(() => getTimelineCells(studio.songEndCycle), [studio.songEndCycle]);
+	const timelineCellWidth = getTimelineCellWidth(arrangementZoom);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
 
@@ -1120,11 +1153,16 @@ export default function Studio() {
 			</div>
 
 				<main className="daw-canvas" aria-label="Sushi workstation">
-					<section className="timeline-shell" style={{ '--timeline-cell-count': timelineCells.length, '--timeline-content-width': `${timelineCells.length * TIMELINE_CELL_WIDTH}px` } as CSSProperties} aria-labelledby="timeline-heading">
+					<section ref={timelineShellRef} className="timeline-shell" style={{ '--timeline-cell-count': timelineCells.length, '--timeline-cell-width': `${timelineCellWidth}px`, '--timeline-content-width': `${timelineCells.length * timelineCellWidth}px` } as CSSProperties} aria-labelledby="timeline-heading">
 						<div className="timeline-head">
 							<div className="timeline-heading-cell">
 								<div className="arrangement-toolbar">
 									<button className="add-track-button" type="button" onClick={() => void addTrack()} disabled={isBusy} aria-label="Add track"><span aria-hidden="true">＋</span> Add track</button>
+									<div className="timeline-zoom-controls" role="group" aria-label="Arrangement zoom">
+										<button className="timeline-zoom-button" type="button" onClick={() => adjustArrangementZoom(-TIMELINE_ZOOM_STEP)} disabled={arrangementZoom <= MIN_TIMELINE_ZOOM} aria-label="Zoom out arrangement" title="Zoom out arrangement">−</button>
+										<output className="timeline-zoom-value" aria-live="polite">{Math.round(arrangementZoom * 100)}%</output>
+										<button className="timeline-zoom-button" type="button" onClick={() => adjustArrangementZoom(TIMELINE_ZOOM_STEP)} disabled={arrangementZoom >= MAX_TIMELINE_ZOOM} aria-label="Zoom in arrangement" title="Zoom in arrangement">＋</button>
+									</div>
 								</div>
 								<div className="timeline-duration">
 									<label className="timeline-length-control">
@@ -1149,9 +1187,17 @@ export default function Studio() {
 							const gain = trackDetails?.gain ?? 1;
 							const pan = trackDetails?.pan ?? 0.5;
 							const timing = trackDetails?.timing ?? { mode: 'full' as const, startCycle: 0, endCycle: studio.songEndCycle };
+							const displayTiming = getTrackDisplayTiming(timing, studio.songEndCycle);
 							const clipStart = clamp(timing.startCycle / studio.songEndCycle, 0, 1);
-							const clipEnd = clamp(timing.endCycle / studio.songEndCycle, clipStart + 0.01, 1);
+							const clipEnd = clamp(displayTiming.displayEndCycle / studio.songEndCycle, clipStart + 0.01, 1);
+							const loopHandlePosition = clipEnd > clipStart
+								? clamp((timing.endCycle / studio.songEndCycle - clipStart) / (clipEnd - clipStart), 0.01, 1)
+								: 1;
+							const loopWidth = Math.max(1, (timing.endCycle - timing.startCycle) * 4 * timelineCellWidth);
 							const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
+							const displayLabel = displayTiming.repeating && displayTiming.displayEndCycle > timing.endCycle
+								? `${timingLabel} · LOOP TO ${formatCycle(displayTiming.displayEndCycle)}`
+								: timingLabel;
 							return (
 								<div className="track-lane" key={block.id}>
 									<div className="track-header" style={{ '--track-color': trackColor } as CSSProperties}>
@@ -1178,11 +1224,11 @@ export default function Studio() {
 											</div>
 										</div>
 									</div>
-										<div className="lane-grid" style={{ '--track-color': trackColor } as CSSProperties}>
-											<div className="lane-grid-lines" aria-hidden="true">{timelineCells.map((cell) => <span className={cell.barStart ? 'beat-start' : ''} key={cell.label} />)}</div>
-										<div className="pattern-region" style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd } as CSSProperties} title={`${block.name}: ${timingLabel}`}>
+									<div className="lane-grid" style={{ '--track-color': trackColor } as CSSProperties}>
+										<div className="lane-grid-lines" aria-hidden="true">{timelineCells.map((cell) => <span className={cell.barStart ? 'beat-start' : ''} key={cell.label} />)}</div>
+										<div className={`pattern-region ${displayTiming.repeating ? 'pattern-region-looping' : ''}`} style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd, '--loop-handle-position': loopHandlePosition, '--loop-width': `${loopWidth}px` } as CSSProperties} title={`${block.name}: ${displayLabel}`}>
 											<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -0.25 : 0.25; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - 0.25), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
-											<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
+											<span>{block.name.toUpperCase()}</span><small>{displayLabel}</small>
 											<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -0.25 : 0.25; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + 0.25, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
 										</div>
 										<span className={`lane-playhead ${studio.runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />

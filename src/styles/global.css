@@ -492,6 +492,54 @@ a { color: inherit; }
 
 .arrangement-toolbar { display: flex; align-items: center; gap: 7px; width: 100%; }
 
+.timeline-zoom-controls {
+	display: inline-flex;
+	align-items: center;
+	flex: 0 0 auto;
+	min-height: 30px;
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	background: #121718;
+	overflow: hidden;
+}
+
+.timeline-zoom-button {
+	display: inline-grid;
+	place-items: center;
+	width: 27px;
+	height: 30px;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	color: var(--ink-soft);
+	font-family: var(--sans);
+	font-size: 17px;
+	line-height: 1;
+	transition: background-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.timeline-zoom-value + .timeline-zoom-button { border-left: 1px solid var(--line); }
+
+.timeline-zoom-button:hover:not(:disabled),
+.timeline-zoom-button:focus-visible { background: #293133; color: var(--accent); }
+
+.timeline-zoom-button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.timeline-zoom-button:disabled { cursor: not-allowed; opacity: 0.32; }
+
+.timeline-zoom-value {
+	display: inline-grid;
+	place-items: center;
+	min-width: 40px;
+	height: 30px;
+	padding: 0 4px;
+	color: var(--ink-muted);
+	font-family: var(--mono);
+	font-size: 8px;
+	font-variant-numeric: tabular-nums;
+	letter-spacing: 0.04em;
+}
+
 .add-track-button {
 	display: inline-flex;
 	align-items: center;
@@ -744,6 +792,33 @@ a { color: inherit; }
 	white-space: nowrap;
 }
 
+.pattern-region-looping {
+	background-color: color-mix(in srgb, var(--track-color) 14%, #0e1213);
+	background-image: repeating-linear-gradient(
+		90deg,
+		color-mix(in srgb, var(--track-color) 14%, #0e1213) 0,
+		color-mix(in srgb, var(--track-color) 14%, #0e1213) calc(var(--loop-width, 1px) - 1px),
+		color-mix(in srgb, var(--track-color) 34%, #0e1213) calc(var(--loop-width, 1px) - 1px),
+		color-mix(in srgb, var(--track-color) 34%, #0e1213) var(--loop-width, 1px)
+	);
+}
+
+.pattern-region-looping::after {
+	content: '';
+	position: absolute;
+	inset: 0;
+	border-right: 1px solid color-mix(in srgb, var(--track-color) 48%, transparent);
+	background: repeating-linear-gradient(
+		90deg,
+		transparent 0,
+		transparent calc(var(--loop-width, 1px) - 1px),
+		color-mix(in srgb, var(--track-color) 42%, transparent) calc(var(--loop-width, 1px) - 1px),
+		color-mix(in srgb, var(--track-color) 42%, transparent) var(--loop-width, 1px)
+	);
+	opacity: 0.7;
+	pointer-events: none;
+}
+
 .pattern-region > span,
 .pattern-region > small { pointer-events: none; }
 
@@ -761,6 +836,11 @@ a { color: inherit; }
 .clip-handle-start { left: 0; }
 
 .clip-handle-end { right: 0; }
+
+.pattern-region-looping .clip-handle-end {
+	right: auto;
+	left: calc(var(--loop-handle-position, 1) * 100% - 4px);
+}
 
 .lane-playhead {
 	position: absolute;
