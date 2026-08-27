@@ -1297,8 +1297,8 @@ export default function Studio() {
 	}, []);
 
 	const finishTrackRename = useCallback(
-		async (trackId: string) => {
-			const result = await renameTrack(trackId, renamingTrackValue);
+		async (trackId: string, name = renamingTrackValue) => {
+			const result = await renameTrack(trackId, name);
 			if (result.ok) cancelTrackRename();
 		},
 		[cancelTrackRename, renameTrack, renamingTrackValue],
@@ -2449,12 +2449,13 @@ export default function Studio() {
 															maxLength={TRACK_NAME_MAX_LENGTH}
 															autoFocus
 															onChange={(event) => setRenamingTrackValue(event.target.value)}
+															onBlur={(event) => { void finishTrackRename(block.id, event.currentTarget.value); }}
 															onClick={(event) => event.stopPropagation()}
 															onKeyDown={(event) => {
 																if (event.key === 'Enter') {
 																	event.preventDefault();
 																	event.stopPropagation();
-																	void finishTrackRename(block.id);
+																	void finishTrackRename(block.id, event.currentTarget.value);
 																} else if (event.key === 'Escape') {
 																	event.preventDefault();
 																	event.stopPropagation();
@@ -2464,8 +2465,8 @@ export default function Studio() {
 																aria-label={`Rename ${block.name}`}
 														/>
 													) : (
-														<span className="track-name-edit">
-															<strong>{block.name}</strong>
+														<span className="track-name-edit" onDoubleClick={(event) => { event.stopPropagation(); beginTrackRename(block.id); }}>
+															<strong title="Double-click to rename">{block.name}</strong>
 															<button className="track-rename-button" type="button" onClick={(event) => { event.stopPropagation(); beginTrackRename(block.id); }} aria-label={`Rename ${block.name}`} title={`Rename ${block.name}`}>
 																<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 5.5 4 4M5 19l3.8-.8L19.2 7.8a1.7 1.7 0 0 0-2.4-2.4L6.4 15.8 5 19Z" /></svg>
 															</button>

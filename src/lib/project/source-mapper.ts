@@ -283,11 +283,18 @@ function formatNumber(value: number): string {
  * the next line into invalid JavaScript.
  */
 function splitTrailingComment(expression: string): { body: string; suffix: string } {
-	const lineComment = expression.match(/(\s*)(\/\/[^\r\n]*)(\r?\n?)$/);
+	const inlineComment = expression.match(/([\s\S]*?)([ \t]+\/\/[^\r\n]*)([ \t]*(?:\r?\n[ \t]*)*)$/);
+	if (inlineComment) {
+		return {
+			body: inlineComment[1],
+			suffix: `${inlineComment[2]}${inlineComment[3]}`,
+		};
+	}
+	const lineComment = expression.match(/([\s\S]*?)(\r?\n[ \t]*\/\/[^\r\n]*(?:[ \t]*\r?\n[ \t]*\/\/[^\r\n]*)*)([ \t]*(?:\r?\n[ \t]*)*)$/);
 	if (lineComment) {
 		return {
-			body: expression.slice(0, expression.length - lineComment[0].length),
-			suffix: lineComment[0],
+			body: lineComment[1],
+			suffix: `${lineComment[2]}${lineComment[3]}`,
 		};
 	}
 	const blockComment = expression.match(/(\s*)(\/\*[\s\S]*?\*\/)(\s*)$/);

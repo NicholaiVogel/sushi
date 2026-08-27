@@ -243,6 +243,23 @@ describe('source mapper', () => {
 		expect(() => new Function(withRange.replace(/^\/\/.*\n/, ''))).not.toThrow();
 	});
 
+	test('keeps comment-only lines outside generated source controls', () => {
+		const source = `// @sushi-track {"id":"trk_comment_line","name":"Pulse","type":"synth","schema":1}\n$: s("bd")\n// keep this note\n\n$: s("cp")`;
+		const updated = updateTrackRange(source, 'trk_comment_line', 1, 3);
+
+		expect(updated).toContain('seqPLoop([1, 3, s("bd")])\n// keep this note');
+		expect(updated).not.toContain('// keep this note])');
+		expect(() => new Function(updated.replace(/^\/\/.*\n/, ''))).not.toThrow();
+	});
+
+	test('does not treat URL-like strings as trailing comments', () => {
+		const source = `// @sushi-track {"id":"trk_url","name":"Sample","type":"sample","schema":1}\n$: s("https://example.com/sample")`;
+		const updated = updateTrackGain(source, 'trk_url', 0.5);
+
+		expect(updated).toContain('s("https://example.com/sample").gain(0.5)');
+		expect(() => new Function(updated.replace(/^\/\/.*\n/, ''))).not.toThrow();
+	});
+
 	test('ignores non-finite mixer values instead of writing invalid JavaScript', () => {
 		const source = DEFAULT_SOURCE;
 		expect(updateTrackGain(source, 'trk_01J4PULSE', Number.NaN)).toBe(source);
