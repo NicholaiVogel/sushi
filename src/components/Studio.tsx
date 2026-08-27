@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import {
 	createInitialProject,
 	DEFAULT_SONG_END_CYCLE,
+	EXTENDED_SONG_END_CYCLE,
 	diagnosticFromError,
 	getSourceBlocks,
 	getSourceIdentityDiagnostics,
@@ -27,14 +28,8 @@ import {
 } from '../lib/project/source-mapper';
 import { getSourceLineNumbers } from '../lib/project/editor';
 import {
-	clampTimelineZoom,
-	DEFAULT_TIMELINE_ZOOM,
 	getTimelineCapacityForEndCycle,
-	getTimelineCells,
 	getTimelineZoomForVisibleCycles,
-	MAX_TIMELINE_ZOOM,
-	MIN_TIMELINE_ZOOM,
-	TIMELINE_ZOOM_STEP,
 } from '../lib/project/timeline';
 import { highlightStrudel } from '../lib/project/syntax-highlight';
 import { loadProjectSnapshot, parseProjectExport, saveProjectSnapshot, serializeProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
@@ -126,6 +121,11 @@ interface TimingDrag {
 	lastPointerClientX: number;
 }
 
+type HeaderPopover = 'tempo' | 'key' | 'help' | 'length';
+
+const SONG_LENGTH_PRESETS = [4, 8, 16, 30, 60, 120] as const;
+const TIMELINE_ZOOM_BUTTON_STEP = 10;
+
 function createInitialStudioState(): StudioState {
 	const project = createInitialProject();
 	return {
@@ -190,19 +190,25 @@ function getDiagnosticLocation(diagnostic: SourceDiagnostic): string {
 }
 
 const TRACK_COLORS = ['#d9ff68', '#8fe1ff', '#f0a3c7', '#c7a6ff'];
-const KEY_OPTIONS = [
-	'C:major', 'C:minor',
-	'C#:major', 'C#:minor',
-	'D:major', 'D:minor',
-	'D#:major', 'D#:minor',
-	'E:major', 'E:minor',
-	'F:major', 'F:minor',
-	'F#:major', 'F#:minor',
-	'G:major', 'G:minor',
-	'G#:major', 'G#:minor',
-	'A:major', 'A:minor',
-	'A#:major', 'A#:minor',
-	'B:major', 'B:minor',
+interface KeyRootOption {
+	value: string;
+	label: string;
+	alternate?: string;
+}
+
+const KEY_ROOT_OPTIONS: KeyRootOption[] = [
+	{ value: 'C', label: 'C' },
+	{ value: 'C#', label: 'C#', alternate: 'D♭' },
+	{ value: 'D', label: 'D' },
+	{ value: 'D#', label: 'D#', alternate: 'E♭' },
+	{ value: 'E', label: 'E' },
+	{ value: 'F', label: 'F' },
+	{ value: 'F#', label: 'F#', alternate: 'G♭' },
+	{ value: 'G', label: 'G' },
+	{ value: 'G#', label: 'G#', alternate: 'A♭' },
+	{ value: 'A', label: 'A' },
+	{ value: 'A#', label: 'A#', alternate: 'B♭' },
+	{ value: 'B', label: 'B' },
 ];
 const SOURCE_HISTORY_LIMIT = 100;
 const EDITOR_WIDTH_MIN = 280;
@@ -255,8 +261,17 @@ function formatCycle(cycle: number): string {
 	return Number(cycle.toFixed(2)).toString();
 }
 
-function formatKey(key: string): string {
-	return key.replace(':', ' ').toUpperCase();
+function getKeyParts(key: string): { root: string; mode: 'major' | 'minor' } {
+	const [root, mode] = key.split(':');
+	return {
+		root: root?.trim() || 'C',
+		mode: mode?.trim().toLowerCase() === 'major' ? 'major' : 'minor',
+	};
+}
+
+function formatKeyDisplay(key: string): string {
+	const { root, mode } = getKeyParts(key);
+	return `${root.replace('#', '♯')} ${mode === 'major' ? 'maj' : 'min'}`;
 }
 
 function getExplicitSourceEndCycle(source: string): number {
@@ -387,13 +402,13 @@ function makeMutationResult(
 export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
 	const [editorWidth, setEditorWidth] = useState(350);
-	const [arrangementZoom, setArrangementZoom] = useState(DEFAULT_TIMELINE_ZOOM);
 	const [, setSourceHistoryVersion] = useState(0);
 	const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
 	const [contextMenu, setContextMenu] = useState<{ trackId: string; x: number; y: number } | null>(null);
 	const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
 	const [renamingTrackValue, setRenamingTrackValue] = useState('');
 	const [timelineZoom, setTimelineZoom] = useState(0);
+	const [openHeaderPopover, setOpenHeaderPopover] = useState<HeaderPopover | null>(null);
 	const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
@@ -415,6 +430,8 @@ export default function Studio() {
 	const timelineSeekDragRef = useRef<HTMLElement | null>(null);
 	const timelineSeekCycleRef = useRef<number | null>(null);
 	const contextMenuRef = useRef<HTMLDivElement | null>(null);
+	const headerPopoverScopeRef = useRef<HTMLElement | null>(null);
+	const timelineLengthRef = useRef<HTMLDivElement | null>(null);
 	const sourceHistoryRef = useRef<SourceHistoryState>({
 		cursorSource: createInitialProject().source.draft,
 		undo: [],
@@ -834,15 +851,6 @@ export default function Studio() {
 		[updateSourceDraft],
 	);
 
-	const extendTimeline = useCallback(() => {
-		const currentSongEndCycle = studioRef.current.songEndCycle;
-		const nextSongEndCycle = getTimelineCapacityForEndCycle(currentSongEndCycle + TIMELINE_SNAP_CYCLE);
-		if (nextSongEndCycle <= currentSongEndCycle) return;
-		adapterRef.current?.setSongEndCycle(nextSongEndCycle);
-		patchStudio({ songEndCycle: nextSongEndCycle });
-		void persistStudioSnapshot();
-	}, [patchStudio, persistStudioSnapshot]);
-
 	const setTrackRange = useCallback(
 		(trackId: string, startCycle: number, endCycle: number) => {
 			const current = studioRef.current;
@@ -868,10 +876,8 @@ export default function Studio() {
 		if (!Number.isFinite(value) || value <= 0) return;
 		const cycleStep = getSourceCycleStep(studioRef.current.lastValid);
 		const requestedEndCycle = Math.max(cycleStep, Math.round(value / cycleStep) * cycleStep);
-		const currentSongEndCycle = studioRef.current.songEndCycle;
-		const nextSongEndCycle = requestedEndCycle > currentSongEndCycle
-			? getTimelineCapacityForEndCycle(requestedEndCycle)
-			: Math.max(requestedEndCycle, getExplicitSourceEndCycle(studioRef.current.lastValid));
+		const explicitSourceEndCycle = getExplicitSourceEndCycle(studioRef.current.lastValid);
+		const nextSongEndCycle = Math.min(EXTENDED_SONG_END_CYCLE, Math.max(requestedEndCycle, explicitSourceEndCycle));
 		adapterRef.current?.setSongEndCycle(nextSongEndCycle);
 		patchStudio({
 			songEndCycle: nextSongEndCycle,
@@ -882,12 +888,12 @@ export default function Studio() {
 		void persistStudioSnapshot();
 	}, [patchStudio, persistStudioSnapshot]);
 
-	const adjustArrangementZoom = useCallback((delta: number) => {
+	const adjustTimelineZoom = useCallback((value: number) => {
 		const shell = timelineShellRef.current;
 		if (shell && shell.scrollWidth > 0) {
 			timelineZoomAnchorRef.current = (shell.scrollLeft + shell.clientWidth / 2) / shell.scrollWidth;
 		}
-		setArrangementZoom((current) => clampTimelineZoom(current + delta));
+		setTimelineZoom(Math.max(0, Math.min(100, value)));
 	}, []);
 
 	useEffect(() => {
@@ -900,7 +906,7 @@ export default function Studio() {
 			shell.scrollLeft = Math.max(0, anchor * shell.scrollWidth - shell.clientWidth / 2);
 		});
 		return () => cancelAnimationFrame(frame);
-	}, [arrangementZoom]);
+	}, [timelineZoom]);
 
 	const updateGlobalSource = useCallback(
 		(update: (source: string) => string) => updateSourceDraft(update),
@@ -1326,6 +1332,23 @@ export default function Studio() {
 			document.removeEventListener('keydown', handleKeyDown);
 		};
 	}, [contextMenu]);
+
+	useEffect(() => {
+		if (!openHeaderPopover) return undefined;
+		const handlePointerDown = (event: PointerEvent) => {
+			if (event.target instanceof Node && (headerPopoverScopeRef.current?.contains(event.target) || timelineLengthRef.current?.contains(event.target))) return;
+			setOpenHeaderPopover(null);
+		};
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') setOpenHeaderPopover(null);
+		};
+		document.addEventListener('pointerdown', handlePointerDown);
+		document.addEventListener('keydown', handleKeyDown);
+		return () => {
+			document.removeEventListener('pointerdown', handlePointerDown);
+			document.removeEventListener('keydown', handleKeyDown);
+		};
+	}, [openHeaderPopover]);
 
 	const dispatch = useCallback(
 		async (command: StudioCommand): Promise<DispatchResult> => {
@@ -2070,6 +2093,8 @@ export default function Studio() {
 	const contextMenuTrack = useMemo(() => blocks.find((block) => block.id === contextMenu?.trackId), [blocks, contextMenu?.trackId]);
 	const sourceGlobals = useMemo(() => getSourceGlobals(studio.lastValid), [studio.lastValid]);
 	const draftGlobals = useMemo(() => getSourceGlobals(studio.draft), [studio.draft]);
+	const draftBpm = clamp(Math.round(draftGlobals.bpm), 0, 300);
+	const draftKey = getKeyParts(draftGlobals.key);
 	const isDirty = studio.draft !== studio.lastValid;
 	const isBusy = studio.phase === 'booting' || studio.phase === 'validating';
 	const canPlay = !isBusy && studio.runtime.audioState !== 'initializing';
@@ -2083,12 +2108,10 @@ export default function Studio() {
 	const timelineCellCount = Math.max(1, Math.ceil(studio.songEndCycle / TIMELINE_SNAP_CYCLE));
 	const timelineSongCycles = Math.max(TIMELINE_SNAP_CYCLE, studio.songEndCycle);
 	const zoomOutCycles = timelineSongCycles;
-	const nextTimelineEndCycle = getTimelineCapacityForEndCycle(studio.songEndCycle + TIMELINE_SNAP_CYCLE);
-	const timelineExtensionCycles = Math.max(0, nextTimelineEndCycle - studio.songEndCycle);
 	const timelineVisibleCycles = zoomOutCycles - (zoomOutCycles - 1) * (timelineZoom / 100);
 	const timelineShowsQuarterBars = timelineVisibleCycles <= DEFAULT_SONG_END_CYCLE;
 	const timelineAvailableWidth = Math.max(560, (timelineViewportWidth || 960) - TIMELINE_LABEL_MIN_WIDTH);
-	const timelineGridWidth = Math.max(560, timelineAvailableWidth * timelineSongCycles / timelineVisibleCycles * arrangementZoom);
+	const timelineGridWidth = Math.max(560, timelineAvailableWidth * timelineSongCycles / timelineVisibleCycles);
 	const timelineBarLabelStride = timelineLabelStride(timelineGridWidth / timelineSongCycles);
 	const timelineCells = useMemo(() => Array.from({ length: timelineCellCount }, (_, index) => {
 		const isBarStart = index % 4 === 0;
@@ -2116,7 +2139,7 @@ export default function Studio() {
 
 	return (
 		<div className="studio-shell">
-			<header className="studio-topbar">
+			<header className="studio-topbar" ref={headerPopoverScopeRef}>
 				<div className="topbar-brand-group">
 					<a className="wordmark" href="/" aria-label="Sushi home">
 						<span className="wordmark-mark" aria-hidden="true">◒</span> sushi
@@ -2129,57 +2152,122 @@ export default function Studio() {
 						<span className={`save-state ${isDirty || studio.persistenceState === 'loading' ? 'save-state-dirty' : ''}`} title={studio.persistenceState === 'unavailable' ? 'IndexedDB is unavailable; this session will not persist after reload.' : 'Project state is saved locally'}><span className="save-dot" aria-hidden="true" />{saveStateLabel}</span>
 					</div>
 					<div className="topbar-transport" aria-label="Transport controls">
-						<div className="topbar-global-controls" aria-label="Tempo and key controls">
-							<label className="topbar-key-control">
-								<span className="topbar-control-label">KEY</span>
-								<select value={draftGlobals.key} onChange={(event) => setKey(event.target.value)} disabled={isBusy} aria-label="Musical key" title="Set musical key">
-									{!KEY_OPTIONS.includes(draftGlobals.key) ? <option value={draftGlobals.key}>{formatKey(draftGlobals.key)}</option> : null}
-									{KEY_OPTIONS.map((key) => <option value={key} key={key}>{formatKey(key)}</option>)}
-								</select>
-							</label>
-								<label className="topbar-bpm-control">
-									<span className="topbar-control-label">BPM</span>
-									<input type="range" min="0" max="300" step="1" value={clamp(Math.round(draftGlobals.bpm), 0, 300)} onChange={(event) => setTempo(Number(event.target.value))} disabled={isBusy} aria-label="Tempo in beats per minute" title="Set tempo from 0 to 300 BPM" />
-									<output>{Math.round(clamp(draftGlobals.bpm, 0, 300))}</output>
+						<div className="topbar-transport-left">
+							<div className="topbar-global-controls" aria-label="Tempo and key controls">
+								<div className="topbar-global-control topbar-bpm-control">
+									<button className="topbar-control-trigger" type="button" onClick={() => setOpenHeaderPopover((current) => current === 'tempo' ? null : 'tempo')} disabled={isBusy} aria-expanded={openHeaderPopover === 'tempo'} aria-haspopup="dialog" aria-label={`Tempo, ${draftBpm} beats per minute`} title="Open tempo controls">
+										<strong>{draftBpm}</strong><span>BPM</span>
+									</button>
+									{openHeaderPopover === 'tempo' ? (
+										<div className="topbar-global-popover tempo-popover" role="dialog" aria-label="Tempo settings">
+											<strong className="topbar-popover-title">Tempo</strong>
+											<div className="tempo-stepper">
+												<button className="tempo-step-button" type="button" onClick={() => setTempo(clamp(draftBpm - 1, 0, 300))} disabled={isBusy || draftBpm <= 0} aria-label="Decrease tempo by 1 BPM" title="Decrease tempo by 1 BPM">−</button>
+												<label className="tempo-value-field">
+													<span className="sr-only">Tempo in beats per minute</span>
+													<input autoFocus type="number" min="0" max="300" step="1" value={draftBpm} onChange={(event) => setTempo(Number(event.target.value))} disabled={isBusy} aria-label="Tempo in beats per minute" />
+													<span>BPM</span>
+												</label>
+												<button className="tempo-step-button" type="button" onClick={() => setTempo(clamp(draftBpm + 1, 0, 300))} disabled={isBusy || draftBpm >= 300} aria-label="Increase tempo by 1 BPM" title="Increase tempo by 1 BPM">+</button>
+											</div>
+											<span className="topbar-popover-note">SOURCE · setcpm</span>
+										</div>
+									) : null}
+								</div>
+								<label className="topbar-quarter-control" title="Set quarter notes per Strudel cycle">
+									<span className="sr-only">Quarter notes per Strudel cycle</span>
+									<input type="number" min="1" max="32" step="1" value={formatCycle(draftGlobals.quarterNotesPerCycle)} onChange={(event) => setQuarterNotesPerCycle(Number(event.target.value))} disabled={isBusy} aria-label="Quarter notes per Strudel cycle" />
+									<span className="topbar-quarter-unit">Q/C</span>
 								</label>
-								<label className="topbar-quarter-control">
-									<span className="topbar-control-label">Q/C</span>
-									<input type="number" min="1" max="32" step="1" value={formatCycle(draftGlobals.quarterNotesPerCycle)} onChange={(event) => setQuarterNotesPerCycle(Number(event.target.value))} disabled={isBusy} aria-label="Quarter notes per Strudel cycle" title="Set quarter notes per cycle" />
-								</label>
+								<div className="topbar-global-control topbar-key-control">
+									<button className="topbar-control-trigger" type="button" onClick={() => setOpenHeaderPopover((current) => current === 'key' ? null : 'key')} disabled={isBusy} aria-expanded={openHeaderPopover === 'key'} aria-haspopup="dialog" aria-label={`Musical key, ${formatKeyDisplay(draftGlobals.key)}`} title="Open musical key controls">
+										<strong>{formatKeyDisplay(draftGlobals.key)}</strong>
+										<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 6 5 5 5-5" /></svg>
+									</button>
+									{openHeaderPopover === 'key' ? (
+										<div className="topbar-global-popover key-popover" role="dialog" aria-label="Musical key settings">
+											<strong className="topbar-popover-title">Musical key</strong>
+											<div className="key-quality-toggle" role="group" aria-label="Key quality">
+												{(['major', 'minor'] as const).map((mode) => (
+													<button className={draftKey.mode === mode ? 'key-quality-button key-quality-button-active' : 'key-quality-button'} type="button" onClick={() => setKey(`${draftKey.root}:${mode}`)} aria-pressed={draftKey.mode === mode}>{mode === 'major' ? 'Major' : 'Minor'}</button>
+												))}
+											</div>
+											<div className="key-root-grid" role="group" aria-label="Key root">
+												<div className="key-root-row key-root-row-accidentals">
+													{KEY_ROOT_OPTIONS.filter((root) => root.alternate).map((root) => (
+														<button className={draftKey.root === root.value ? 'key-root-button key-root-button-active' : 'key-root-button'} type="button" onClick={() => setKey(`${root.value}:${draftKey.mode}`)} aria-pressed={draftKey.root === root.value} aria-label={`${root.value} or ${root.alternate}`}>
+															<span>{root.label}</span><small>{root.alternate}</small>
+														</button>
+													))}
+												</div>
+												<div className="key-root-row key-root-row-naturals">
+													{KEY_ROOT_OPTIONS.filter((root) => !root.alternate).map((root) => (
+														<button className={draftKey.root === root.value ? 'key-root-button key-root-button-active' : 'key-root-button'} type="button" onClick={() => setKey(`${root.value}:${draftKey.mode}`)} aria-pressed={draftKey.root === root.value} aria-label={root.value}>
+															<span>{root.label}</span>
+														</button>
+													))}
+												</div>
+											</div>
+											<span className="topbar-popover-note">SOURCE · const key</span>
+										</div>
+									) : null}
+								</div>
 							</div>
-						<div className="topbar-source-actions" aria-label="Source actions">
-						<button className="transport-button source-action-button source-action-revert" type="button" onClick={() => { cancelPendingTrackCommit(); sourceHistoryRef.current.cursorSource = studioRef.current.lastValid; patchStudio({ draft: studioRef.current.lastValid, diagnostics: [], phase: 'ready' }); void persistStudioSnapshot(); }} disabled={!isDirty || isBusy} aria-label="Revert source draft" title="Revert source draft">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v4" /><path d="M5.2 11A7.5 7.5 0 1 0 7.4 5.6L5 7" /></svg>
-							</button>
-							<button className="transport-button source-action-button source-action-commit" type="button" onClick={() => void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studio.revision })} disabled={!isDirty || isBusy} aria-label="Commit source" title="Commit source">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>
-							</button>
-							<button className="transport-button source-action-button" type="button" onClick={() => void undoSourceEdit()} disabled={isBusy || isDirty || sourceHistoryRef.current.undo.length === 0} aria-label="Undo source edit" title="Undo source edit">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h8a6 6 0 0 1 6 6" /></svg>
-							</button>
-							<button className="transport-button source-action-button" type="button" onClick={() => void redoSourceEdit()} disabled={isBusy || isDirty || sourceHistoryRef.current.redo.length === 0} aria-label="Redo source edit" title="Redo source edit">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 8 5 4-5 4" /><path d="M20 12h-8a6 6 0 0 0-6 6" /></svg>
-							</button>
-							<button className="transport-button source-action-button" type="button" onClick={exportProject} disabled={isBusy} aria-label="Export Sushi project" title="Export project">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11" /><path d="m8 8 4-4 4 4" /><path d="M5 14v5h14v-5" /></svg>
-							</button>
-							<button className="transport-button source-action-button" type="button" onClick={() => projectImportInputRef.current?.click()} disabled={isBusy} aria-label="Import Sushi project" title="Import project">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V9" /><path d="m8 16 4 4 4-4" /><path d="M5 10V5h14v5" /></svg>
-							</button>
-							<input ref={projectImportInputRef} className="project-import-input" type="file" accept="application/json,.json" onChange={importProject} aria-label="Import Sushi project file" />
+							<div className="topbar-source-actions" aria-label="Source actions">
+								<button className="transport-button source-action-button source-action-revert" type="button" onClick={() => { cancelPendingTrackCommit(); sourceHistoryRef.current.cursorSource = studioRef.current.lastValid; patchStudio({ draft: studioRef.current.lastValid, diagnostics: [], phase: 'ready' }); void persistStudioSnapshot(); }} disabled={!isDirty || isBusy} aria-label="Revert source draft" title="Revert source draft">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v4" /><path d="M5.2 11A7.5 7.5 0 1 0 7.4 5.6L5 7" /></svg>
+								</button>
+								<button className="transport-button source-action-button source-action-commit" type="button" onClick={() => void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studio.revision })} disabled={!isDirty || isBusy} aria-label="Commit source" title="Commit source">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>
+								</button>
+							</div>
 						</div>
-						<span className="topbar-action-divider" aria-hidden="true" />
-						<button className="transport-button transport-stop" type="button" onClick={() => void dispatch({ type: 'stop' })} disabled={!canPlay || (studio.runtime.transport === 'stopped' && studio.runtime.currentCycle === 0)} aria-label="Stop playback" title="Stop and return to cycle zero">■</button>
-						<button className="transport-button transport-play" type="button" onClick={() => void dispatch({ type: 'play' })} disabled={!canPlay} aria-label={studio.runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'} title={studio.runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'}>▶</button>
-						<button className="transport-button transport-pause" type="button" onClick={() => void dispatch({ type: 'pause' })} disabled={!canPlay || studio.runtime.transport !== 'playing'} aria-label="Pause playback" title="Pause at the current cycle">Ⅱ</button>
-						<span className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>
-						<span className="transport-cycle" aria-live="polite">CYCLE {formatCycle(studio.runtime.currentCycle)}</span>
-						<span className="transport-divider" aria-hidden="true" />
-						<span className="transport-readout">{studio.runtime.audioState === 'initializing' ? 'PREPARING' : studio.runtime.transport.toUpperCase()}</span>
+						<div className="transport-playback" aria-label="Playback controls">
+							<button className="transport-button transport-stop" type="button" onClick={() => void dispatch({ type: 'stop' })} disabled={!canPlay || (studio.runtime.transport === 'stopped' && studio.runtime.currentCycle === 0)} aria-label="Stop playback" title="Stop and return to cycle zero">■</button>
+							<button className="transport-button transport-play" type="button" onClick={() => void dispatch({ type: 'play' })} disabled={!canPlay} aria-label={studio.runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'} title={studio.runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'}>▶</button>
+							<button className="transport-button transport-pause" type="button" onClick={() => void dispatch({ type: 'pause' })} disabled={!canPlay || studio.runtime.transport !== 'playing'} aria-label="Pause playback" title="Pause at the current cycle">Ⅱ</button>
+						</div>
+						<div className="topbar-transport-right">
+							<div className="topbar-source-actions-right" aria-label="Source history and project actions">
+								<button className="transport-button source-action-button" type="button" onClick={() => void undoSourceEdit()} disabled={isBusy || isDirty || sourceHistoryRef.current.undo.length === 0} aria-label="Undo source edit" title="Undo source edit">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h8a6 6 0 0 1 6 6" /></svg>
+								</button>
+								<button className="transport-button source-action-button" type="button" onClick={() => void redoSourceEdit()} disabled={isBusy || isDirty || sourceHistoryRef.current.redo.length === 0} aria-label="Redo source edit" title="Redo source edit">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 8 5 4-5 4" /><path d="M20 12h-8a6 6 0 0 0-6 6" /></svg>
+								</button>
+								<button className="transport-button source-action-button" type="button" onClick={exportProject} disabled={isBusy} aria-label="Export Sushi project" title="Export project">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11" /><path d="m8 8 4-4 4 4" /><path d="M5 14v5h14v-5" /></svg>
+								</button>
+								<button className="transport-button source-action-button" type="button" onClick={() => projectImportInputRef.current?.click()} disabled={isBusy} aria-label="Import Sushi project" title="Import project">
+									<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V9" /><path d="m8 16 4 4 4-4" /><path d="M5 10V5h14v5" /></svg>
+								</button>
+								<input ref={projectImportInputRef} className="project-import-input" type="file" accept="application/json,.json" onChange={importProject} aria-label="Import Sushi project file" />
+							</div>
+							<div className="transport-status" aria-label="Playback status">
+								<span className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>
+								<span className="transport-cycle" aria-live="polite">CYCLE {formatCycle(studio.runtime.currentCycle)}</span>
+								<span className="transport-divider" aria-hidden="true" />
+								<span className="transport-readout">{studio.runtime.audioState === 'initializing' ? 'PREPARING' : studio.runtime.transport.toUpperCase()}</span>
+							</div>
+						</div>
 					</div>
 				</div>
 				<div className="topbar-right">
 					<div className="topbar-metrics" aria-label="Project settings"><span>{formatCycle(sourceGlobals.quarterNotesPerCycle)} Q/C</span><span>{formatCycle(songEndSeconds)}s</span></div>
+					<div className="topbar-help-control">
+						<button className="topbar-help-button" type="button" onClick={() => setOpenHeaderPopover((current) => current === 'help' ? null : 'help')} disabled={isBusy} aria-expanded={openHeaderPopover === 'help'} aria-haspopup="dialog" aria-label="Keyboard shortcuts" title="Show keyboard shortcuts">?</button>
+						{openHeaderPopover === 'help' ? (
+							<div className="topbar-help-popover" role="dialog" aria-label="Keyboard shortcuts">
+								<strong className="topbar-popover-title">Keyboard shortcuts</strong>
+								<div className="hotkey-list">
+									<div className="hotkey-item"><kbd>⌘ / Ctrl + Enter</kbd><span>Validate source</span></div>
+									<div className="hotkey-item"><kbd>Backspace / Delete</kbd><span>Delete selected track</span></div>
+									<div className="hotkey-item"><kbd>Right-click</kbd><span>Track actions</span></div>
+									<div className="hotkey-item"><kbd>← / →</kbd><span>Nudge a clip by ¼ bar</span></div>
+								</div>
+							</div>
+						) : null}
+				</div>
 				</div>
 			</header>
 
@@ -2240,26 +2328,44 @@ export default function Studio() {
 							<div className="timeline-heading-cell">
 								<div className="arrangement-toolbar">
 									<button className="add-track-button" type="button" onClick={() => void addTrack()} disabled={isBusy} aria-label="Add track"><span aria-hidden="true">＋</span> Add track</button>
-									{timelineExtensionCycles > 0 ? <button className="extend-timeline-button" type="button" onClick={extendTimeline} disabled={isBusy} aria-label={`Extend timeline by ${formatCycle(timelineExtensionCycles)} bars`} title={`Extend the timeline by ${formatCycle(timelineExtensionCycles)} bars`}>EXTEND +{formatCycle(timelineExtensionCycles)}</button> : null}
-									<div className="timeline-zoom-controls" role="group" aria-label="Arrangement zoom">
-										<button className="timeline-zoom-button" type="button" onClick={() => adjustArrangementZoom(-TIMELINE_ZOOM_STEP)} disabled={arrangementZoom <= MIN_TIMELINE_ZOOM} aria-label="Zoom out arrangement" title="Zoom out arrangement">−</button>
-										<output className="timeline-zoom-value" aria-live="polite">{Math.round(arrangementZoom * 100)}%</output>
-										<button className="timeline-zoom-button" type="button" onClick={() => adjustArrangementZoom(TIMELINE_ZOOM_STEP)} disabled={arrangementZoom >= MAX_TIMELINE_ZOOM} aria-label="Zoom in arrangement" title="Zoom in arrangement">＋</button>
-									</div>
 								</div>
 								<div className="timeline-duration">
-									<label className="timeline-length-control">
-										<span className="sr-only">Arrangement length in cycles</span>
-										<input type="number" min={cycleStep} step={cycleStep} value={formatCycle(studio.songEndCycle)} onChange={(event) => setSongEndCycle(Number(event.target.value))} aria-label="Arrangement length in cycles" title="Set arrangement length in cycles" />
-										<span>cycles</span>
-									</label>
+									<div className="timeline-length-control-wrap" ref={timelineLengthRef}>
+										<button className="timeline-length-trigger" type="button" onClick={() => setOpenHeaderPopover((current) => current === 'length' ? null : 'length')} disabled={isBusy} aria-expanded={openHeaderPopover === 'length'} aria-haspopup="dialog" aria-label={`Song length, ${formatCycle(studio.songEndCycle)} bars`} title="Choose song length">
+											<strong>{formatCycle(studio.songEndCycle)}</strong><span>BARS</span>
+											<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 6 5 5 5-5" /></svg>
+										</button>
+										{openHeaderPopover === 'length' ? (
+											<div className="timeline-length-popover" role="dialog" aria-label="Song length settings">
+												<strong className="topbar-popover-title">Song length</strong>
+												<label className="timeline-length-value">
+													<span className="sr-only">Song length in bars</span>
+													<input autoFocus type="number" min={cycleStep} max={EXTENDED_SONG_END_CYCLE} step={cycleStep} value={formatCycle(studio.songEndCycle)} onChange={(event) => setSongEndCycle(Number(event.target.value))} aria-label="Song length in bars" />
+													<span>BARS</span>
+												</label>
+												<div className="timeline-length-presets" role="group" aria-label="Song length presets">
+													{SONG_LENGTH_PRESETS.map((preset) => <button className={studio.songEndCycle === preset ? 'timeline-length-preset timeline-length-preset-active' : 'timeline-length-preset'} type="button" key={preset} onClick={() => setSongEndCycle(preset)} aria-pressed={studio.songEndCycle === preset}>{preset}</button>)}
+												</div>
+												<span className="timeline-length-note">{formatCycle(songEndSeconds)}S AT {draftBpm} BPM</span>
+											</div>
+										) : null}
+									</div>
 									<span aria-hidden="true">·</span>
-									<span>{formatCycle(songEndSeconds)}s</span>
+									<span>{formatCycle(songEndSeconds)}S</span>
 								</div>
 								<span className="sr-only" id="timeline-heading">{activeLaneCount} source lanes</span>
 							</div>
 							<div className="timeline-ruler" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-label="Arrangement beats">
 								{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'bar-number' : ''} key={index}>{cell.label}</span>)}
+								<div className="timeline-ruler-controls" role="group" aria-label="Timeline zoom">
+									<button className="timeline-ruler-zoom-button" type="button" onClick={() => adjustTimelineZoom(timelineZoom - TIMELINE_ZOOM_BUTTON_STEP)} disabled={isBusy || timelineZoom <= 0} aria-label="Zoom out timeline" title="Zoom out timeline">
+										<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="M7.5 10.5h6" /><path d="m15 15 5 5" /></svg>
+									</button>
+									<output aria-live="polite">{Math.round(timelineVisibleCycles)} BAR{Math.round(timelineVisibleCycles) === 1 ? '' : 'S'}</output>
+									<button className="timeline-ruler-zoom-button" type="button" onClick={() => adjustTimelineZoom(timelineZoom + TIMELINE_ZOOM_BUTTON_STEP)} disabled={isBusy || timelineZoom >= 100} aria-label="Zoom in timeline" title="Zoom in timeline">
+										<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="M7.5 10.5h6" /><path d="M10.5 7.5v6" /><path d="m15 15 5 5" /></svg>
+									</button>
+								</div>
 								<button className="timeline-seek-surface" type="button" onPointerDown={startTimelineSeekDrag} onKeyDown={handleTimelineSeekKeyDown} disabled={isBusy} aria-label={`Seek playhead, cycle ${formatCycle(studio.runtime.currentCycle)}, ${formatClock(currentSeconds)}`} title="Click or drag to seek" />
 								<i className="timeline-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
 							</div>
@@ -2386,28 +2492,6 @@ export default function Studio() {
 					{studio.diagnostics.length ? <div className="canvas-diagnostic" role="status" aria-live="polite"><div className="diagnostic-meta"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span>{getDiagnosticLocation(studio.diagnostics[0]) || `REV ${formatRevision(studio.diagnostics[0].revision)}`}</span></div><p>{studio.diagnostics[0].message}</p>{studio.diagnostics[0].context ? <code className="diagnostic-context">{studio.diagnostics[0].context}</code> : null}</div> : null}
 				</main>
 			</div>
-
-
-			<footer className="studio-footer" aria-label="Studio commands">
-				<div className="studio-footer-group studio-footer-left">
-					<span className="studio-footer-heading">COMMANDS</span>
-					<span><kbd>⌘/Ctrl + Enter</kbd> validate source</span>
-					<span><kbd>Backspace/Delete</kbd> delete selected track</span>
-				</div>
-				<div className="studio-footer-group studio-footer-right">
-					<div className="timeline-zoom-control">
-						<span className="timeline-zoom-icon timeline-zoom-mountain" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m3 18 5.5-7 3.3 4 3.2-5 6 8H3Z" /></svg></span>
-						<label>
-							<span className="sr-only">Timeline zoom</span>
-							<input type="range" min="0" max="100" step="1" value={timelineZoom} onChange={(event) => setTimelineZoom(Number(event.target.value))} aria-label="Timeline zoom" aria-valuetext={`${Math.round(timelineVisibleCycles)} bars visible`} title="Timeline zoom: overview to one bar" />
-						</label>
-						<span className="timeline-zoom-icon timeline-zoom-search" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 5 5" /></svg></span>
-						<output>{Math.round(timelineVisibleCycles)} BAR{Math.round(timelineVisibleCycles) === 1 ? '' : 'S'}</output>
-					</div>
-					<span><kbd>Right-click</kbd> track actions</span>
-					<span><kbd>←/→</kbd> nudge a clip by ¼ bar</span>
-				</div>
-			</footer>
 
 			{contextMenu && contextMenuTrack ? (
 				<div className="track-context-menu" ref={contextMenuRef} style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" aria-label={`${contextMenuTrack.name} track actions`}>
