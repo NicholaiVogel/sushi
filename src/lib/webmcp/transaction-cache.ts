@@ -27,6 +27,12 @@ export class TransactionCache<T> {
 		return this.completed.get(this.key(action, transactionId));
 	}
 
+	/** Store a result produced by a caller that manages its own async flow. */
+	public set(action: string, transactionId: string, result: T): void {
+		this.completed.set(this.key(action, transactionId), result);
+		this.trimCompleted();
+	}
+
 	public run(action: string, transactionId: string, operation: () => T | Promise<T>, fingerprint?: string): Promise<T> {
 		const key = this.key(action, transactionId);
 		const existingFingerprint = this.fingerprints.get(key);

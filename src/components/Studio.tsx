@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent as ReactChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent as ReactChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
 	createInitialProject,
 	DEFAULT_SONG_END_CYCLE,
 	diagnosticFromError,
+	EXTENDED_SONG_END_CYCLE,
 	getSourceBlocks,
 	getSourceIdentityDiagnostics,
 	type AssetManifestEntry,
+	LEGACY_DEFAULT_SOURCE,
 	type RuntimeState,
 	type SourceDiagnostic,
 } from '../lib/project/model';
@@ -17,8 +19,11 @@ import {
 	updateSourceKey,
 	updateSourceQuarterNotesPerCycle,
 	updateSourceTempo,
+	deleteTrack as deleteSourceTrack,
+	updateSourceBpm,
 	updateTrackGain,
 	updateTrackMode,
+	updateTrackName as updateSourceTrackName,
 	updateTrackPan,
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
@@ -43,11 +48,18 @@ import {
 	type SourceMutationInput,
 	type SourcePatchInput,
 	type WebMcpController,
+	type WebMcpKeyInput,
 	type WebMcpMutationResult,
 	type WebMcpPlaybackAction,
 	type WebMcpPlaybackResult,
 	type WebMcpRegistration,
 	type WebMcpStateSnapshot,
+	type WebMcpTempoInput,
+	type WebMcpTimelineExtensionInput,
+	type WebMcpTrackMutationInput,
+	type WebMcpTrackRangeInput,
+	type WebMcpTrackRenameInput,
+	type WebMcpTrackTarget,
 	type WebMcpValidationResult,
 } from '../lib/webmcp/tools';
 import { stableSerialize, TransactionCache, TransactionReuseError } from '../lib/webmcp/transaction-cache';
@@ -102,6 +114,15 @@ interface CommitSourceResult {
 		expectedRevision: number;
 		actualRevision: number;
 	};
+}
+
+interface TimingDrag {
+	trackId: string;
+	edge: 'start' | 'end' | 'move';
+	lane: HTMLElement;
+	pointerStartCycle: number;
+	startCycle: number;
+	endCycle: number;
 }
 
 function createInitialStudioState(): StudioState {
@@ -168,9 +189,28 @@ function getDiagnosticLocation(diagnostic: SourceDiagnostic): string {
 }
 
 const TRACK_COLORS = ['#d9ff68', '#8fe1ff', '#f0a3c7', '#c7a6ff'];
+const KEY_OPTIONS = [
+	'C:major', 'C:minor',
+	'C#:major', 'C#:minor',
+	'D:major', 'D:minor',
+	'D#:major', 'D#:minor',
+	'E:major', 'E:minor',
+	'F:major', 'F:minor',
+	'F#:major', 'F#:minor',
+	'G:major', 'G:minor',
+	'G#:major', 'G#:minor',
+	'A:major', 'A:minor',
+	'A#:major', 'A#:minor',
+	'B:major', 'B:minor',
+];
 const SOURCE_HISTORY_LIMIT = 100;
 const EDITOR_WIDTH_MIN = 280;
 const EDITOR_WIDTH_MAX = 560;
+const TIMELINE_SNAP_CYCLE = 0.25;
+const DEFAULT_TRACK_END_CYCLE = 4;
+const TRACK_NAME_MAX_LENGTH = 80;
+const TIMELINE_LABEL_MIN_WIDTH = 270;
+const LEGACY_DEFAULT_SONG_END_CYCLES = [187, 187.5];
 
 function getTrackColor(index: number): string {
 	return TRACK_COLORS[index % TRACK_COLORS.length];
@@ -184,6 +224,25 @@ function clamp(value: number, min: number, max: number): number {
 	return Math.max(min, Math.min(max, value));
 }
 
+function snapCycle(value: number): number {
+	return Math.round(value / TIMELINE_SNAP_CYCLE) * TIMELINE_SNAP_CYCLE;
+}
+
+function normalizeTrackRange(startCycle: number, endCycle: number, songEndCycle: number): { startCycle: number; endCycle: number } {
+	const safeSongEnd = Number.isFinite(songEndCycle) && songEndCycle > 0 ? songEndCycle : TIMELINE_SNAP_CYCLE;
+	const maxEnd = Math.max(TIMELINE_SNAP_CYCLE, Math.floor(safeSongEnd / TIMELINE_SNAP_CYCLE) * TIMELINE_SNAP_CYCLE);
+	const start = clamp(snapCycle(Number.isFinite(startCycle) ? startCycle : 0), 0, Math.max(0, maxEnd - TIMELINE_SNAP_CYCLE));
+	const end = clamp(snapCycle(Number.isFinite(endCycle) ? endCycle : start + TIMELINE_SNAP_CYCLE), start + TIMELINE_SNAP_CYCLE, maxEnd);
+	return { startCycle: Number(start.toFixed(2)), endCycle: Number(end.toFixed(2)) };
+}
+
+function shiftTrackRange(startCycle: number, endCycle: number, delta: number, songEndCycle: number): { startCycle: number; endCycle: number } {
+	const length = Math.max(TIMELINE_SNAP_CYCLE, endCycle - startCycle);
+	const maxStart = Math.max(0, songEndCycle - length);
+	const nextStart = clamp(snapCycle(startCycle + delta), 0, maxStart);
+	return normalizeTrackRange(nextStart, nextStart + length, songEndCycle);
+}
+
 function formatClock(seconds: number): string {
 	const totalSeconds = Math.max(0, Math.floor(seconds));
 	const hours = Math.floor(totalSeconds / 3600);
@@ -194,6 +253,10 @@ function formatClock(seconds: number): string {
 
 function formatCycle(cycle: number): string {
 	return Number(cycle.toFixed(2)).toString();
+}
+
+function formatKey(key: string): string {
+	return key.replace(':', ' ').toUpperCase();
 }
 
 function getExplicitSourceEndCycle(source: string): number {
@@ -235,8 +298,68 @@ function getSourceCycleStep(source: string): number {
 	return 1 / Math.max(1, Math.round(quarterNotesPerCycle));
 }
 
+function timelineLabelStride(pixelsPerCycle: number): number {
+	if (pixelsPerCycle >= 48) return 1;
+	if (pixelsPerCycle >= 24) return 2;
+	if (pixelsPerCycle >= 12) return 4;
+	if (pixelsPerCycle >= 6) return 8;
+	return 16;
+}
+
 function sourceEntityIds(state: WebMcpStateSnapshot): string[] {
 	return ['source', ...state.tracks.map((track) => track.id)];
+}
+
+type TrackDetails = ReturnType<typeof getSourceBlockDetails>[number];
+
+function getTrackTimingForTimeline(track: TrackDetails | undefined, songEndCycle: number): TrackDetails['timing'] {
+	if (track?.timing.mode !== 'full') return track?.timing ?? { mode: 'full', startCycle: 0, endCycle: Math.min(DEFAULT_TRACK_END_CYCLE, songEndCycle) };
+	return { ...track.timing, endCycle: Math.min(DEFAULT_TRACK_END_CYCLE, songEndCycle) };
+}
+
+function sourceUsesExtendedTimeline(source: string): boolean {
+	return getSourceBlockDetails(source).some((track) => track.timing.endCycle > DEFAULT_SONG_END_CYCLE);
+}
+
+type TrackTargetResolution =
+	| { ok: true; track: TrackDetails }
+	| { ok: false; code: string; message: string };
+
+function resolveTrackTarget(source: string, target: WebMcpTrackTarget): TrackTargetResolution {
+	const tracks = getSourceBlockDetails(source);
+	const byNumber = target.trackNumber === undefined ? undefined : tracks[target.trackNumber - 1];
+	const byId = target.trackId === undefined ? undefined : tracks.find((track) => track.id === target.trackId);
+	const normalizedName = target.trackName?.trim().toLocaleLowerCase();
+	const byName = normalizedName
+		? tracks.filter((track) => track.name.trim().toLocaleLowerCase() === normalizedName)
+		: [];
+
+	if (target.trackNumber !== undefined && !byNumber) {
+		return { ok: false, code: 'TRACK_NOT_FOUND', message: `No track exists at track number ${target.trackNumber}.` };
+	}
+	if (target.trackId !== undefined && !byId) {
+		return { ok: false, code: 'TRACK_NOT_FOUND', message: `No track exists with ID ${JSON.stringify(target.trackId)}.` };
+	}
+	if (normalizedName && byName.length > 1) {
+		return { ok: false, code: 'AMBIGUOUS_TRACK_NAME', message: `More than one track is named ${JSON.stringify(target.trackName)}; use trackNumber.` };
+	}
+	if (byNumber && byName.length === 1 && byNumber.id !== byName[0].id) {
+		return { ok: false, code: 'TRACK_TARGET_MISMATCH', message: 'trackNumber and trackName identify different tracks.' };
+	}
+	if (byNumber && byId && byNumber.id !== byId.id) {
+		return { ok: false, code: 'TRACK_TARGET_MISMATCH', message: 'trackNumber and trackId identify different tracks.' };
+	}
+	if (byId && byName.length === 1 && byId.id !== byName[0].id) {
+		return { ok: false, code: 'TRACK_TARGET_MISMATCH', message: 'trackId and trackName identify different tracks.' };
+	}
+	if (byNumber) return { ok: true, track: byNumber };
+	if (byId) return { ok: true, track: byId };
+	if (byName.length === 1) return { ok: true, track: byName[0] };
+	return { ok: false, code: 'TRACK_NOT_FOUND', message: `No track is named ${JSON.stringify(target.trackName)}.` };
+}
+
+function sourceForTrackMutation(studio: StudioState): string {
+	return getSourceBlockDetails(studio.draft).length ? studio.draft : studio.lastValid;
 }
 
 function makeMutationResult(
@@ -248,12 +371,13 @@ function makeMutationResult(
 	ok: boolean,
 	message: string,
 	error?: { code: string; message: string; details?: Record<string, unknown> },
+	affectedEntityIds: string[] = sourceEntityIds(state),
 ): WebMcpMutationResult {
 	const diff = sourceDiff(beforeSource, state.source.draft, beforeRevision, state.source.revision);
 	return {
 		ok,
 		action,
-		affectedEntityIds: sourceEntityIds(state),
+		affectedEntityIds,
 		message,
 		state,
 		revision: state.source.revision,
@@ -269,6 +393,12 @@ export default function Studio() {
 	const [editorWidth, setEditorWidth] = useState(350);
 	const [arrangementZoom, setArrangementZoom] = useState(DEFAULT_TIMELINE_ZOOM);
 	const [, setSourceHistoryVersion] = useState(0);
+	const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+	const [contextMenu, setContextMenu] = useState<{ trackId: string; x: number; y: number } | null>(null);
+	const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
+	const [renamingTrackValue, setRenamingTrackValue] = useState('');
+	const [timelineZoom, setTimelineZoom] = useState(50);
+	const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
@@ -277,16 +407,18 @@ export default function Studio() {
 	const sourceHighlightRef = useRef<HTMLPreElement | null>(null);
 	const editorGutterRef = useRef<HTMLDivElement | null>(null);
 	const projectImportInputRef = useRef<HTMLInputElement | null>(null);
+	const timelineViewportRef = useRef<HTMLElement | null>(null);
+	const timelineShellRef = useRef<HTMLElement | null>(null);
+	const timelineZoomAnchorRef = useRef<number | null>(null);
 	const editorResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 	const pendingTrackSourceRef = useRef<{ source: string; baseRevision: number } | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const sourceCommitQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const persistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
-	const timingDragRef = useRef<{ trackId: string; edge: 'start' | 'end'; lane: HTMLElement } | null>(null);
+	const timingDragRef = useRef<TimingDrag | null>(null);
 	const timelineSeekDragRef = useRef<HTMLElement | null>(null);
 	const timelineSeekCycleRef = useRef<number | null>(null);
-	const timelineShellRef = useRef<HTMLElement | null>(null);
-	const timelineZoomAnchorRef = useRef<number | null>(null);
+	const contextMenuRef = useRef<HTMLDivElement | null>(null);
 	const sourceHistoryRef = useRef<SourceHistoryState>({
 		cursorSource: createInitialProject().source.draft,
 		undo: [],
@@ -380,7 +512,16 @@ export default function Studio() {
 			}
 
 			if (!isCurrentSession()) return;
-			const project = stored?.project ?? fallbackProject;
+			const storedProject = stored?.project;
+			const isUntouchedLegacySeed = storedProject?.source.revision === 0
+				&& storedProject.source.draft === LEGACY_DEFAULT_SOURCE
+				&& storedProject.source.lastValid === LEGACY_DEFAULT_SOURCE;
+			const project = !storedProject
+				? fallbackProject
+				: isUntouchedLegacySeed ? { ...storedProject, source: fallbackProject.source } : storedProject;
+			const activeRevision = !storedProject || isUntouchedLegacySeed
+				? fallbackProject.source.revision
+				: stored?.activeRevision ?? project.source.revision;
 			const storedEndCycle = project.timeline.songEndCycle;
 			const configuredEndCycle = typeof storedEndCycle === 'number' && Number.isFinite(storedEndCycle) && storedEndCycle > 0
 				? storedEndCycle
@@ -393,7 +534,9 @@ export default function Studio() {
 				legacyTimeline && storedEndCycle === 4 ? DEFAULT_SONG_END_CYCLE : configuredEndCycle,
 				getExplicitSourceEndCycle(project.source.lastValid),
 			);
-			const activeRevision = stored?.activeRevision ?? project.source.revision;
+			const songEndCycle = sourceUsesExtendedTimeline(project.source.lastValid)
+				? EXTENDED_SONG_END_CYCLE
+				: Math.min(EXTENDED_SONG_END_CYCLE, Math.max(normalizedEndCycle, DEFAULT_SONG_END_CYCLE));
 			sourceHistoryRef.current = {
 				cursorSource: project.source.draft,
 				undo: [],
@@ -407,7 +550,7 @@ export default function Studio() {
 				lastValid: project.source.lastValid,
 				revision: project.source.revision,
 				activeRevision,
-				songEndCycle: normalizedEndCycle,
+				songEndCycle,
 				persistenceState,
 				runtime: { ...studioRef.current.runtime, activeRevision },
 			});
@@ -591,7 +734,9 @@ export default function Studio() {
 				if (!mountedRef.current || studioGenerationRef.current !== operationGeneration) return { ok: false, changed: false, previousSource, source, revision };
 				if (result.ok) {
 					const explicitEndCycle = getExplicitSourceEndCycle(source);
-					const nextSongEndCycle = Math.max(studioRef.current.songEndCycle, explicitEndCycle);
+					const nextSongEndCycle = sourceUsesExtendedTimeline(source)
+						? EXTENDED_SONG_END_CYCLE
+						: Math.max(studioRef.current.songEndCycle, explicitEndCycle);
 					adapter.setSongEndCycle(nextSongEndCycle);
 					patchStudio({
 						lastValid: source,
@@ -661,7 +806,8 @@ export default function Studio() {
 	const addTrack = useCallback(async () => {
 		cancelPendingTrackCommit();
 		const baseRevision = studioRef.current.revision;
-		const currentSource = studioRef.current.draft.trimEnd();
+		const draft = studioRef.current.draft.trimEnd();
+		const currentSource = getSourceBlocks(draft).length || !/\bsilence\s*$/.test(draft) ? draft : draft.replace(/\s*silence\s*$/, '');
 		const nextTrackNumber = getSourceBlocks(currentSource).length + 1;
 		const existingIds = new Set(getSourceBlocks(currentSource).map((track) => track.id));
 		let trackId = '';
@@ -671,7 +817,7 @@ export default function Studio() {
 				: `${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
 			trackId = `trk_${randomUuid}`;
 		}
-		const nextSource = `${currentSource}\n\n// @sushi-track {"id":"${trackId}","name":"Track ${nextTrackNumber}","type":"synth","schema":1}\n$: note("<c3 e3 g3 a3>").s("sine").gain(0.18)\n`;
+		const nextSource = `${currentSource}\n\n// @sushi-track {"id":"${trackId}","name":"Track ${nextTrackNumber}","type":"synth","schema":1}\n$: seqPLoop([0, 4, note("<c3 e3 g3 a3>").s("sine").gain(0.18)])\n`;
 		await commitSource(nextSource, { expectedRevision: baseRevision });
 	}, [cancelPendingTrackCommit, commitSource]);
 
@@ -691,12 +837,20 @@ export default function Studio() {
 	);
 
 	const updateTrackSource = useCallback(
-		(trackId: string, update: (source: string) => string) => updateSourceDraft((source) => update(source)),
+		(_trackId: string, update: (source: string) => string) => updateSourceDraft(update),
 		[updateSourceDraft],
 	);
 
+	const extendTimeline = useCallback(() => {
+		if (studioRef.current.songEndCycle >= EXTENDED_SONG_END_CYCLE) return;
+		patchStudio({ songEndCycle: EXTENDED_SONG_END_CYCLE });
+	}, [patchStudio]);
+
 	const setTrackRange = useCallback(
-		(trackId: string, startCycle: number, endCycle: number) => updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, startCycle, endCycle, getSourceCycleStep(source))),
+		(trackId: string, startCycle: number, endCycle: number) => {
+			const range = normalizeTrackRange(startCycle, endCycle, studioRef.current.songEndCycle);
+			updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, range.startCycle, range.endCycle, getSourceCycleStep(source)));
+		},
 		[updateTrackSource],
 	);
 
@@ -735,6 +889,107 @@ export default function Studio() {
 		return () => cancelAnimationFrame(frame);
 	}, [arrangementZoom]);
 
+	const updateGlobalSource = useCallback(
+		(update: (source: string) => string) => updateSourceDraft(update),
+		[updateSourceDraft],
+	);
+
+	const setTempo = useCallback(
+		(bpm: number): void => updateGlobalSource((source) => updateSourceBpm(source, bpm)),
+		[updateGlobalSource],
+	);
+
+	const setKey = useCallback(
+		(key: string): void => updateGlobalSource((source) => updateSourceKey(source, key)),
+		[updateGlobalSource],
+	);
+
+	const commitTempo = useCallback(
+		async (bpm: number): Promise<CommitSourceResult> => {
+			cancelPendingTrackCommit();
+			const current = studioRef.current;
+			const nextSource = updateSourceBpm(current.draft, bpm);
+			if (nextSource === current.draft) return { ok: true, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision };
+			return commitSource(nextSource);
+		},
+		[cancelPendingTrackCommit, commitSource],
+	);
+
+	const commitKey = useCallback(
+		async (key: string): Promise<CommitSourceResult> => {
+			cancelPendingTrackCommit();
+			const current = studioRef.current;
+			const nextSource = updateSourceKey(current.draft, key);
+			if (nextSource === current.draft) return { ok: true, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision };
+			return commitSource(nextSource);
+		},
+		[cancelPendingTrackCommit, commitSource],
+	);
+
+	const commitTrackRange = useCallback(
+		async (trackId: string, startCycle: number, endCycle: number): Promise<CommitSourceResult> => {
+			cancelPendingTrackCommit();
+			const current = studioRef.current;
+			const timelineEndCycle = endCycle > current.songEndCycle ? EXTENDED_SONG_END_CYCLE : current.songEndCycle;
+			const range = normalizeTrackRange(startCycle, endCycle, timelineEndCycle);
+			const source = sourceForTrackMutation(current);
+			const nextSource = updateSourceTrackRange(source, trackId, range.startCycle, range.endCycle);
+			if (nextSource === source) {
+				return { ok: true, changed: false, previousSource: source, source, revision: current.revision };
+			}
+			return commitSource(nextSource);
+		},
+		[cancelPendingTrackCommit, commitSource],
+	);
+
+	const renameTrack = useCallback(
+		async (trackId: string, name: string): Promise<CommitSourceResult> => {
+			cancelPendingTrackCommit();
+			const current = studioRef.current;
+			const normalizedName = name.trim();
+			if (!normalizedName) {
+				return {
+					ok: false,
+					changed: false,
+					previousSource: current.draft,
+					source: current.draft,
+					revision: current.revision,
+					error: diagnosticFromError(current.revision, new Error('Track name cannot be empty.'), current.draft),
+				};
+			}
+			const source = sourceForTrackMutation(current);
+			const nextSource = updateSourceTrackName(source, trackId, normalizedName);
+			if (nextSource === source) {
+				return { ok: true, changed: false, previousSource: source, source, revision: current.revision };
+			}
+			return commitSource(nextSource);
+		},
+		[cancelPendingTrackCommit, commitSource],
+	);
+
+	const deleteTrack = useCallback(
+		async (trackId: string): Promise<CommitSourceResult> => {
+			cancelPendingTrackCommit();
+			const current = studioRef.current;
+			const source = sourceForTrackMutation(current);
+			const nextSource = deleteSourceTrack(source, trackId);
+			if (nextSource === source) {
+				return {
+					ok: false,
+					changed: false,
+					previousSource: source,
+					source,
+					revision: current.revision,
+					error: diagnosticFromError(current.revision, new Error('The selected track no longer exists in the source.'), current.draft),
+				};
+			}
+			const result = await commitSource(nextSource);
+			if (result.ok) setSelectedTrackId((selected) => selected === trackId ? null : selected);
+			return result;
+		},
+		[cancelPendingTrackCommit, commitSource],
+	);
+
 	const handleTimingPointerMove = useCallback(
 		(event: PointerEvent) => {
 			const drag = timingDragRef.current;
@@ -742,12 +997,21 @@ export default function Studio() {
 
 			const rect = drag.lane.getBoundingClientRect();
 			if (!rect.width) return;
-			const cycleStep = getSourceCycleStep(studioRef.current.draft);
-			const nextCycle = clamp(Math.round(((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle / cycleStep) * cycleStep, 0, studioRef.current.songEndCycle);
-			const details = getSourceBlockDetails(studioRef.current.draft, studioRef.current.songEndCycle).find((block) => block.id === drag.trackId);
+			const songEndCycle = studioRef.current.songEndCycle;
+			const nextCycle = clamp(snapCycle(((event.clientX - rect.left) / rect.width) * songEndCycle), 0, songEndCycle);
+
+			if (drag.edge === 'move') {
+				const delta = nextCycle - drag.pointerStartCycle;
+				const range = shiftTrackRange(drag.startCycle, drag.endCycle, delta, songEndCycle);
+				setTrackRange(drag.trackId, range.startCycle, range.endCycle);
+				return;
+			}
+
+			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === drag.trackId);
 			if (!details) return;
-			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, details.timing.endCycle - cycleStep) : details.timing.startCycle;
-			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, details.timing.startCycle + cycleStep) : details.timing.endCycle;
+			const timing = getTrackTimingForTimeline(details, studioRef.current.songEndCycle);
+			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, timing.endCycle - TIMELINE_SNAP_CYCLE) : timing.startCycle;
+			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, timing.startCycle + TIMELINE_SNAP_CYCLE) : timing.endCycle;
 			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.min(studioRef.current.songEndCycle, endCycle));
 		},
 		[setTrackRange],
@@ -761,11 +1025,26 @@ export default function Studio() {
 	}, [handleTimingPointerMove]);
 
 	const startTimingDrag = useCallback(
-		(event: ReactPointerEvent<HTMLButtonElement>, trackId: string, edge: 'start' | 'end') => {
+		(event: ReactPointerEvent<HTMLElement>, trackId: string, edge: 'start' | 'end' | 'move') => {
 			const lane = event.currentTarget.closest('.lane-grid');
 			if (!(lane instanceof HTMLElement)) return;
+			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === trackId);
+			if (!details) return;
+			const timing = getTrackTimingForTimeline(details, studioRef.current.songEndCycle);
 			event.preventDefault();
-			timingDragRef.current = { trackId, edge, lane };
+			event.stopPropagation();
+			const rect = lane.getBoundingClientRect();
+			const pointerStartCycle = rect.width
+				? clamp(snapCycle(((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle), 0, studioRef.current.songEndCycle)
+				: timing.startCycle;
+			timingDragRef.current = {
+				trackId,
+				edge,
+				lane,
+				pointerStartCycle,
+				startCycle: timing.startCycle,
+				endCycle: timing.endCycle,
+			};
 			window.addEventListener('pointermove', handleTimingPointerMove);
 			window.addEventListener('pointerup', stopTimingDrag);
 			window.addEventListener('pointercancel', stopTimingDrag);
@@ -775,6 +1054,20 @@ export default function Studio() {
 
 	useEffect(() => stopTimingDrag, [stopTimingDrag]);
 	useEffect(() => stopEditorResize, [stopEditorResize]);
+
+	useEffect(() => {
+		const viewport = timelineViewportRef.current;
+		if (!viewport) return undefined;
+		const updateViewportWidth = () => setTimelineViewportWidth(viewport.clientWidth);
+		updateViewportWidth();
+		if (typeof ResizeObserver === 'undefined') {
+			window.addEventListener('resize', updateViewportWidth);
+			return () => window.removeEventListener('resize', updateViewportWidth);
+		}
+		const observer = new ResizeObserver(updateViewportWidth);
+		observer.observe(viewport);
+		return () => observer.disconnect();
+	}, []);
 
 	const setTrackGain = useCallback(
 		(trackId: string, value: number) => updateTrackSource(trackId, (source) => updateTrackGain(source, trackId, value)),
@@ -786,18 +1079,8 @@ export default function Studio() {
 		[updateTrackSource],
 	);
 
-	const setTempo = useCallback(
-		(value: number) => updateSourceDraft((source) => updateSourceTempo(source, value)),
-		[updateSourceDraft],
-	);
-
 	const setQuarterNotesPerCycle = useCallback(
 		(value: number) => updateSourceDraft((source) => updateSourceQuarterNotesPerCycle(source, value)),
-		[updateSourceDraft],
-	);
-
-	const setKey = useCallback(
-		(value: string) => updateSourceDraft((source) => updateSourceKey(source, value)),
 		[updateSourceDraft],
 	);
 
@@ -926,6 +1209,98 @@ export default function Studio() {
 		[updateTrackSource],
 	);
 
+	const selectTrack = useCallback((trackId: string) => {
+		setSelectedTrackId(trackId);
+		setContextMenu(null);
+	}, []);
+
+	const beginTrackRename = useCallback((trackId: string) => {
+		const track = getSourceBlocks(studioRef.current.lastValid).find((block) => block.id === trackId);
+		if (!track) return;
+		setSelectedTrackId(trackId);
+		setContextMenu(null);
+		setRenamingTrackId(trackId);
+		setRenamingTrackValue(track.name);
+	}, []);
+
+	const cancelTrackRename = useCallback(() => {
+		setRenamingTrackId(null);
+		setRenamingTrackValue('');
+	}, []);
+
+	const finishTrackRename = useCallback(
+		async (trackId: string) => {
+			const result = await renameTrack(trackId, renamingTrackValue);
+			if (result.ok) cancelTrackRename();
+		},
+		[cancelTrackRename, renameTrack, renamingTrackValue],
+	);
+
+	const deleteSelectedTrack = useCallback(
+		async (trackId: string) => {
+			setContextMenu(null);
+			cancelTrackRename();
+			await deleteTrack(trackId);
+		},
+		[cancelTrackRename, deleteTrack],
+	);
+
+	const openTrackContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>, trackId: string) => {
+		event.preventDefault();
+		selectTrack(trackId);
+		const menuWidth = 190;
+		const menuHeight = 116;
+		const maxX = Math.max(8, window.innerWidth - menuWidth - 8);
+		const maxY = Math.max(8, window.innerHeight - menuHeight - 8);
+		setContextMenu({ trackId, x: Math.min(Math.max(8, event.clientX), maxX), y: Math.min(Math.max(8, event.clientY), maxY) });
+	}, [selectTrack]);
+
+	const handleTrackLaneKeyDown = useCallback(
+		(event: ReactKeyboardEvent<HTMLDivElement>, trackId: string) => {
+			if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
+			event.preventDefault();
+			const rect = event.currentTarget.getBoundingClientRect();
+			const menuWidth = 190;
+			const menuHeight = 116;
+			const maxX = Math.max(8, window.innerWidth - menuWidth - 8);
+			const maxY = Math.max(8, window.innerHeight - menuHeight - 8);
+			selectTrack(trackId);
+			setContextMenu({ trackId, x: Math.min(Math.max(8, rect.left + 24), maxX), y: Math.min(Math.max(8, rect.top + 24), maxY) });
+		},
+		[selectTrack],
+	);
+
+	useEffect(() => {
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (!selectedTrackId || (event.key !== 'Backspace' && event.key !== 'Delete')) return;
+			const target = event.target;
+			if (target instanceof HTMLButtonElement || target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return;
+			if (target instanceof HTMLElement && target.isContentEditable) return;
+			event.preventDefault();
+			void deleteSelectedTrack(selectedTrackId);
+		};
+
+		document.addEventListener('keydown', handleKeyDown);
+		return () => document.removeEventListener('keydown', handleKeyDown);
+	}, [deleteSelectedTrack, selectedTrackId]);
+
+	useEffect(() => {
+		if (!contextMenu) return undefined;
+		const handlePointerDown = (event: PointerEvent) => {
+			if (event.target instanceof Node && contextMenuRef.current?.contains(event.target)) return;
+			setContextMenu(null);
+		};
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') setContextMenu(null);
+		};
+		document.addEventListener('pointerdown', handlePointerDown);
+		document.addEventListener('keydown', handleKeyDown);
+		return () => {
+			document.removeEventListener('pointerdown', handlePointerDown);
+			document.removeEventListener('keydown', handleKeyDown);
+		};
+	}, [contextMenu]);
+
 	const dispatch = useCallback(
 		async (command: StudioCommand): Promise<DispatchResult> => {
 			if (command.type === 'writeSource') {
@@ -1041,14 +1416,15 @@ export default function Studio() {
 		const current = studioRef.current;
 		const project = createInitialProject();
 		const globals = getSourceGlobals(current.lastValid);
-		const tracks = getSourceBlockDetails(current.lastValid, current.songEndCycle).map((track) => ({
+		const tracks = getSourceBlockDetails(current.lastValid).map((track, index) => ({
 			id: track.id,
+			number: index + 1,
 			name: track.name,
 			type: track.type,
 			line: track.line,
 			...(track.label === undefined ? {} : { label: track.label }),
 			...(track.expression === undefined ? {} : { expression: track.expression }),
-			timing: track.timing,
+			timing: getTrackTimingForTimeline(track, current.songEndCycle),
 			gain: { ...(track.gain === undefined ? {} : { value: track.gain }), editable: track.gainEditable },
 			pan: { ...(track.pan === undefined ? {} : { value: track.pan }), editable: track.panEditable },
 			muted: track.muted,
@@ -1075,6 +1451,11 @@ export default function Studio() {
 			persistenceState: current.persistenceState,
 			webmcp: { available: webmcpAvailableRef.current },
 		};
+	}, []);
+
+	const rememberMutation = useCallback((result: WebMcpMutationResult): WebMcpMutationResult => {
+		if (result.transactionId) sourceTransactionsRef.current.set(result.action, result.transactionId, result);
+		return result;
 	}, []);
 
 	const applySourceMutation = useCallback(
@@ -1151,6 +1532,217 @@ export default function Studio() {
 			return makeMutationResult(state, action, input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
 		}),
 		[applySourceMutation, getWebMcpState],
+	);
+
+	const timelineMutationForWebMcp = useCallback(
+		async (
+			action: string,
+			input: WebMcpTempoInput | WebMcpKeyInput,
+			mutate: () => Promise<CommitSourceResult>,
+			successMessage: (state: WebMcpStateSnapshot) => string,
+		): Promise<WebMcpMutationResult> => {
+			const cached = sourceTransactionsRef.current.get(action, input.transactionId);
+			if (cached) return cached;
+
+			const current = studioRef.current;
+			if (input.baseRevision !== current.revision) {
+				const state = getWebMcpState();
+				return {
+					ok: false,
+					action,
+					affectedEntityIds: ['source'],
+					message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+					state,
+					revision: state.source.revision,
+					activeRevision: state.source.activeRevision,
+					transactionId: input.transactionId,
+					error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
+					conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
+				};
+			}
+
+			const beforeSource = current.draft;
+			let result: CommitSourceResult;
+			try {
+				result = await mutate();
+			} catch (error) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The timeline setting could not be changed.', { code: 'SOURCE_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) }));
+			}
+
+			const state = getWebMcpState();
+			if (result.ok) return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, successMessage(state), undefined, ['source']));
+
+			const diagnostic = result.error;
+			return rememberMutation(makeMutationResult(
+				state,
+				action,
+				input.transactionId,
+				beforeSource,
+				input.baseRevision,
+				false,
+				`Timeline setting was rejected; ${formatRevision(state.source.activeRevision)} remains active.`,
+				{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the timeline setting.', details: diagnostic ? { diagnostic } : undefined },
+				['source'],
+			));
+		},
+		[getWebMcpState, rememberMutation],
+	);
+
+	const setTempoForWebMcp = useCallback(
+		(input: WebMcpTempoInput) => timelineMutationForWebMcp(
+			'set_tempo',
+			input,
+			() => commitTempo(input.bpm),
+			(state) => `Set tempo to ${formatCycle(state.timeline.bpm)} BPM at ${formatRevision(state.source.revision)}.`,
+		),
+		[commitTempo, timelineMutationForWebMcp],
+	);
+
+	const setKeyForWebMcp = useCallback(
+		(input: WebMcpKeyInput) => timelineMutationForWebMcp(
+			'set_key',
+			input,
+			() => commitKey(input.key),
+			(state) => `Set key to ${JSON.stringify(state.timeline.key)} at ${formatRevision(state.source.revision)}.`,
+		),
+		[commitKey, timelineMutationForWebMcp],
+	);
+
+	const extendTimelineForWebMcp = useCallback(
+		async (input: WebMcpTimelineExtensionInput): Promise<WebMcpMutationResult> => {
+			const cached = sourceTransactionsRef.current.get('extend_timeline', input.transactionId);
+			if (cached) return cached;
+			const current = studioRef.current;
+			if (input.baseRevision !== current.revision) {
+				const state = getWebMcpState();
+				return {
+					ok: false,
+					action: 'extend_timeline',
+					affectedEntityIds: ['timeline'],
+					message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+					state,
+					revision: state.source.revision,
+					activeRevision: state.source.activeRevision,
+					transactionId: input.transactionId,
+					error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
+					conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
+				};
+			}
+
+			if (current.songEndCycle < EXTENDED_SONG_END_CYCLE) patchStudio({ songEndCycle: EXTENDED_SONG_END_CYCLE });
+			const state = getWebMcpState();
+			return rememberMutation(makeMutationResult(
+				state,
+				'extend_timeline',
+				input.transactionId,
+				current.draft,
+				input.baseRevision,
+				true,
+				`Timeline is available through bar ${EXTENDED_SONG_END_CYCLE}.`,
+				undefined,
+				['timeline'],
+			));
+		},
+		[getWebMcpState, patchStudio, rememberMutation],
+	);
+
+	const trackMutationForWebMcp = useCallback(
+		async (
+			action: string,
+			input: WebMcpTrackMutationInput,
+			mutate: (trackId: string) => Promise<CommitSourceResult>,
+			successMessage: (track: TrackDetails, state: WebMcpStateSnapshot) => string,
+		): Promise<WebMcpMutationResult> => {
+			const cached = sourceTransactionsRef.current.get(action, input.transactionId);
+			if (cached) return cached;
+
+			const current = studioRef.current;
+			if (input.baseRevision !== current.revision) {
+				const state = getWebMcpState();
+				return {
+					ok: false,
+					action,
+					affectedEntityIds: sourceEntityIds(state),
+					message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+					state,
+					revision: state.source.revision,
+					activeRevision: state.source.activeRevision,
+					transactionId: input.transactionId,
+					error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
+					conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
+				};
+			}
+
+			const mutationSource = sourceForTrackMutation(current);
+			const resolved = resolveTrackTarget(mutationSource, input);
+			if (!resolved.ok) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, action, input.transactionId, current.draft, current.revision, false, resolved.message, { code: resolved.code, message: resolved.message }));
+			}
+
+			const beforeSource = current.draft;
+			let result: CommitSourceResult;
+			try {
+				result = await mutate(resolved.track.id);
+			} catch (error) {
+				const state = getWebMcpState();
+				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The track transaction could not be completed.', { code: 'TRACK_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) }, ['source', resolved.track.id]));
+			}
+
+			const state = getWebMcpState();
+			const affectedEntityIds = ['source', resolved.track.id];
+			if (result.ok) {
+				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, successMessage(resolved.track, state), undefined, affectedEntityIds));
+			}
+
+			const diagnostic = result.error;
+			return rememberMutation(makeMutationResult(
+				state,
+				action,
+				input.transactionId,
+				beforeSource,
+				input.baseRevision,
+				false,
+				`Track change was rejected; ${formatRevision(state.source.activeRevision)} remains active.`,
+				{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the track change.', details: diagnostic ? { diagnostic } : undefined },
+				affectedEntityIds,
+			));
+		},
+		[getWebMcpState, rememberMutation],
+	);
+
+	const deleteTrackForWebMcp = useCallback(
+		(input: WebMcpTrackMutationInput) => trackMutationForWebMcp(
+			'delete_track',
+			input,
+			deleteTrack,
+			(track, state) => `Deleted track ${JSON.stringify(track.name)} at ${formatRevision(state.source.revision)}.`,
+		),
+		[deleteTrack, trackMutationForWebMcp],
+	);
+
+	const renameTrackForWebMcp = useCallback(
+		(input: WebMcpTrackRenameInput) => trackMutationForWebMcp(
+			'rename_track',
+			input,
+			(trackId) => renameTrack(trackId, input.newName),
+			(_track, state) => `Renamed track to ${JSON.stringify(input.newName.trim())} at ${formatRevision(state.source.revision)}.`,
+		),
+		[renameTrack, trackMutationForWebMcp],
+	);
+
+	const setTrackRangeForWebMcp = useCallback(
+		(input: WebMcpTrackRangeInput) => trackMutationForWebMcp(
+			'set_track_range',
+			input,
+			(trackId) => commitTrackRange(trackId, input.startCycle, input.endCycle),
+			(track, state) => {
+				const range = normalizeTrackRange(input.startCycle, input.endCycle, state.timeline.songEndCycle);
+				return `Set ${JSON.stringify(track.name)} to cycles ${formatCycle(range.startCycle)}–${formatCycle(range.endCycle)} at ${formatRevision(state.source.revision)}.`;
+			},
+		),
+		[commitTrackRange, trackMutationForWebMcp],
 	);
 
 	const patchSourceForWebMcp = useCallback(
@@ -1315,11 +1907,17 @@ export default function Studio() {
 		getState: getWebMcpState,
 		writeSource: (input) => sourceMutationForWebMcp('write_strudel_source', input),
 		patchSource: patchSourceForWebMcp,
+		setTempo: setTempoForWebMcp,
+		setKey: setKeyForWebMcp,
+		deleteTrack: deleteTrackForWebMcp,
+		renameTrack: renameTrackForWebMcp,
+		setTrackRange: setTrackRangeForWebMcp,
+		extendTimeline: extendTimelineForWebMcp,
 		validateSource: validateSourceForWebMcp,
 		controlPlayback: controlPlaybackForWebMcp,
 		undoSourceEdit: undoSourceForWebMcp,
 		redoSourceEdit: redoSourceForWebMcp,
-	}), [controlPlaybackForWebMcp, getWebMcpState, patchSourceForWebMcp, redoSourceForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
+	}), [controlPlaybackForWebMcp, deleteTrackForWebMcp, extendTimelineForWebMcp, getWebMcpState, patchSourceForWebMcp, redoSourceForWebMcp, renameTrackForWebMcp, setKeyForWebMcp, setTempoForWebMcp, setTrackRangeForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
 
 	useEffect(() => {
 		let disposed = false;
@@ -1359,8 +1957,7 @@ export default function Studio() {
 			const rect = ruler.getBoundingClientRect();
 			if (!rect.width) return;
 			const songEndCycle = studioRef.current.songEndCycle;
-			const cycleStep = getSourceCycleStep(studioRef.current.lastValid);
-			const cycle = clamp(Math.round(((clientX - rect.left) / rect.width) * songEndCycle / cycleStep) * cycleStep, 0, songEndCycle);
+			const cycle = clamp(snapCycle(((clientX - rect.left) / rect.width) * songEndCycle), 0, songEndCycle);
 			if (timelineSeekCycleRef.current === cycle) return;
 			timelineSeekCycleRef.current = cycle;
 			void dispatch({ type: 'seek', cycle });
@@ -1437,9 +2034,11 @@ export default function Studio() {
 
 	const blocks = useMemo(() => getSourceBlocks(studio.lastValid), [studio.lastValid]);
 	const draftBlocks = useMemo(() => getSourceBlocks(studio.draft), [studio.draft]);
-	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft, studio.songEndCycle).map((block) => [block.id, block])), [studio.draft, studio.songEndCycle]);
-	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid, studio.songEndCycle).map((block) => [block.id, block])), [studio.lastValid, studio.songEndCycle]);
+	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft).map((block) => [block.id, block])), [studio.draft]);
+	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid).map((block) => [block.id, block])), [studio.lastValid]);
+	const contextMenuTrack = useMemo(() => blocks.find((block) => block.id === contextMenu?.trackId), [blocks, contextMenu?.trackId]);
 	const sourceGlobals = useMemo(() => getSourceGlobals(studio.lastValid), [studio.lastValid]);
+	const draftGlobals = useMemo(() => getSourceGlobals(studio.draft), [studio.draft]);
 	const isDirty = studio.draft !== studio.lastValid;
 	const isBusy = studio.phase === 'booting' || studio.phase === 'validating';
 	const canPlay = !isBusy && studio.runtime.audioState !== 'initializing';
@@ -1447,11 +2046,36 @@ export default function Studio() {
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
-	const timelineCells = useMemo(() => getTimelineCells(studio.songEndCycle, sourceGlobals.quarterNotesPerCycle), [sourceGlobals.quarterNotesPerCycle, studio.songEndCycle]);
-	const timelineCellWidth = getTimelineCellWidth(arrangementZoom);
 	const cycleStep = getSourceCycleStep(studio.lastValid);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
+	const timelineCellWidth = getTimelineCellWidth(arrangementZoom);
+	const timelineCellCount = Math.max(1, Math.ceil(studio.songEndCycle / TIMELINE_SNAP_CYCLE));
+	const timelineSongCycles = Math.max(TIMELINE_SNAP_CYCLE, studio.songEndCycle);
+	const zoomOutCycles = Math.max(1, Math.min(timelineSongCycles, DEFAULT_SONG_END_CYCLE));
+	const timelineVisibleCycles = zoomOutCycles - (zoomOutCycles - 1) * (timelineZoom / 100);
+	const timelineAvailableWidth = Math.max(560, (timelineViewportWidth || 960) - TIMELINE_LABEL_MIN_WIDTH);
+	const timelineGridWidth = Math.max(560, timelineAvailableWidth * timelineSongCycles / timelineVisibleCycles * arrangementZoom);
+	const timelineBarLabelStride = timelineLabelStride(timelineGridWidth / timelineSongCycles);
+	const timelineCells = useMemo(() => Array.from({ length: timelineCellCount }, (_, index) => {
+		const isBarStart = index % 4 === 0;
+		const barNumber = Math.floor(index / 4) + 1;
+		const showLabel = isBarStart && (barNumber === 1 || barNumber % timelineBarLabelStride === 0);
+		return {
+			isBarStart,
+			label: showLabel ? barNumber.toString() : '',
+		};
+	}), [timelineBarLabelStride, timelineCellCount]);
+	const timelineGridStyle = {
+		'--timeline-grid-width': `${timelineGridWidth}px`,
+		'--timeline-cell-count': timelineCellCount,
+	} as CSSProperties;
+
+	useEffect(() => {
+		if (selectedTrackId && !blocks.some((block) => block.id === selectedTrackId)) setSelectedTrackId(null);
+		if (contextMenu && !blocks.some((block) => block.id === contextMenu.trackId)) setContextMenu(null);
+		if (renamingTrackId && !blocks.some((block) => block.id === renamingTrackId)) cancelTrackRename();
+	}, [blocks, cancelTrackRename, contextMenu, renamingTrackId, selectedTrackId]);
 
 	useEffect(() => {
 		syncEditorScroll();
@@ -1472,6 +2096,24 @@ export default function Studio() {
 						<span className={`save-state ${isDirty || studio.persistenceState === 'loading' ? 'save-state-dirty' : ''}`} title={studio.persistenceState === 'unavailable' ? 'IndexedDB is unavailable; this session will not persist after reload.' : 'Project state is saved locally'}><span className="save-dot" aria-hidden="true" />{saveStateLabel}</span>
 					</div>
 					<div className="topbar-transport" aria-label="Transport controls">
+						<div className="topbar-global-controls" aria-label="Tempo and key controls">
+							<label className="topbar-key-control">
+								<span className="topbar-control-label">KEY</span>
+								<select value={draftGlobals.key} onChange={(event) => setKey(event.target.value)} disabled={isBusy} aria-label="Musical key" title="Set musical key">
+									{!KEY_OPTIONS.includes(draftGlobals.key) ? <option value={draftGlobals.key}>{formatKey(draftGlobals.key)}</option> : null}
+									{KEY_OPTIONS.map((key) => <option value={key} key={key}>{formatKey(key)}</option>)}
+								</select>
+							</label>
+								<label className="topbar-bpm-control">
+									<span className="topbar-control-label">BPM</span>
+									<input type="range" min="0" max="300" step="1" value={clamp(Math.round(draftGlobals.bpm), 0, 300)} onChange={(event) => setTempo(Number(event.target.value))} disabled={isBusy} aria-label="Tempo in beats per minute" title="Set tempo from 0 to 300 BPM" />
+									<output>{Math.round(clamp(draftGlobals.bpm, 0, 300))}</output>
+								</label>
+								<label className="topbar-quarter-control">
+									<span className="topbar-control-label">Q/C</span>
+									<input type="number" min="1" max="32" step="1" value={formatCycle(draftGlobals.quarterNotesPerCycle)} onChange={(event) => setQuarterNotesPerCycle(Number(event.target.value))} disabled={isBusy} aria-label="Quarter notes per Strudel cycle" title="Set quarter notes per cycle" />
+								</label>
+							</div>
 						<div className="topbar-source-actions" aria-label="Source actions">
 						<button className="transport-button source-action-button source-action-revert" type="button" onClick={() => { cancelPendingTrackCommit(); sourceHistoryRef.current.cursorSource = studioRef.current.lastValid; patchStudio({ draft: studioRef.current.lastValid, diagnostics: [], phase: 'ready' }); void persistStudioSnapshot(); }} disabled={!isDirty || isBusy} aria-label="Revert source draft" title="Revert source draft">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v4" /><path d="M5.2 11A7.5 7.5 0 1 0 7.4 5.6L5 7" /></svg>
@@ -1504,23 +2146,7 @@ export default function Studio() {
 					</div>
 				</div>
 				<div className="topbar-right">
-					<div className="topbar-metrics" aria-label="Project settings">
-						<label className="topbar-metric-control">
-							<span className="sr-only">Tempo in beats per minute</span>
-							<input type="number" min="1" max="400" step="1" value={formatCycle(sourceGlobals.bpm)} onChange={(event) => setTempo(Number(event.target.value))} aria-label="Tempo in beats per minute" title="Set tempo" />
-							<span>BPM</span>
-						</label>
-						<label className="topbar-metric-control">
-							<span className="sr-only">Quarter notes per Strudel cycle</span>
-							<input type="number" min="1" max="32" step="1" value={formatCycle(sourceGlobals.quarterNotesPerCycle)} onChange={(event) => setQuarterNotesPerCycle(Number(event.target.value))} aria-label="Quarter notes per Strudel cycle" title="Set quarter notes per cycle" />
-							<span>Q/C</span>
-						</label>
-						<label className="topbar-metric-control topbar-key-control">
-							<span className="sr-only">Musical key</span>
-							<input type="text" value={sourceGlobals.key} onChange={(event) => setKey(event.target.value)} aria-label="Musical key" title="Set musical key" />
-						</label>
-						<span className="topbar-metric-duration">{formatCycle(songEndSeconds)}s</span>
-					</div>
+					<div className="topbar-metrics" aria-label="Project settings"><span>{formatCycle(sourceGlobals.quarterNotesPerCycle)} Q/C</span><span>{formatCycle(songEndSeconds)}s</span></div>
 				</div>
 			</header>
 
@@ -1576,11 +2202,12 @@ export default function Studio() {
 			</div>
 
 				<main className="daw-canvas" aria-label="Sushi workstation">
-					<section ref={timelineShellRef} className="timeline-shell" style={{ '--timeline-cell-count': timelineCells.length, '--timeline-cell-width': `${timelineCellWidth}px`, '--timeline-content-width': `${timelineCells.length * timelineCellWidth}px` } as CSSProperties} aria-labelledby="timeline-heading">
-						<div className="timeline-head">
+					<section className="timeline-shell" ref={(element) => { timelineViewportRef.current = element; timelineShellRef.current = element; }} aria-labelledby="timeline-heading">
+						<div className="timeline-head" style={timelineGridStyle}>
 							<div className="timeline-heading-cell">
 								<div className="arrangement-toolbar">
 									<button className="add-track-button" type="button" onClick={() => void addTrack()} disabled={isBusy} aria-label="Add track"><span aria-hidden="true">＋</span> Add track</button>
+									{studio.songEndCycle < EXTENDED_SONG_END_CYCLE ? <button className="extend-timeline-button" type="button" onClick={extendTimeline} disabled={isBusy} aria-label="Extend timeline to 137 bars" title="Extend the timeline to 137 bars">EXTEND 137</button> : null}
 									<div className="timeline-zoom-controls" role="group" aria-label="Arrangement zoom">
 										<button className="timeline-zoom-button" type="button" onClick={() => adjustArrangementZoom(-TIMELINE_ZOOM_STEP)} disabled={arrangementZoom <= MIN_TIMELINE_ZOOM} aria-label="Zoom out arrangement" title="Zoom out arrangement">−</button>
 										<output className="timeline-zoom-value" aria-live="polite">{Math.round(arrangementZoom * 100)}%</output>
@@ -1596,10 +2223,11 @@ export default function Studio() {
 									<span aria-hidden="true">·</span>
 									<span>{formatCycle(songEndSeconds)}s</span>
 								</div>
+								<span className="timeline-duration">{formatCycle(studio.songEndCycle)} bars · {formatCycle(songEndSeconds)}s</span>
 								<span className="sr-only" id="timeline-heading">{activeLaneCount} source lanes</span>
 							</div>
-							<div className="timeline-ruler" aria-label="Arrangement beats">
-								{timelineCells.map((cell) => <span className={cell.barStart ? 'bar-number' : ''} key={cell.label}>{cell.label}</span>)}
+							<div className="timeline-ruler" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-label="Arrangement beats">
+								{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'bar-number' : ''} key={index}>{cell.label}</span>)}
 								<button className="timeline-seek-surface" type="button" onPointerDown={startTimelineSeekDrag} onKeyDown={handleTimelineSeekKeyDown} disabled={isBusy} aria-label={`Seek playhead, cycle ${formatCycle(studio.runtime.currentCycle)}, ${formatClock(currentSeconds)}`} title="Click or drag to seek" />
 								<i className="timeline-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
 							</div>
@@ -1609,9 +2237,9 @@ export default function Studio() {
 							const trackDetails = draftTrackDetails.get(block.id) ?? validTrackDetails.get(block.id);
 							const gain = trackDetails?.gain ?? 1;
 							const pan = trackDetails?.pan ?? 0.5;
-							const timing = trackDetails?.timing ?? { mode: 'full' as const, startCycle: 0, endCycle: studio.songEndCycle };
-							const displayTiming = getTrackDisplayTiming(timing, studio.songEndCycle);
+							const timing = getTrackTimingForTimeline(trackDetails, studio.songEndCycle);
 							const clipStart = clamp(timing.startCycle / studio.songEndCycle, 0, 1);
+							const displayTiming = getTrackDisplayTiming(timing, studio.songEndCycle);
 							const clipEnd = clamp(displayTiming.displayEndCycle / studio.songEndCycle, clipStart + 0.01, 1);
 							const loopHandlePosition = clipEnd > clipStart
 								? clamp((timing.endCycle / studio.songEndCycle - clipStart) / (clipEnd - clipStart), 0.01, 1)
@@ -1622,49 +2250,148 @@ export default function Studio() {
 								? `${timingLabel} · LOOP TO ${formatCycle(displayTiming.displayEndCycle)}`
 								: timingLabel;
 							return (
-								<div className="track-lane" key={block.id}>
+								<div
+									className={`track-lane ${selectedTrackId === block.id ? 'track-lane-selected' : ''}`}
+									style={timelineGridStyle}
+									key={block.id}
+									tabIndex={0}
+									onClick={() => selectTrack(block.id)}
+									onFocus={() => setSelectedTrackId(block.id)}
+									onContextMenu={(event) => openTrackContextMenu(event, block.id)}
+									onKeyDown={(event) => handleTrackLaneKeyDown(event, block.id)}
+									aria-current={selectedTrackId === block.id ? 'true' : undefined}
+									aria-label={`Track ${(index + 1).toString()}: ${block.name}`}
+								>
 									<div className="track-header" style={{ '--track-color': trackColor } as CSSProperties}>
 										<div className="track-header-top">
 											<span className="track-instrument-icon" aria-hidden="true">♩</span>
-											<div className="track-title-wrap"><div className="track-name-line"><span className="track-number">{(index + 1).toString().padStart(2, '0')}</span><strong>{block.name}</strong></div><span className="track-type">{getTrackLabel(block.type)} <span aria-hidden="true">·</span> LINE {block.line}</span></div>
+											<div className="track-title-wrap">
+												<div className="track-name-line">
+													<span className="track-number">{(index + 1).toString().padStart(2, '0')}</span>
+													{renamingTrackId === block.id ? (
+														<input
+															className="track-name-input"
+															type="text"
+															value={renamingTrackValue}
+															maxLength={TRACK_NAME_MAX_LENGTH}
+															autoFocus
+															onChange={(event) => setRenamingTrackValue(event.target.value)}
+															onClick={(event) => event.stopPropagation()}
+															onKeyDown={(event) => {
+																if (event.key === 'Enter') {
+																	event.preventDefault();
+																	event.stopPropagation();
+																	void finishTrackRename(block.id);
+																} else if (event.key === 'Escape') {
+																	event.preventDefault();
+																	event.stopPropagation();
+																	cancelTrackRename();
+																}
+																}}
+																aria-label={`Rename ${block.name}`}
+														/>
+													) : (
+														<span className="track-name-edit">
+															<strong>{block.name}</strong>
+															<button className="track-rename-button" type="button" onClick={(event) => { event.stopPropagation(); beginTrackRename(block.id); }} aria-label={`Rename ${block.name}`} title={`Rename ${block.name}`}>
+																<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 5.5 4 4M5 19l3.8-.8L19.2 7.8a1.7 1.7 0 0 0-2.4-2.4L6.4 15.8 5 19Z" /></svg>
+															</button>
+														</span>
+													)}
+												</div>
+												<span className="track-type">{getTrackLabel(block.type)} <span aria-hidden="true">·</span> LINE {block.line}</span>
+											</div>
 											<div className="track-mode-controls" role="group" aria-label={`${block.name} source modes`}>
 												<button className={`track-mode-button ${trackDetails?.muted ? 'track-mode-button-active' : ''}`} type="button" onClick={() => toggleTrackMode(block.id, 'mute', !trackDetails?.muted)} disabled={!trackDetails} aria-label={`Mute ${block.name}`} aria-pressed={trackDetails?.muted ?? false}>M</button>
 												<button className={`track-mode-button ${trackDetails?.soloed ? 'track-mode-button-active' : ''}`} type="button" onClick={() => toggleTrackMode(block.id, 'solo', !trackDetails?.soloed)} disabled={!trackDetails} aria-label={`Solo ${block.name}`} aria-pressed={trackDetails?.soloed ?? false}>S</button>
 											</div>
 										</div>
-										<div className="track-mix-controls">
+											<div className="track-mix-controls">
 											<label className="track-volume">
 												<span className="sr-only">{block.name} gain</span>
 												<input className="track-volume-control" type="range" min="0" max="1" step="0.01" value={gain} onChange={(event) => setTrackGain(block.id, Number(event.target.value))} disabled={!trackDetails?.gainEditable} aria-label={`${block.name} gain`} />
 											</label>
-											<div className="track-pan">
-												<span aria-hidden="true">L</span>
-												<span className="track-pan-control-wrap">
-													<input className="track-pan-control" type="range" min="0" max="1" step="0.01" value={pan} onChange={(event) => setTrackPan(block.id, Number(event.target.value))} disabled={!trackDetails?.panEditable} aria-label={`${block.name} pan`} />
-													<span className="track-pan-indicator" aria-hidden="true" style={{ transform: `translateX(-50%) rotate(${(pan - 0.5) * 42}deg)` }} />
-												</span>
-												<span aria-hidden="true">R</span>
-											</div>
+												<div className="track-pan">
+													<span aria-hidden="true">L</span>
+													<span className="track-pan-control-wrap">
+														<input className="track-pan-control" type="range" min="0" max="100" step="1" value={Math.round(clamp(pan, 0, 1) * 100)} onChange={(event) => setTrackPan(block.id, Number(event.target.value) / 100)} disabled={!trackDetails?.panEditable} aria-label={`${block.name} pan`} />
+														<span className="track-pan-center" aria-hidden="true" />
+													</span>
+													<span aria-hidden="true">R</span>
+													<output className="track-pan-value" aria-label={`${block.name} pan value`}>{Math.round(clamp(pan, 0, 1) * 100)}</output>
+												</div>
 										</div>
 									</div>
-									<div className="lane-grid" style={{ '--track-color': trackColor } as CSSProperties}>
-										<div className="lane-grid-lines" aria-hidden="true">{timelineCells.map((cell) => <span className={cell.barStart ? 'beat-start' : ''} key={cell.label} />)}</div>
-										<div className={`pattern-region ${displayTiming.repeating ? 'pattern-region-looping' : ''}`} style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd, '--loop-handle-position': loopHandlePosition, '--loop-width': `${loopWidth}px` } as CSSProperties} title={`${block.name}: ${displayLabel}`}>
-										<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -cycleStep : cycleStep; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - cycleStep), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
-										<span>{block.name.toUpperCase()}</span><small>{displayLabel}</small>
-										<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -cycleStep : cycleStep; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + cycleStep, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
+									<div className="lane-grid" style={{ ...timelineGridStyle, '--track-color': trackColor } as CSSProperties}>
+										<div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-hidden="true">{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'beat-start' : ''} key={index} />)}</div>
+										<div
+											className={`pattern-region ${displayTiming.repeating ? 'pattern-region-looping' : ''}`}
+											style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd, '--loop-handle-position': loopHandlePosition, '--loop-width': `${loopWidth}px` } as CSSProperties}
+											onPointerDown={(event) => startTimingDrag(event, block.id, 'move')}
+											onKeyDown={(event) => {
+												if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+												event.preventDefault();
+												const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE;
+												const range = shiftTrackRange(timing.startCycle, timing.endCycle, delta, studioRef.current.songEndCycle);
+												setTrackRange(block.id, range.startCycle, range.endCycle);
+											}}
+											role="button"
+											tabIndex={0}
+											aria-label={`Move ${block.name} clip, currently ${timingLabel}`}
+											title={`${block.name}: drag to move in quarter-cycle steps`}
+										>
+											<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - TIMELINE_SNAP_CYCLE), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
+											<span>{block.name.toUpperCase()}</span><small>{displayLabel}</small>
+											<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + TIMELINE_SNAP_CYCLE, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
 										</div>
 										<span className={`lane-playhead ${studio.runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
 									</div>
 								</div>
 							);
 						})}
-						<div className="timeline-fill" aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines">{timelineCells.map((cell) => <span className={cell.barStart ? 'beat-start' : ''} key={cell.label} />)}</div><span className="lane-playhead timeline-fill-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} /></div></div>
+						{blocks.length ? (
+							<div className="timeline-fill" style={timelineGridStyle} aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties}>{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'beat-start' : ''} key={index} />)}</div><span className="lane-playhead timeline-fill-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} /></div></div>
+						) : (
+							<div className="timeline-empty-state" style={timelineGridStyle}>
+								<strong>NO TRACKS</strong>
+								<span>Add a track or write a <code>$:</code> pattern to begin.</span>
+							</div>
+						)}
 					</section>
 
 					{studio.diagnostics.length ? <div className="canvas-diagnostic" role="status" aria-live="polite"><div className="diagnostic-meta"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span>{getDiagnosticLocation(studio.diagnostics[0]) || `REV ${formatRevision(studio.diagnostics[0].revision)}`}</span></div><p>{studio.diagnostics[0].message}</p>{studio.diagnostics[0].context ? <code className="diagnostic-context">{studio.diagnostics[0].context}</code> : null}</div> : null}
 				</main>
 			</div>
+
+
+			<footer className="studio-footer" aria-label="Studio commands">
+				<div className="studio-footer-group studio-footer-left">
+					<span className="studio-footer-heading">COMMANDS</span>
+					<span><kbd>⌘/Ctrl + Enter</kbd> validate source</span>
+					<span><kbd>Backspace/Delete</kbd> delete selected track</span>
+				</div>
+				<div className="studio-footer-group studio-footer-right">
+					<div className="timeline-zoom-control">
+						<span className="timeline-zoom-icon timeline-zoom-mountain" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m3 18 5.5-7 3.3 4 3.2-5 6 8H3Z" /></svg></span>
+						<label>
+							<span className="sr-only">Timeline zoom</span>
+							<input type="range" min="0" max="100" step="1" value={timelineZoom} onChange={(event) => setTimelineZoom(Number(event.target.value))} aria-label="Timeline zoom" aria-valuetext={`${Math.round(timelineVisibleCycles)} bars visible`} title="Timeline zoom: overview to one bar" />
+						</label>
+						<span className="timeline-zoom-icon timeline-zoom-search" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 5 5" /></svg></span>
+						<output>{Math.round(timelineVisibleCycles)} BAR{Math.round(timelineVisibleCycles) === 1 ? '' : 'S'}</output>
+					</div>
+					<span><kbd>Right-click</kbd> track actions</span>
+					<span><kbd>←/→</kbd> nudge a clip by ¼ bar</span>
+				</div>
+			</footer>
+
+			{contextMenu && contextMenuTrack ? (
+				<div className="track-context-menu" ref={contextMenuRef} style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" aria-label={`${contextMenuTrack.name} track actions`}>
+					<div className="track-context-heading">TRACK {(blocks.findIndex((block) => block.id === contextMenuTrack.id) + 1).toString().padStart(2, '0')} · {contextMenuTrack.name}</div>
+					<button type="button" role="menuitem" onClick={() => beginTrackRename(contextMenuTrack.id)}>Rename track</button>
+					<button className="track-context-delete" type="button" role="menuitem" onClick={() => void deleteSelectedTrack(contextMenuTrack.id)}>Delete track <span aria-hidden="true">⌫</span></button>
+				</div>
+			) : null}
 		</div>
 	);
 }

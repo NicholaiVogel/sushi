@@ -88,6 +88,16 @@ function collectSourceAudioAssets(source: string): SourceAudioAsset[] {
 	}));
 }
 
+function isHeaderOnlyAstError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes('unexpected ast format without body expression');
+}
+
+function appendRuntimeSilence(source: string): string {
+	const trimmed = source.trimEnd();
+	return `${trimmed}${trimmed ? '\n\n' : ''}silence`;
+}
+
 let soundfontRuntimePromise: Promise<SoundfontRuntime> | undefined;
 let soundfontDefinitionsPromise: Promise<{ default: SoundfontDefinition }> | undefined;
 
@@ -468,8 +478,16 @@ export class StrudelAdapter {
 				throw new Error('Strudel did not return a browser REPL.');
 			}
 
-			const pattern = await this.repl.evaluate(source, autoplay);
+			let pattern = await this.repl.evaluate(source, autoplay);
 			if (this.destroyed) return { ok: false, error: this.destroyedError() };
+			if (currentEvaluation.error && isHeaderOnlyAstError(currentEvaluation.error)) {
+				// A source document may intentionally contain only Sushi's global
+				// declarations. Strudel's transpiler expects a final expression, so
+				// provide silence to the runtime without adding it to canonical source.
+				currentEvaluation.error = undefined;
+				pattern = await this.repl.evaluate(appendRuntimeSilence(source), autoplay);
+				if (this.destroyed) return { ok: false, error: this.destroyedError() };
+			}
 			if (currentEvaluation.error) {
 				return { ok: false, error: currentEvaluation.error };
 			}

@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { DEFAULT_SOURCE } from './model';
+import { DEFAULT_SOURCE, DEFAULT_SONG_END_CYCLE, EXTENDED_SONG_END_CYCLE, createInitialProject } from './model';
 import {
 	cyclesToSeconds,
+	deleteTrack,
 	getSourceBlockDetails,
 	getSourceGlobals,
 	getTrackDisplayTiming,
@@ -9,13 +10,25 @@ import {
 	updateSourceKey,
 	updateSourceQuarterNotesPerCycle,
 	updateSourceTempo,
+	updateSourceBpm,
 	updateTrackGain,
 	updateTrackMode,
+	updateTrackName,
 	updateTrackPan,
 	updateTrackRange,
 } from './source-mapper';
 
 const pulseId = 'trk_01J4PULSE';
+
+const TRACKED_SOURCE = `setcpm(84 / 4)
+const key = "E:minor"
+
+// @sushi-track {"id":"trk_01J4PULSE","name":"Pulse","type":"synth","schema":1}
+$: note("<e2 e2 g2 b2>").s("sawtooth").gain(0.24)
+
+// @sushi-track {"id":"trk_01JGLASS","name":"Glass lead","type":"synth","schema":1}
+$: note("<e4 b3 g4 a4>").s("triangle").gain(0.16)
+`;
 
 const REGULAR_STRUDEL_SONG = [
 	'setcpm(90/4)',
@@ -29,8 +42,17 @@ const REGULAR_STRUDEL_SONG = [
 ].join('\n');
 
 describe('source mapper', () => {
+	test('starts with only the tempo and key header', () => {
+		expect(DEFAULT_SOURCE).toBe('setcpm(150 / 4)\nconst key = "E:minor"\n');
+		expect(getSourceBlockDetails(DEFAULT_SOURCE)).toHaveLength(0);
+		expect(DEFAULT_SONG_END_CYCLE).toBe(30);
+		expect(EXTENDED_SONG_END_CYCLE).toBe(137);
+		expect(createInitialProject().timeline.songEndCycle).toBe(DEFAULT_SONG_END_CYCLE);
+		expect(cyclesToSeconds(DEFAULT_SONG_END_CYCLE, getSourceGlobals(DEFAULT_SOURCE))).toBe(48);
+	});
+
 	test('projects marked labels and scalar chain controls', () => {
-		const [pulse, glass] = getSourceBlockDetails(DEFAULT_SOURCE);
+		const [pulse, glass] = getSourceBlockDetails(TRACKED_SOURCE);
 
 		expect(pulse).toMatchObject({ id: pulseId, name: 'Pulse', line: 4, label: '$', gain: 0.24, muted: false, soloed: false });
 		expect(pulse.expressionRange?.line).toBe(5);
@@ -39,7 +61,7 @@ describe('source mapper', () => {
 	});
 
 	test('updates only the selected block and appends missing pan', () => {
-		const withGain = updateTrackGain(DEFAULT_SOURCE, pulseId, 0.5);
+		const withGain = updateTrackGain(TRACKED_SOURCE, pulseId, 0.5);
 		const withPan = updateTrackPan(withGain, pulseId, 0.25);
 
 		expect(withPan).toContain('$: note("<e2 e2 g2 b2>").s("sawtooth").gain(0.5).pan(0.25)');
@@ -59,7 +81,7 @@ describe('source mapper', () => {
 	});
 
 	test('uses Strudel labels for mute and solo', () => {
-		const soloed = updateTrackMode(DEFAULT_SOURCE, pulseId, 'solo', true);
+		const soloed = updateTrackMode(TRACKED_SOURCE, pulseId, 'solo', true);
 		const unmuted = updateTrackMode(soloed, pulseId, 'solo', false);
 		const muted = updateTrackMode(unmuted, pulseId, 'mute', true);
 		const restored = updateTrackMode(muted, pulseId, 'mute', false);
@@ -84,12 +106,55 @@ describe('source mapper', () => {
 	});
 
 	test('does not rewrite non-scalar chain expressions', () => {
-		const source = DEFAULT_SOURCE.replace('.gain(0.24)', '.gain(slider(0.24, 0, 1))');
+		const source = TRACKED_SOURCE.replace('.gain(0.24)', '.gain(slider(0.24, 0, 1))');
 		expect(updateTrackGain(source, pulseId, 0.5)).toBe(source);
 	});
 
+	test('renames a marked track without changing its identity', () => {
+		const renamed = updateTrackName(TRACKED_SOURCE, pulseId, 'Warm Pulse');
+		const [pulse, glass] = getSourceBlockDetails(renamed);
+
+		expect(pulse).toMatchObject({ id: pulseId, name: 'Warm Pulse' });
+		expect(glass.name).toBe('Glass lead');
+		expect(renamed).toContain('// @sushi-track {"id":"trk_01J4PULSE","name":"Warm Pulse","type":"synth","schema":1}');
+	});
+
+	test('promotes an unmanaged track when it is renamed', () => {
+		const source = '$: s("bd")';
+		const renamed = updateTrackName(source, 'trk_source_01', 'Kick');
+		const [track] = getSourceBlockDetails(renamed);
+
+		expect(track).toMatchObject({ id: 'trk_source_01', name: 'Kick', marker: true });
+		expect(renamed).toContain('// @sushi-track {"id":"trk_source_01","name":"Kick","type":"drum","schema":1}\n$: s("bd")');
+	});
+
+	test('deletes only the selected source block', () => {
+		const deleted = deleteTrack(TRACKED_SOURCE, pulseId);
+		const tracks = getSourceBlockDetails(deleted);
+
+		expect(tracks).toHaveLength(1);
+		expect(tracks[0]).toMatchObject({ id: 'trk_01JGLASS', name: 'Glass lead' });
+		expect(deleted).not.toContain('trk_01J4PULSE');
+	});
+
+	test('leaves only the canonical header when the last track is deleted', () => {
+		const source = `${DEFAULT_SOURCE}\n// @sushi-track {"id":"trk_source_01","name":"Kick","type":"drum","schema":1}\n$: s("bd")\n`;
+		const deleted = deleteTrack(source, 'trk_source_01');
+
+		expect(getSourceBlockDetails(deleted)).toHaveLength(0);
+		expect(deleted).toBe(`${DEFAULT_SOURCE}\n`);
+	});
+
+	test('removes both seeded tracks without leaving a parsed ghost block', () => {
+		const deletedPulse = deleteTrack(TRACKED_SOURCE, pulseId);
+		const deletedBoth = deleteTrack(deletedPulse, 'trk_01JGLASS');
+
+		expect(getSourceBlockDetails(deletedBoth)).toHaveLength(0);
+		expect(deletedBoth).toBe('setcpm(84 / 4)\nconst key = "E:minor"\n\n');
+	});
+
 	test('projects source tempo, key, and cycle/second conversion', () => {
-		const globals = getSourceGlobals(DEFAULT_SOURCE);
+		const globals = getSourceGlobals(TRACKED_SOURCE);
 
 		expect(globals).toEqual({ bpm: 84, quarterNotesPerCycle: 4, key: 'E:minor' });
 		expect(cyclesToSeconds(10.5, globals)).toBe(30);
@@ -125,8 +190,26 @@ describe('source mapper', () => {
 		expect(updateSourceKey(DEFAULT_SOURCE, 'bad\nkey')).toBe(DEFAULT_SOURCE);
 	});
 
+	test('updates the canonical tempo and key declarations', () => {
+		const withTempo = updateSourceBpm(TRACKED_SOURCE, 150);
+		const withKey = updateSourceKey(withTempo, 'C:major');
+
+		expect(withKey).toContain('setcpm(150 / 4)');
+		expect(withKey).toContain('const key = "C:major"');
+		expect(getSourceGlobals(withKey)).toMatchObject({ bpm: 150, quarterNotesPerCycle: 4, key: 'C:major' });
+	});
+
+	test('allows a zero BPM source value without producing infinite timeline seconds', () => {
+		const source = updateSourceBpm(DEFAULT_SOURCE, 0);
+		const globals = getSourceGlobals(source);
+
+		expect(source).toContain('setcpm(0 / 4)');
+		expect(globals.bpm).toBe(0);
+		expect(cyclesToSeconds(4, globals)).toBe(0);
+	});
+
 	test('writes and reads explicit seqPLoop track ranges', () => {
-		const ranged = updateTrackRange(DEFAULT_SOURCE, pulseId, 1, 3.5);
+		const ranged = updateTrackRange(TRACKED_SOURCE, pulseId, 1, 3.5);
 		const [pulse, glass] = getSourceBlockDetails(ranged);
 
 		expect(ranged).toContain('seqPLoop([1, 3.5, note("<e2 e2 g2 b2>").s("sawtooth").gain(0.24)])');
@@ -175,7 +258,7 @@ describe('source mapper', () => {
 	});
 
 	test('projects arrange durations as a source timing span', () => {
-		const arrangeSource = DEFAULT_SOURCE.replace(
+		const arrangeSource = TRACKED_SOURCE.replace(
 			'note("<e2 e2 g2 b2>").s("sawtooth").gain(0.24)',
 			'arrange([2, note("<e2 e2 g2 b2>").s("sawtooth")], [3, note("<a2 b2>").s("sawtooth")])',
 		);
@@ -239,7 +322,7 @@ describe('source mapper', () => {
 	});
 
 	test('uses the project boundary for full-length tracks', () => {
-		const [track] = getSourceBlockDetails(DEFAULT_SOURCE, 16);
+		const [track] = getSourceBlockDetails(REGULAR_STRUDEL_SONG, 16);
 
 		expect(track.timing).toEqual({ mode: 'full', startCycle: 0, endCycle: 16 });
 	});

@@ -301,7 +301,7 @@ Transport semantics:
 
 ### Timeline editing
 
-Dragging a track's in or out point is a source edit. The mapper converts the dragged seconds to cycles and updates the track's timing wrapper:
+Dragging a track clip moves its timing range; dragging its in or out point resizes the range. Both are source edits and snap to quarter-cycle boundaries. The mapper converts the dragged seconds to cycles and updates the track's timing wrapper:
 
 - Use `arrange(...)` for section-based timelines with explicit durations.
 - Use `seqPLoop(...)` for independent track ranges with explicit start and stop positions, including overlaps.
@@ -329,7 +329,7 @@ The UI stores tempo as BPM and stores the number of quarter notes per Strudel cy
 setcpm(bpm / quarterNotesPerCycle)
 ```
 
-For example, 84 BPM in a four-quarter-note cycle becomes `setcpm(84 / 4)`.
+For example, 150 BPM in a four-quarter-note cycle becomes `setcpm(150 / 4)`. The UI exposes BPM from 0 through 300; zero is retained in source as a stopped tempo and does not produce infinite UI durations.
 
 Meter is project metadata displayed by the UI and reflected through the rhythmic grouping of patterns.
 
@@ -386,6 +386,8 @@ writeSource
 patchSource
 setTrackParameter
 setTrackRange
+deleteTrack
+renameTrack
 setTempo
 setKey
 play
@@ -425,6 +427,12 @@ inspect_strudel_state
 read_strudel_source
 write_strudel_source
 patch_strudel_source
+set_tempo
+set_key
+delete_track
+rename_track
+set_track_range
+extend_timeline
 validate_strudel_source
 lookup_strudel_reference
 control_playback
@@ -449,6 +457,8 @@ Source tools operate on the source document itself:
 - `read_strudel_source` returns the draft, last-valid source, revision, and diagnostics.
 - `write_strudel_source` replaces the draft source and validates it atomically.
 - `patch_strudel_source` applies exact, revision-checked text edits and validates the result.
+- `set_tempo` writes a 0–300 BPM value as `setcpm(bpm / quarterNotesPerCycle)` and `set_key` updates the canonical `const key` declaration; both validate through Strudel and return the shared source revision.
+- `extend_timeline` raises the project boundary from 30 to 137 bars without changing source text.
 - `inspect_strudel_state` returns source, parsed source blocks, recognized controls, diagnostics, and runtime status.
 - `validate_strudel_source` checks candidate source and returns diagnostics.
 - `control_playback` starts, pauses, or stops the derived Strudel runtime.
@@ -456,9 +466,11 @@ Source tools operate on the source document itself:
 
 Invalid writes remain as drafts with structured diagnostics. The runtime and playable project remain on the last valid revision. A successful correction promotes the draft and clears the diagnostics.
 
-Track creation, removal, patterns, transpose, effects, mixer values, tempo, key, and meter are all represented by source edits. The UI derives its state from the resulting source.
+Track creation, removal, patterns, transpose, effects, mixer values, tempo, key, and meter are all represented by source edits. Track tools accept a stable track ID, 1-based track number, or exact track name. The UI derives its state from the resulting source.
 
 The tool registry should grow from real interaction needs rather than expose the entire command dispatcher automatically.
+
+The timeline starts with a 30-bar capacity and new tracks default to a four-bar range. The user or agent can extend the project boundary to 137 bars, and an explicit source range beyond bar 30 promotes the boundary automatically. Its zoom is view-only: the mountain/left end shows all available bars, the magnifier/right end shows one bar, and it opens at the midpoint.
 
 ## Musical model
 

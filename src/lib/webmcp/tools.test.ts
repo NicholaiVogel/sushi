@@ -19,6 +19,7 @@ const state: WebMcpStateSnapshot = {
 	timeline: { bpm: 84, quarterNotesPerCycle: 4, key: 'E:minor', songEndCycle: 4 },
 	tracks: [{
 		id: 'trk_test',
+		number: 1,
 		name: 'Test',
 		type: 'synth',
 		line: 1,
@@ -40,6 +41,12 @@ function testController(): WebMcpController {
 		getState: () => state,
 		writeSource: async () => ({ ok: true, action: 'write_strudel_source', affectedEntityIds: ['source'], message: 'accepted', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
 		patchSource: async () => ({ ok: true, action: 'patch_strudel_source', affectedEntityIds: ['source'], message: 'accepted', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
+		setTempo: async () => ({ ok: true, action: 'set_tempo', affectedEntityIds: ['source'], message: 'tempo set', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
+		setKey: async () => ({ ok: true, action: 'set_key', affectedEntityIds: ['source'], message: 'key set', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
+		deleteTrack: async () => ({ ok: true, action: 'delete_track', affectedEntityIds: ['source', 'trk_test'], message: 'deleted', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
+		renameTrack: async () => ({ ok: true, action: 'rename_track', affectedEntityIds: ['source', 'trk_test'], message: 'renamed', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
+		setTrackRange: async () => ({ ok: true, action: 'set_track_range', affectedEntityIds: ['source', 'trk_test'], message: 'ranged', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
+		extendTimeline: async () => ({ ok: true, action: 'extend_timeline', affectedEntityIds: ['timeline'], message: 'extended', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
 		validateSource: async (source) => ({ ok: true, action: 'validate_strudel_source', source: source ?? state.source.draft, diagnostics: [], message: 'valid', revision: state.source.revision, state }),
 		controlPlayback: async ({ action }) => ({ ok: true, action: `control_playback:${action}`, affectedEntityIds: ['transport'], message: 'done', state, revision: state.source.revision, activeRevision: state.source.activeRevision }),
 		undoSourceEdit: async () => ({ ok: true, action: 'undo_source_edit', affectedEntityIds: ['source'], message: 'undone', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
@@ -184,12 +191,62 @@ describe('WebMCP tool adapter', () => {
 		expect(write?.inputSchema).toMatchObject({ required: ['source', 'baseRevision', 'transactionId'] });
 		const patch = tools.find((tool) => tool.name === 'patch_strudel_source');
 		expect(patch?.inputSchema).toMatchObject({ required: ['edits', 'baseRevision', 'transactionId'] });
+		const tempo = tools.find((tool) => tool.name === 'set_tempo');
+		expect(tempo?.inputSchema).toMatchObject({ required: ['bpm', 'baseRevision', 'transactionId'] });
+		const key = tools.find((tool) => tool.name === 'set_key');
+		expect(key?.inputSchema).toMatchObject({ required: ['key', 'baseRevision', 'transactionId'] });
+		const deleteTool = tools.find((tool) => tool.name === 'delete_track');
+		expect(deleteTool?.inputSchema).toMatchObject({ required: ['baseRevision', 'transactionId'] });
+		const renameTool = tools.find((tool) => tool.name === 'rename_track');
+		expect(renameTool?.inputSchema).toMatchObject({ required: ['newName', 'baseRevision', 'transactionId'] });
+		const rangeTool = tools.find((tool) => tool.name === 'set_track_range');
+		expect(rangeTool?.inputSchema).toMatchObject({ required: ['startCycle', 'endCycle', 'baseRevision', 'transactionId'] });
+		const extendTool = tools.find((tool) => tool.name === 'extend_timeline');
+		expect(extendTool?.inputSchema).toMatchObject({ required: ['baseRevision', 'transactionId'] });
 	});
 
 	test('rejects malformed tool inputs before dispatch', async () => {
 		const write = createWebMcpTools(testController()).find((tool) => tool.name === 'write_strudel_source');
 		const result = await write?.execute({ source: 'next', baseRevision: 0 }, { signal: new AbortController().signal });
 		expect(result).toEqual({ ok: false, error: { code: 'INVALID_INPUT', message: 'transactionId must be a non-empty string.' } });
+	});
+
+	test('validates track targets before dispatching track tools', async () => {
+		const deleteTool = createWebMcpTools(testController()).find((tool) => tool.name === 'delete_track');
+		const result = await deleteTool?.execute({ baseRevision: 0, transactionId: 'delete-test' }, { signal: new AbortController().signal });
+		expect(result).toEqual({ ok: false, error: { code: 'INVALID_INPUT', message: 'Provide trackNumber, trackId, or trackName to identify a track.' } });
+	});
+
+	test('validates tempo and key inputs before dispatch', async () => {
+		const tools = createWebMcpTools(testController());
+		const tempo = tools.find((tool) => tool.name === 'set_tempo');
+		const key = tools.find((tool) => tool.name === 'set_key');
+		const signal = new AbortController().signal;
+
+		expect(await tempo?.execute({ bpm: 301, baseRevision: 0, transactionId: 'tempo-test' }, { signal })).toEqual({ ok: false, error: { code: 'INVALID_INPUT', message: 'bpm must be a finite number from 0 to 300.' } });
+		expect(await key?.execute({ key: '  ', baseRevision: 0, transactionId: 'key-test' }, { signal })).toEqual({ ok: false, error: { code: 'INVALID_INPUT', message: 'key must contain 1-64 characters.' } });
+	});
+
+	test('normalizes a track-name target before dispatch', async () => {
+		let received: unknown;
+		const controller = { ...testController(), deleteTrack: async (input: Parameters<WebMcpController['deleteTrack']>[0]) => {
+			received = input;
+			return { ok: true, action: 'delete_track', affectedEntityIds: ['source', 'trk_test'], message: 'deleted', state, revision: 1, activeRevision: 1, transactionId: input.transactionId };
+		} };
+		const deleteTool = createWebMcpTools(controller).find((tool) => tool.name === 'delete_track');
+		await deleteTool?.execute({ trackName: '  Test  ', baseRevision: 0, transactionId: 'delete-name' }, { signal: new AbortController().signal });
+		expect(received).toMatchObject({ trackName: 'Test', baseRevision: 0, transactionId: 'delete-name' });
+	});
+
+	test('accepts an explicit track ID target', async () => {
+		let received: unknown;
+		const controller = { ...testController(), deleteTrack: async (input: Parameters<WebMcpController['deleteTrack']>[0]) => {
+			received = input;
+			return { ok: true, action: 'delete_track', affectedEntityIds: ['source', 'trk_test'], message: 'deleted', state, revision: 1, activeRevision: 1, transactionId: input.transactionId };
+		} };
+		const deleteTool = createWebMcpTools(controller).find((tool) => tool.name === 'delete_track');
+		await deleteTool?.execute({ trackId: '  trk_test  ', baseRevision: 0, transactionId: 'delete-id' }, { signal: new AbortController().signal });
+		expect(received).toMatchObject({ trackId: 'trk_test', baseRevision: 0, transactionId: 'delete-id' });
 	});
 
 	test('applies exact edits and rejects overlap', () => {
