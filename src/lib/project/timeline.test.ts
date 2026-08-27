@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { clampTimelineZoom, getTimelineCellWidth, getTimelineCells } from './timeline';
+import { clampTimelineZoom, getTimelineCapacityForEndCycle, getTimelineCellWidth, getTimelineCells, getTimelineZoomForVisibleCycles } from './timeline';
 
 describe('arrangement timeline cells', () => {
 	test('expands the ruler beyond the default four cycles', () => {
@@ -19,6 +19,20 @@ describe('arrangement timeline cells', () => {
 
 		expect(cells).toHaveLength(16);
 		expect(cells.slice(0, 10).map((cell) => cell.label)).toEqual(['1', '1.1', '1.2', '1.3', '1.4', '1.5', '1.6', '1.7', '2', '2.1']);
+	});
+
+	test('grows timeline capacity in 30-bar pages and caps at 137 bars', () => {
+		expect(getTimelineCapacityForEndCycle(30)).toBe(30);
+		expect(getTimelineCapacityForEndCycle(30.25)).toBe(60);
+		expect(getTimelineCapacityForEndCycle(60)).toBe(60);
+		expect(getTimelineCapacityForEndCycle(60.25)).toBe(90);
+		expect(getTimelineCapacityForEndCycle(120.25)).toBe(137);
+		expect(getTimelineCapacityForEndCycle(200)).toBe(137);
+	});
+
+	test('opens loaded timelines at about 30 visible bars', () => {
+		expect(getTimelineZoomForVisibleCycles(30)).toBe(0);
+		expect(Math.round(137 - (137 - 1) * (getTimelineZoomForVisibleCycles(137) / 100))).toBe(30);
 	});
 
 	test('clamps arrangement zoom to usable quarter-note widths', () => {

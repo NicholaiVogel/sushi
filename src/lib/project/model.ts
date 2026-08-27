@@ -61,9 +61,6 @@ export interface ProjectDocumentV1 {
 	assets: AssetManifestEntry[];
 }
 
-/** Default working range for a new arrangement, expressed in Strudel cycles. */
-export const DEFAULT_SONG_END_CYCLE = 16;
-
 export interface SourceBlockSummary {
 	id: string;
 	name: string;
@@ -71,7 +68,15 @@ export interface SourceBlockSummary {
 	line: number;
 }
 
-export const DEFAULT_SOURCE = `setcpm(84 / 4)
+export const DEFAULT_SONG_END_CYCLE = 30;
+export const EXTENDED_SONG_END_CYCLE = 137;
+
+export const DEFAULT_SOURCE = `setcpm(150 / 4)
+const key = "E:minor"
+`;
+
+/** The pre-empty-session seed used only to migrate untouched local projects. */
+export const LEGACY_DEFAULT_SOURCE = `setcpm(84 / 4)
 const key = "E:minor"
 
 // @sushi-track {"id":"trk_01J4PULSE","name":"Pulse","type":"synth","schema":1}

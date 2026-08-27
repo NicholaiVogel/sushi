@@ -177,7 +177,7 @@ export const STRUDEL_REFERENCE: StrudelReferenceEntry[] = [
 		title: 'Tempo and key header',
 		summary: 'The canonical Sushi header for tempo, cycle grouping, and musical key.',
 		syntax: 'setcpm(bpm / quarterNotesPerCycle)\nconst key = "E:minor"',
-		example: 'setcpm(84 / 4)\nconst key = "E:minor"',
+		example: 'setcpm(150 / 4)\nconst key = "E:minor"',
 		tags: ['tempo', 'key', 'header', 'sushi'],
 	},
 ];

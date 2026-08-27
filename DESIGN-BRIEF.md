@@ -15,7 +15,8 @@ Sushi is a source-first browser DAW for a beginner and an agent sharing one musi
 - **Spacing rhythm:** tight (8px), related (16px), group (24px), section (40px), page (64px).
 - **Surface rules:** near-black canvas, charcoal panels, one-pixel hairlines, small radii, and one acid-lime interaction accent. No decorative card wall or gradient mesh.
 - **Media rules:** no external media in Slice 0; the signal bars are a semantic playback indicator, not a fake waveform.
-- **Interaction rules:** source-editor edits stay local until Commit; mapped track controls write the corresponding Strudel source expression and evaluate immediately; a failed draft remains visible while the last-valid source remains the playable runtime; Play and Stop are always visible.
+- **Interaction rules:** source-editor edits stay local until Commit; mapped track controls write the corresponding Strudel source expression and evaluate immediately; tracks can be selected, deleted with Backspace/Delete or a context menu, renamed through the hover pencil, and moved or resized on quarter-cycle boundaries; a failed draft remains visible while the last-valid source remains the playable runtime; Play and Stop are always visible.
+- **Session controls:** new sessions contain only the tempo/key header; a 0–300 BPM control is centered at 150, the key dropdown rewrites `const key`, and both changes evaluate through the shared Strudel pipeline; the timeline starts at 30 bars, new tracks span four bars, and dragging or lengthening beyond the current boundary adds 30-bar pages up to 137 bars.
 - **Responsive behavior:** desktop docks source left of a full-height timeline; below 980px the source editor moves above the canvas and the timeline keeps a fixed-height, horizontally scrollable grid with compact lane heights; controls remain touch-sized and source text keeps a readable minimum width.
 - **Motion budget:** one restrained signal-bar pulse while playing. `prefers-reduced-motion` disables it without hiding state.
 - **Signature moves:** a centered editable session name, flush line-numbered source editor, compact transport clock, BandLab-style add-track control strip, and beat-grid timeline make the boundary between draft and sound visible.
@@ -38,6 +39,7 @@ Sushi is a source-first browser DAW for a beginner and an agent sharing one musi
 | Valid source evaluates and plays | Play calls the adapter against the committed source |
 | Invalid draft is visible and non-destructive | Commit preserves `lastValid` and `activeRevision`, then renders diagnostics |
 | Track controls are source-backed | Gain/pan rewrite numeric Strudel chain calls; mute/solo rewrite `_$:`/`S$:` labels and re-evaluate through `StrudelAdapter` |
+| Track editing is source-backed | Selection, context-menu/keyboard deletion, inline rename, clip movement, and quarter-cycle range edits update and evaluate the corresponding source block |
 | Projects reopen from local storage | IndexedDB restores the project name, draft, last-valid source, and revision before the runtime boots |
 | Timeline timing stays source-backed | `seqPLoop(...)` ranges render as cycle/second spans; dragging either clip edge rewrites the marked source block |
 | Transport follows Strudel's scheduler | Play, pause/resume, stop-to-zero, seek, live cycle progress, and song-end stop use the adapter scheduler |

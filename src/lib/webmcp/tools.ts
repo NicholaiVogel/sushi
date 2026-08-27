@@ -10,6 +10,12 @@ export const WEBMCP_TOOL_NAMES = [
 	'read_strudel_source',
 	'write_strudel_source',
 	'patch_strudel_source',
+	'set_tempo',
+	'set_key',
+	'delete_track',
+	'rename_track',
+	'set_track_range',
+	'extend_timeline',
 	'validate_strudel_source',
 	'lookup_strudel_reference',
 	'control_playback',
@@ -26,6 +32,7 @@ export interface WebMcpControlState {
 
 export interface WebMcpTrackState {
 	id: string;
+	number: number;
 	name: string;
 	type: SourceBlockDetails['type'];
 	line: number;
@@ -133,6 +140,43 @@ export interface SourceMutationInput {
 	transactionId: string;
 }
 
+export interface WebMcpTrackTarget {
+	trackNumber?: number;
+	trackId?: string;
+	trackName?: string;
+}
+
+export interface WebMcpTrackMutationInput extends WebMcpTrackTarget {
+	baseRevision: number;
+	transactionId: string;
+}
+
+export interface WebMcpTrackRenameInput extends WebMcpTrackMutationInput {
+	newName: string;
+}
+
+export interface WebMcpTrackRangeInput extends WebMcpTrackMutationInput {
+	startCycle: number;
+	endCycle: number;
+}
+
+export interface WebMcpTempoInput {
+	bpm: number;
+	baseRevision: number;
+	transactionId: string;
+}
+
+export interface WebMcpKeyInput {
+	key: string;
+	baseRevision: number;
+	transactionId: string;
+}
+
+export interface WebMcpTimelineExtensionInput {
+	baseRevision: number;
+	transactionId: string;
+}
+
 export interface SourcePatchInput {
 	edits: SourceTextEdit[];
 	baseRevision: number;
@@ -143,6 +187,12 @@ export interface WebMcpController {
 	getState: () => WebMcpStateSnapshot;
 	writeSource: (input: SourceMutationInput) => Promise<WebMcpMutationResult>;
 	patchSource: (input: SourcePatchInput) => Promise<WebMcpMutationResult>;
+	setTempo: (input: WebMcpTempoInput) => Promise<WebMcpMutationResult>;
+	setKey: (input: WebMcpKeyInput) => Promise<WebMcpMutationResult>;
+	deleteTrack: (input: WebMcpTrackMutationInput) => Promise<WebMcpMutationResult>;
+	renameTrack: (input: WebMcpTrackRenameInput) => Promise<WebMcpMutationResult>;
+	setTrackRange: (input: WebMcpTrackRangeInput) => Promise<WebMcpMutationResult>;
+	extendTimeline: (input: WebMcpTimelineExtensionInput) => Promise<WebMcpMutationResult>;
 	validateSource: (source?: string) => Promise<WebMcpValidationResult>;
 	controlPlayback: (input: { action: WebMcpPlaybackAction; cycle?: number }) => Promise<WebMcpPlaybackResult>;
 	undoSourceEdit: (input: Omit<SourceMutationInput, 'source'>) => Promise<WebMcpMutationResult>;
@@ -275,11 +325,20 @@ interface ToolOptions {
 const MAX_SOURCE_LENGTH = 200_000;
 const MAX_EDIT_COUNT = 100;
 const MAX_TRANSACTION_LENGTH = 128;
+const MAX_TRACK_NAME_LENGTH = 120;
+const MAX_KEY_LENGTH = 64;
 
 const EMPTY_SCHEMA = {
 	type: 'object',
 	properties: {},
 	additionalProperties: false,
+} as const;
+
+const TRACK_TARGET_SCHEMA = {
+	trackNumber: { type: 'integer', minimum: 1 },
+	trackId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+	trackName: { type: 'string', minLength: 1, maxLength: MAX_TRACK_NAME_LENGTH },
+	name: { type: 'string', minLength: 1, maxLength: MAX_TRACK_NAME_LENGTH },
 } as const;
 
 function messageFromError(error: unknown): string {
@@ -332,6 +391,82 @@ function readMutationInput(value: unknown): { ok: true; input: SourceMutationInp
 	const transaction = readTransactionInput(value.transactionId);
 	if (!transaction.ok) return transaction;
 	return { ok: true, input: { source: source.source, baseRevision: revision.revision, transactionId: transaction.transactionId } };
+}
+
+function readTrackTarget(value: Record<string, unknown>): { ok: true; target: WebMcpTrackTarget } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	const hasTrackNumber = value.trackNumber !== undefined;
+	if (hasTrackNumber && (!isInteger(value.trackNumber) || value.trackNumber < 1)) return { ok: false, result: invalidInput('trackNumber must be a positive integer.') };
+
+	const hasTrackId = value.trackId !== undefined;
+	if (hasTrackId && (typeof value.trackId !== 'string' || !value.trackId.trim() || value.trackId.trim().length > MAX_TRANSACTION_LENGTH)) return { ok: false, result: invalidInput(`trackId must contain 1-${MAX_TRANSACTION_LENGTH} characters.`) };
+
+	const hasTrackName = value.trackName !== undefined;
+	const hasNameAlias = value.name !== undefined;
+	if (hasTrackName && typeof value.trackName !== 'string') return { ok: false, result: invalidInput('trackName must be a non-empty string.') };
+	if (hasNameAlias && typeof value.name !== 'string') return { ok: false, result: invalidInput('name must be a non-empty string.') };
+	if (hasTrackName && hasNameAlias && value.trackName !== value.name) return { ok: false, result: invalidInput('trackName and name must identify the same track.') };
+
+	const rawName = typeof value.trackName === 'string' ? value.trackName : typeof value.name === 'string' ? value.name : undefined;
+	const trackName = rawName?.trim();
+	if (trackName !== undefined && (!trackName || trackName.length > MAX_TRACK_NAME_LENGTH)) return { ok: false, result: invalidInput(`trackName must contain 1-${MAX_TRACK_NAME_LENGTH} characters.`) };
+	if (!hasTrackNumber && !hasTrackId && !trackName) return { ok: false, result: invalidInput('Provide trackNumber, trackId, or trackName to identify a track.') };
+
+	return {
+		ok: true,
+		target: {
+			...(hasTrackNumber ? { trackNumber: value.trackNumber as number } : {}),
+			...(hasTrackId ? { trackId: (value.trackId as string).trim() } : {}),
+			...(trackName ? { trackName } : {}),
+		},
+	};
+}
+
+function readTrackMutationInput(value: unknown): { ok: true; input: WebMcpTrackMutationInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	const target = readTrackTarget(value);
+	if (!target.ok) return target;
+	const revision = readRevisionInput(value.baseRevision);
+	if (!revision.ok) return revision;
+	const transaction = readTransactionInput(value.transactionId);
+	if (!transaction.ok) return transaction;
+	return { ok: true, input: { ...target.target, baseRevision: revision.revision, transactionId: transaction.transactionId } };
+}
+
+function readTrackRenameInput(value: unknown): { ok: true; input: WebMcpTrackRenameInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	const mutation = readTrackMutationInput(value);
+	if (!mutation.ok) return mutation;
+	if (typeof value.newName !== 'string' || !value.newName.trim() || value.newName.trim().length > MAX_TRACK_NAME_LENGTH) return { ok: false, result: invalidInput(`newName must contain 1-${MAX_TRACK_NAME_LENGTH} characters.`) };
+	return { ok: true, input: { ...mutation.input, newName: value.newName.trim() } };
+}
+
+function readTrackRangeInput(value: unknown): { ok: true; input: WebMcpTrackRangeInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	const mutation = readTrackMutationInput(value);
+	if (!mutation.ok) return mutation;
+	if (!isFiniteNumber(value.startCycle) || value.startCycle < 0) return { ok: false, result: invalidInput('startCycle must be a non-negative finite number.') };
+	if (!isFiniteNumber(value.endCycle) || value.endCycle <= value.startCycle) return { ok: false, result: invalidInput('endCycle must be a finite number greater than startCycle.') };
+	return { ok: true, input: { ...mutation.input, startCycle: value.startCycle, endCycle: value.endCycle } };
+}
+
+function readTempoInput(value: unknown): { ok: true; input: WebMcpTempoInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	if (!isFiniteNumber(value.bpm) || value.bpm < 0 || value.bpm > 300) return { ok: false, result: invalidInput('bpm must be a finite number from 0 to 300.') };
+	const revision = readRevisionInput(value.baseRevision);
+	if (!revision.ok) return revision;
+	const transaction = readTransactionInput(value.transactionId);
+	if (!transaction.ok) return transaction;
+	return { ok: true, input: { bpm: value.bpm, baseRevision: revision.revision, transactionId: transaction.transactionId } };
+}
+
+function readKeyInput(value: unknown): { ok: true; input: WebMcpKeyInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	if (typeof value.key !== 'string' || !value.key.trim() || value.key.trim().length > MAX_KEY_LENGTH) return { ok: false, result: invalidInput(`key must contain 1-${MAX_KEY_LENGTH} characters.`) };
+	const revision = readRevisionInput(value.baseRevision);
+	if (!revision.ok) return revision;
+	const transaction = readTransactionInput(value.transactionId);
+	if (!transaction.ok) return transaction;
+	return { ok: true, input: { key: value.key.trim(), baseRevision: revision.revision, transactionId: transaction.transactionId } };
 }
 
 function readRevisionTransactionInput(value: unknown): { ok: true; input: Omit<SourceMutationInput, 'source'> } | { ok: false; result: ReturnType<typeof invalidInput> } {
@@ -526,6 +661,110 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			const parsed = readPatchInput(input);
 			if (!parsed.ok) return parsed.result;
 			return executeSafely(() => controller.patchSource(parsed.input));
+		}),
+
+		createTool({
+			name: 'set_tempo',
+			title: 'Set BPM',
+			description: 'Set the source tempo from 0 to 300 BPM. Sushi writes this as setcpm(bpm / quarterNotesPerCycle) and validates it through Strudel.',
+			inputSchema: schema({
+				bpm: { type: 'number', minimum: 0, maximum: 300 },
+				baseRevision: { type: 'integer', minimum: 0 },
+				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+			}, ['bpm', 'baseRevision', 'transactionId']),
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readTempoInput(input);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => controller.setTempo(parsed.input));
+		}),
+
+		createTool({
+			name: 'set_key',
+			title: 'Set musical key',
+			description: 'Update the canonical const key source declaration and validate it through Strudel.',
+			inputSchema: schema({
+				key: { type: 'string', minLength: 1, maxLength: MAX_KEY_LENGTH },
+				baseRevision: { type: 'integer', minimum: 0 },
+				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+			}, ['key', 'baseRevision', 'transactionId']),
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readKeyInput(input);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => controller.setKey(parsed.input));
+		}),
+
+		createTool({
+			name: 'delete_track',
+			title: 'Delete track',
+			description: 'Delete a source-defined track by ID, 1-based track number, or exact track name. Requires the current source revision.',
+			inputSchema: schema({
+				...TRACK_TARGET_SCHEMA,
+				baseRevision: { type: 'integer', minimum: 0 },
+				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+			}, ['baseRevision', 'transactionId']),
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readTrackMutationInput(input);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => controller.deleteTrack(parsed.input));
+		}),
+
+		createTool({
+			name: 'rename_track',
+			title: 'Rename track',
+			description: 'Rename a source-defined track by ID, 1-based track number, or exact track name. The new name is written into the Sushi source marker.',
+			inputSchema: schema({
+				...TRACK_TARGET_SCHEMA,
+				newName: { type: 'string', minLength: 1, maxLength: MAX_TRACK_NAME_LENGTH },
+				baseRevision: { type: 'integer', minimum: 0 },
+				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+			}, ['newName', 'baseRevision', 'transactionId']),
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readTrackRenameInput(input);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => controller.renameTrack(parsed.input));
+		}),
+
+		createTool({
+			name: 'set_track_range',
+			title: 'Set track range',
+			description: 'Move or resize a track by ID, 1-based track number, or exact track name to exact musical cycle boundaries. Use 0.25 increments for quarter-bar precision; in the default four-quarter-note cycle, cycle 1 is the start of bar 2.',
+			inputSchema: schema({
+				...TRACK_TARGET_SCHEMA,
+				startCycle: { type: 'number', minimum: 0 },
+				endCycle: { type: 'number', minimum: 0 },
+				baseRevision: { type: 'integer', minimum: 0 },
+				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+			}, ['startCycle', 'endCycle', 'baseRevision', 'transactionId']),
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readTrackRangeInput(input);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => controller.setTrackRange(parsed.input));
+		}),
+
+		createTool({
+			name: 'extend_timeline',
+			title: 'Extend timeline',
+			description: 'Advance the editable timeline by the next 30-bar page, capped at the 137-bar maximum. This changes project timeline metadata without changing source text.',
+			inputSchema: schema({
+				baseRevision: { type: 'integer', minimum: 0 },
+				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+			}, ['baseRevision', 'transactionId']),
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readRevisionTransactionInput(input);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => controller.extendTimeline(parsed.input));
 		}),
 
 		createTool({

@@ -1,3 +1,5 @@
+import { DEFAULT_SONG_END_CYCLE, EXTENDED_SONG_END_CYCLE } from './model';
+
 export interface TimelineCell {
 	label: string;
 	barStart: boolean;
@@ -9,6 +11,29 @@ export const DEFAULT_TIMELINE_ZOOM = 1;
 export const MIN_TIMELINE_ZOOM = 0.25;
 export const MAX_TIMELINE_ZOOM = 2;
 export const TIMELINE_ZOOM_STEP = 0.25;
+
+/**
+ * Timeline capacity grows in 30-bar pages, with a final capped page ending
+ * at the 137-bar maximum. Track ranges can still use quarter-cycle precision;
+ * this only controls how much room the arrangement exposes around them.
+ */
+export function getTimelineCapacityForEndCycle(requiredEndCycle: number): number {
+	const safeEndCycle = Number.isFinite(requiredEndCycle) && requiredEndCycle > 0
+		? requiredEndCycle
+		: DEFAULT_SONG_END_CYCLE;
+	if (safeEndCycle <= DEFAULT_SONG_END_CYCLE) return DEFAULT_SONG_END_CYCLE;
+	return Math.min(EXTENDED_SONG_END_CYCLE, Math.ceil(safeEndCycle / DEFAULT_SONG_END_CYCLE) * DEFAULT_SONG_END_CYCLE);
+}
+
+/** Choose the slider position that opens a loaded timeline around the target number of visible bars. */
+export function getTimelineZoomForVisibleCycles(timelineEndCycle: number, targetVisibleCycles = DEFAULT_SONG_END_CYCLE): number {
+	const safeEndCycle = Number.isFinite(timelineEndCycle) && timelineEndCycle > 0 ? timelineEndCycle : DEFAULT_SONG_END_CYCLE;
+	const safeTarget = Number.isFinite(targetVisibleCycles) && targetVisibleCycles > 0
+		? Math.min(safeEndCycle, targetVisibleCycles)
+		: Math.min(safeEndCycle, DEFAULT_SONG_END_CYCLE);
+	if (safeEndCycle <= 1) return 0;
+	return Math.max(0, Math.min(100, Math.round(((safeEndCycle - safeTarget) / (safeEndCycle - 1)) * 100)));
+}
 
 export function clampTimelineZoom(value: number): number {
 	const safeValue = Number.isFinite(value) ? value : DEFAULT_TIMELINE_ZOOM;

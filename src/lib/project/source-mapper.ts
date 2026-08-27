@@ -11,6 +11,7 @@ export interface SourceBlockDetails extends SourceBlockSummary {
 	expressionRange?: SourceRange;
 	label?: string;
 	expression?: string;
+	marker: boolean;
 	timing: TrackTiming;
 	gain?: number;
 	pan?: number;
@@ -40,8 +41,9 @@ export interface TrackDisplayTiming extends TrackTiming {
 }
 
 const labelPattern = /^(\s*)([A-Za-z_$][\w$]*)(\s*):(\s*)(.*)$/;
+const markerLinePattern = /^(\s*\/\/\s*@sushi-track\s+)(\{.*\})(\s*)$/;
 const numericLiteral = '[-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?';
-const DEFAULT_BPM = 84;
+const DEFAULT_BPM = 150;
 const DEFAULT_QUARTER_NOTES_PER_CYCLE = 4;
 const DEFAULT_TRACK_END_CYCLE = 4;
 
@@ -55,17 +57,19 @@ export function getSourceGlobals(source: string): SourceGlobals {
 	const parsedQuarterNotes = tempoMatch?.[2] ? Number(tempoMatch[2]) : DEFAULT_QUARTER_NOTES_PER_CYCLE;
 	const keyMatch = source.match(/^\s*(?:const|let|var)\s+key\s*=\s*["']([^"']+)["']/m);
 	return {
-		bpm: Number.isFinite(parsedBpm) && parsedBpm > 0 ? parsedBpm : DEFAULT_BPM,
+		bpm: Number.isFinite(parsedBpm) && parsedBpm >= 0 ? parsedBpm : DEFAULT_BPM,
 		quarterNotesPerCycle: Number.isFinite(parsedQuarterNotes) && parsedQuarterNotes > 0 ? parsedQuarterNotes : DEFAULT_QUARTER_NOTES_PER_CYCLE,
 		key: keyMatch?.[1] ?? 'E:minor',
 	};
 }
 
 export function cyclesToSeconds(cycles: number, globals: SourceGlobals): number {
+	if (globals.bpm <= 0) return 0;
 	return cycles * 60 * globals.quarterNotesPerCycle / globals.bpm;
 }
 
 export function secondsToCycles(seconds: number, globals: SourceGlobals): number {
+	if (globals.bpm <= 0) return 0;
 	return seconds * globals.bpm / (60 * globals.quarterNotesPerCycle);
 }
 
@@ -122,6 +126,16 @@ export function updateSourceKey(source: string, key: string): string {
 		return `${source.slice(0, insertAt)}${declaration}\n${source.slice(insertAt)}`;
 	}
 	return prependGlobalDeclaration(source, declaration);
+}
+
+/** Update BPM using the explicit ratio form required by the studio controls. */
+export function updateSourceBpm(source: string, bpm: number): string {
+	const normalizedBpm = Number.isFinite(bpm) ? Math.max(0, Math.min(300, bpm)) : DEFAULT_BPM;
+	const globals = getSourceGlobals(source);
+	const replacement = `setcpm(${formatNumber(normalizedBpm)} / ${formatNumber(globals.quarterNotesPerCycle)})`;
+	const tempoPattern = /\bsetcpm\s*\(\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?(?:\s*\/\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)?\s*\)/;
+	if (tempoPattern.test(source)) return source.replace(tempoPattern, replacement);
+	return `${replacement}\n${source}`;
 }
 
 export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAULT_TRACK_END_CYCLE): TrackTiming {
@@ -328,6 +342,46 @@ export function updateTrackGain(source: string, trackId: string, value: number):
 
 export function updateTrackPan(source: string, trackId: string, value: number): string {
 	return updateNumericMethod(source, trackId, 'pan', value);
+}
+
+/**
+ * Update the display name stored in a Sushi marker. Unmanaged Strudel blocks
+ * are promoted to marked blocks so a rename gives them a stable identity for
+ * subsequent source edits.
+ */
+export function updateTrackName(source: string, trackId: string, name: string): string {
+	const normalizedName = name.trim();
+	if (!normalizedName) return source;
+
+	const details = getSourceBlockDetails(source).find((block) => block.id === trackId);
+	if (!details) return source;
+
+	if (details.marker) {
+		const lineEnd = source.indexOf('\n', details.sourceRange.start);
+		const markerEnd = lineEnd === -1 ? source.length : lineEnd;
+		const markerLine = source.slice(details.sourceRange.start, markerEnd);
+		const match = markerLine.match(markerLinePattern);
+		if (!match) return source;
+
+		try {
+			const metadata = JSON.parse(match[2]) as Record<string, unknown>;
+			const updatedMarker = JSON.stringify({ ...metadata, name: normalizedName });
+			return `${source.slice(0, details.sourceRange.start)}${match[1]}${updatedMarker}${match[3]}${source.slice(markerEnd)}`;
+		} catch {
+			return source;
+		}
+	}
+
+	const lineEnding = source.includes('\r\n') ? '\r\n' : '\n';
+	const marker = JSON.stringify({ id: details.id, name: normalizedName, type: details.type, schema: 1 });
+	return `${source.slice(0, details.sourceRange.start)}// @sushi-track ${marker}${lineEnding}${source.slice(details.sourceRange.start)}`;
+}
+
+/** Remove one complete source-defined track block while preserving all other source. */
+export function deleteTrack(source: string, trackId: string): string {
+	const details = getSourceBlockDetails(source).find((block) => block.id === trackId);
+	if (!details) return source;
+	return `${source.slice(0, details.sourceRange.start)}${source.slice(details.sourceRange.end)}`;
 }
 
 export function updateTrackRange(source: string, trackId: string, startCycle: number, endCycle: number, minimumCycleSpan = 0.25): string {

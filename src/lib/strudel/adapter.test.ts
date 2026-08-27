@@ -128,6 +128,44 @@ describe('StrudelAdapter evaluation queue', () => {
 		}
 	});
 
+	test('evaluates a header-only source with runtime silence without changing source text', async () => {
+		const evaluated: string[] = [];
+		let onEvalError: ((error: unknown) => void) | undefined;
+		const fakeModule = {
+			initStrudel: async (options?: { onEvalError?: (error: unknown) => void }) => {
+				onEvalError = options?.onEvalError;
+				return {
+					evaluate: async (code: string) => {
+						evaluated.push(code);
+						if (!code.endsWith('silence')) onEvalError?.(new Error('unexpected ast format without body expression'));
+						return code.endsWith('silence') ? {} : undefined;
+					},
+					start: async () => undefined,
+					stop: () => undefined,
+					pause: () => undefined,
+					scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+				};
+			},
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			const source = 'setcpm(150 / 4)\nconst key = "E:minor"\n';
+			expect(await adapter.evaluateSource(source)).toEqual({ ok: true });
+			expect(evaluated).toEqual([source, 'setcpm(150 / 4)\nconst key = "E:minor"\n\nsilence']);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
+
 	test('stops safely when a rejected candidate cannot restore the accepted source', async () => {
 		let onEvalError: ((error: unknown) => void) | undefined;
 		let acceptedEvaluations = 0;
