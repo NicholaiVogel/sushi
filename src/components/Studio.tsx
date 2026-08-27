@@ -2239,9 +2239,10 @@ export default function Studio() {
 							const timing = getTrackTimingForTimeline(trackDetails, studio.songEndCycle);
 							const displayTiming = getTrackDisplayTiming(timing, studio.songEndCycle);
 							// A newly created lane is a four-bar editable clip even though
-							// its source pattern is repeatable. Only expand visibly longer
-							// loop ranges through the project boundary.
-							const showLoopSpan = displayTiming.repeating && timing.endCycle > DEFAULT_TRACK_END_CYCLE;
+							// its source pattern is repeatable. Use the range duration—not
+							// the absolute end—so moving a four-bar clip past bar four
+							// does not turn it into a full-project visual span.
+							const showLoopSpan = displayTiming.repeating && timing.endCycle - timing.startCycle > DEFAULT_TRACK_END_CYCLE;
 							const clipStart = clamp(timing.startCycle / studio.songEndCycle, 0, 1);
 							const clipEnd = clamp((showLoopSpan ? displayTiming.displayEndCycle : timing.endCycle) / studio.songEndCycle, clipStart + 0.01, 1);
 							const loopHandlePosition = clipEnd > clipStart
