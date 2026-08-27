@@ -2223,7 +2223,6 @@ export default function Studio() {
 									<span aria-hidden="true">·</span>
 									<span>{formatCycle(songEndSeconds)}s</span>
 								</div>
-								<span className="timeline-duration">{formatCycle(studio.songEndCycle)} bars · {formatCycle(songEndSeconds)}s</span>
 								<span className="sr-only" id="timeline-heading">{activeLaneCount} source lanes</span>
 							</div>
 							<div className="timeline-ruler" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-label="Arrangement beats">
