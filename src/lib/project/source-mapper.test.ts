@@ -77,6 +77,23 @@ describe('source mapper', () => {
 		expect(glass.timing).toEqual({ mode: 'full', startCycle: 0, endCycle: 4 });
 	});
 
+	test('updates the outer range of a multi-part seqPLoop', () => {
+		const source = `// @sushi-track {"id":"trk_multirange","name":"Layer","type":"synth","schema":1}\n$: seqPLoop([0, 2, s("bd")], [3, 5, s("cp")])`;
+		const updated = updateTrackRange(source, 'trk_multirange', 1, 4);
+		const [layer] = getSourceBlockDetails(updated);
+
+		expect(updated).toContain('seqPLoop([1, 2, s("bd")], [3, 4, s("cp")])');
+		expect(layer.timing).toEqual({ mode: 'seqPLoop', startCycle: 1, endCycle: 4 });
+	});
+
+	test('keeps semicolon-terminated expressions valid when adding a range', () => {
+		const source = `// @sushi-track {"id":"trk_semicolon","name":"Pulse","type":"synth","schema":1}\n$: s("bd");`;
+		const updated = updateTrackRange(source, 'trk_semicolon', 1, 3);
+
+		expect(updated).toContain('seqPLoop([1, 3, s("bd")]);');
+		expect(() => new Function(updated.replace(/^\/\/.*\n/, ''))).not.toThrow();
+	});
+
 	test('projects arrange durations as a source timing span', () => {
 		const arrangeSource = DEFAULT_SOURCE.replace(
 			'note("<e2 e2 g2 b2>").s("sawtooth").gain(0.24)',

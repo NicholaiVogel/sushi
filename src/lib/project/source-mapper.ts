@@ -293,19 +293,28 @@ export function updateTrackRange(source: string, trackId: string, startCycle: nu
 	const start = Number.isFinite(startCycle) ? Math.max(0, startCycle) : 0;
 	const end = Number.isFinite(endCycle) ? Math.max(start + 0.25, endCycle) : start + 0.25;
 	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
-		const rangePattern = new RegExp(`(seqPLoop\\(\\s*\\[\\s*)${numericLiteral}(\\s*,\\s*)${numericLiteral}`);
-		if (rangePattern.test(expression)) {
+		const rangePattern = new RegExp(`(seqPLoop\\s*\\(\\s*|\\]\\s*,\\s*)\\[\\s*(${numericLiteral})(\\s*,\\s*)(${numericLiteral})`, 'g');
+		const ranges = Array.from(expression.matchAll(rangePattern));
+		if (ranges.length) {
+			let rangeIndex = 0;
 			return {
 				label,
-				expression: expression.replace(rangePattern, `$1${formatNumber(start)}$2${formatNumber(end)}`),
+				expression: expression.replace(rangePattern, (match, prefix: string, oldStart: string, separator: string, oldEnd: string) => {
+					const nextStart = rangeIndex === 0 ? formatNumber(start) : oldStart;
+					const nextEnd = rangeIndex === ranges.length - 1 ? formatNumber(end) : oldEnd;
+					rangeIndex += 1;
+					return `${prefix}[${nextStart}${separator}${nextEnd}`;
+				}),
 			};
 		}
 
 		const trailingWhitespace = expression.match(/\s*$/)?.[0] ?? '';
 		const expressionBody = trailingWhitespace ? expression.slice(0, -trailingWhitespace.length) : expression;
+		const semicolon = expressionBody.endsWith(';') ? ';' : '';
+		const body = semicolon ? expressionBody.slice(0, -1) : expressionBody;
 		return {
 			label,
-			expression: `seqPLoop([${formatNumber(start)}, ${formatNumber(end)}, ${expressionBody}])${trailingWhitespace}`,
+			expression: `seqPLoop([${formatNumber(start)}, ${formatNumber(end)}, ${body}])${semicolon}${trailingWhitespace}`,
 		};
 	});
 }

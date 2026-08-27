@@ -85,4 +85,57 @@ describe('StrudelAdapter evaluation queue', () => {
 			}
 		}
 	});
+
+	test('stages a playing evaluation until the next cycle boundary', async () => {
+		let now = 0.5;
+		let starts = 0;
+		const evaluations: string[] = [];
+		let onToggle: ((started: boolean) => void) | undefined;
+		const scheduler = {
+			now: () => now,
+			cps: 10,
+			stop: () => undefined,
+			lastEnd: 0,
+			lastBegin: 0,
+		};
+		const fakeModule = {
+			initStrudel: async (options?: { onToggle?: (started: boolean) => void }) => {
+				onToggle = options?.onToggle;
+				return {
+					evaluate: async (code: string) => {
+						evaluations.push(code);
+						if (code === 'next') now = 1;
+						return {};
+					},
+					start: async () => { starts += 1; onToggle?.(true); },
+					stop: () => onToggle?.(false),
+					pause: () => onToggle?.(false),
+					scheduler,
+				};
+			},
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			await adapter.evaluateSource('initial');
+			await adapter.play(4);
+			const pending = adapter.evaluateSource('next', { restoreSource: 'initial' });
+			await new Promise((resolve) => setTimeout(resolve, 5));
+
+			expect(evaluations).toEqual(['initial']);
+			expect(await pending).toEqual({ ok: true });
+			expect(evaluations).toEqual(['initial', 'next']);
+			expect(starts).toBe(2);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
 });

@@ -21,6 +21,7 @@ interface StrudelRepl {
 
 interface StrudelScheduler {
 	now(): number;
+	cps?: number;
 	setCycle?: (cycle: number) => void;
 	stop?: () => void;
 	lastEnd?: number;
@@ -131,9 +132,22 @@ export class StrudelAdapter {
 		options: { autoplay?: boolean; restoreSource?: string },
 	): Promise<AdapterResult> {
 		await this.init();
+		const wasPlaying = this.runtime.transport === 'playing';
+		const wasPaused = this.runtime.transport === 'paused';
+		const pausedCycle = this.runtime.currentCycle ?? 0;
+		const boundaryCycle = wasPlaying ? await this.waitForNextCycleBoundary() : pausedCycle;
 		const result = await this.evaluateRaw(source, options.autoplay ?? false);
 		if (!result.ok && options.restoreSource && options.restoreSource !== source) {
 			await this.evaluateRaw(options.restoreSource, false);
+		}
+		if (wasPlaying || wasPaused) {
+			this.setSchedulerCycle(wasPlaying ? boundaryCycle : pausedCycle);
+			if (wasPlaying) {
+				await this.repl?.start();
+				this.startCycleTimer();
+			} else {
+				this.setRuntime({ transport: 'paused', currentCycle: pausedCycle });
+			}
 		}
 		return result;
 	}
@@ -312,6 +326,41 @@ export class StrudelAdapter {
 	private readCurrentCycle(): number {
 		const cycle = this.repl?.scheduler?.now?.();
 		return typeof cycle === 'number' && Number.isFinite(cycle) ? Math.max(0, cycle) : this.runtime.currentCycle ?? 0;
+	}
+
+	private async waitForNextCycleBoundary(): Promise<number> {
+		const scheduler = this.repl?.scheduler;
+		const currentCycle = this.readCurrentCycle();
+		const nextCycle = Math.floor(currentCycle) + 1;
+		const cps = scheduler?.cps;
+		if (typeof cps === 'number' && Number.isFinite(cps) && cps > 0 && nextCycle > currentCycle) {
+			await new Promise<void>((resolve) => setTimeout(resolve, ((nextCycle - currentCycle) / cps) * 1000));
+		}
+		return nextCycle;
+	}
+
+	private setSchedulerCycle(
+		targetCycle: number,
+		scheduler = this.repl?.scheduler,
+	): void {
+		if (!scheduler) {
+			throw new Error('Strudel did not return a scheduler.');
+		}
+		if (typeof scheduler.setCycle === 'function') {
+			scheduler.setCycle(targetCycle);
+			return;
+		}
+		if (typeof scheduler.stop === 'function' && 'lastEnd' in scheduler) {
+			// Cyclist (the default @strudel/web scheduler) keeps its current
+			// cycle in lastEnd but does not expose setCycle publicly. Resetting
+			// that scheduler cursor preserves Strudel's own event scheduling and
+			// lets the next start begin at the requested cycle.
+			scheduler.stop();
+			scheduler.lastEnd = targetCycle;
+			scheduler.lastBegin = targetCycle;
+			return;
+		}
+		throw new Error('This Strudel scheduler does not support cycle seeking.');
 	}
 
 	private startCycleTimer(): void {
