@@ -754,7 +754,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 		createTool({
 			name: 'extend_timeline',
 			title: 'Extend timeline',
-			description: 'Extend the editable timeline from the default 30 bars to the 137-bar maximum. This changes project timeline metadata without changing source text.',
+			description: 'Advance the editable timeline by the next 30-bar page, capped at the 137-bar maximum. This changes project timeline metadata without changing source text.',
 			inputSchema: schema({
 				baseRevision: { type: 'integer', minimum: 0 },
 				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },

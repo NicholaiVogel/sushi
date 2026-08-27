@@ -3,7 +3,6 @@ import {
 	createInitialProject,
 	DEFAULT_SONG_END_CYCLE,
 	diagnosticFromError,
-	EXTENDED_SONG_END_CYCLE,
 	getSourceBlocks,
 	getSourceIdentityDiagnostics,
 	type AssetManifestEntry,
@@ -30,6 +29,7 @@ import { getSourceLineNumbers } from '../lib/project/editor';
 import {
 	clampTimelineZoom,
 	DEFAULT_TIMELINE_ZOOM,
+	getTimelineCapacityForEndCycle,
 	getTimelineCells,
 	MAX_TIMELINE_ZOOM,
 	MIN_TIMELINE_ZOOM,
@@ -121,6 +121,8 @@ interface TimingDrag {
 	pointerStartCycle: number;
 	startCycle: number;
 	endCycle: number;
+	pointerCycle: number;
+	lastPointerClientX: number;
 }
 
 function createInitialStudioState(): StudioState {
@@ -234,11 +236,10 @@ function normalizeTrackRange(startCycle: number, endCycle: number, songEndCycle:
 	return { startCycle: Number(start.toFixed(2)), endCycle: Number(end.toFixed(2)) };
 }
 
-function shiftTrackRange(startCycle: number, endCycle: number, delta: number, songEndCycle: number): { startCycle: number; endCycle: number } {
+function shiftTrackRange(startCycle: number, endCycle: number, delta: number): { startCycle: number; endCycle: number } {
 	const length = Math.max(TIMELINE_SNAP_CYCLE, endCycle - startCycle);
-	const maxStart = Math.max(0, songEndCycle - length);
-	const nextStart = clamp(snapCycle(startCycle + delta), 0, maxStart);
-	return normalizeTrackRange(nextStart, nextStart + length, songEndCycle);
+	const nextStart = Math.max(0, snapCycle(startCycle + delta));
+	return { startCycle: nextStart, endCycle: nextStart + length };
 }
 
 function formatClock(seconds: number): string {
@@ -270,7 +271,7 @@ function normalizeImportedSnapshot(snapshot: StoredProjectSnapshot): StoredProje
 	const configuredEndCycle = typeof importedEndCycle === 'number' && Number.isFinite(importedEndCycle) && importedEndCycle > 0
 		? importedEndCycle
 		: DEFAULT_SONG_END_CYCLE;
-	const songEndCycle = Math.max(configuredEndCycle, getExplicitSourceEndCycle(imported.source.lastValid));
+	const songEndCycle = getTimelineCapacityForEndCycle(Math.max(configuredEndCycle, getExplicitSourceEndCycle(imported.source.lastValid)));
 	return {
 		project: {
 			...project,
@@ -313,10 +314,6 @@ type TrackDetails = ReturnType<typeof getSourceBlockDetails>[number];
 function getTrackTimingForTimeline(track: TrackDetails | undefined, songEndCycle: number): TrackDetails['timing'] {
 	if (track?.timing.mode !== 'full') return track?.timing ?? { mode: 'full', startCycle: 0, endCycle: Math.min(DEFAULT_TRACK_END_CYCLE, songEndCycle) };
 	return { ...track.timing, endCycle: Math.min(DEFAULT_TRACK_END_CYCLE, songEndCycle) };
-}
-
-function sourceUsesExtendedTimeline(source: string): boolean {
-	return getSourceBlockDetails(source).some((track) => track.timing.endCycle > DEFAULT_SONG_END_CYCLE);
 }
 
 type TrackTargetResolution =
@@ -532,9 +529,7 @@ export default function Studio() {
 				legacyTimeline && storedEndCycle === 4 ? DEFAULT_SONG_END_CYCLE : configuredEndCycle,
 				getExplicitSourceEndCycle(project.source.lastValid),
 			);
-			const songEndCycle = sourceUsesExtendedTimeline(project.source.lastValid)
-				? EXTENDED_SONG_END_CYCLE
-				: Math.min(EXTENDED_SONG_END_CYCLE, Math.max(normalizedEndCycle, DEFAULT_SONG_END_CYCLE));
+			const songEndCycle = getTimelineCapacityForEndCycle(normalizedEndCycle);
 			sourceHistoryRef.current = {
 				cursorSource: project.source.draft,
 				undo: [],
@@ -732,9 +727,7 @@ export default function Studio() {
 				if (!mountedRef.current || studioGenerationRef.current !== operationGeneration) return { ok: false, changed: false, previousSource, source, revision };
 				if (result.ok) {
 					const explicitEndCycle = getExplicitSourceEndCycle(source);
-					const nextSongEndCycle = sourceUsesExtendedTimeline(source)
-						? EXTENDED_SONG_END_CYCLE
-						: Math.max(studioRef.current.songEndCycle, explicitEndCycle);
+					const nextSongEndCycle = getTimelineCapacityForEndCycle(Math.max(studioRef.current.songEndCycle, explicitEndCycle));
 					adapter.setSongEndCycle(nextSongEndCycle);
 					patchStudio({
 						lastValid: source,
@@ -840,23 +833,43 @@ export default function Studio() {
 	);
 
 	const extendTimeline = useCallback(() => {
-		if (studioRef.current.songEndCycle >= EXTENDED_SONG_END_CYCLE) return;
-		patchStudio({ songEndCycle: EXTENDED_SONG_END_CYCLE });
-	}, [patchStudio]);
+		const currentSongEndCycle = studioRef.current.songEndCycle;
+		const nextSongEndCycle = getTimelineCapacityForEndCycle(currentSongEndCycle + TIMELINE_SNAP_CYCLE);
+		if (nextSongEndCycle <= currentSongEndCycle) return;
+		adapterRef.current?.setSongEndCycle(nextSongEndCycle);
+		patchStudio({ songEndCycle: nextSongEndCycle });
+		void persistStudioSnapshot();
+	}, [patchStudio, persistStudioSnapshot]);
 
 	const setTrackRange = useCallback(
 		(trackId: string, startCycle: number, endCycle: number) => {
-			const range = normalizeTrackRange(startCycle, endCycle, studioRef.current.songEndCycle);
+			const current = studioRef.current;
+			const requestedEndCycle = Math.max(
+				Number.isFinite(startCycle) ? startCycle : 0,
+				Number.isFinite(endCycle) ? endCycle : 0,
+			);
+			const nextSongEndCycle = requestedEndCycle > current.songEndCycle
+				? getTimelineCapacityForEndCycle(requestedEndCycle)
+				: current.songEndCycle;
+			if (nextSongEndCycle > current.songEndCycle) {
+				adapterRef.current?.setSongEndCycle(nextSongEndCycle);
+				patchStudio({ songEndCycle: nextSongEndCycle });
+				void persistStudioSnapshot();
+			}
+			const range = normalizeTrackRange(startCycle, endCycle, nextSongEndCycle);
 			updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, range.startCycle, range.endCycle, getSourceCycleStep(source)));
 		},
-		[updateTrackSource],
+		[patchStudio, persistStudioSnapshot, updateTrackSource],
 	);
 
 	const setSongEndCycle = useCallback((value: number) => {
 		if (!Number.isFinite(value) || value <= 0) return;
 		const cycleStep = getSourceCycleStep(studioRef.current.lastValid);
 		const requestedEndCycle = Math.max(cycleStep, Math.round(value / cycleStep) * cycleStep);
-		const nextSongEndCycle = Math.max(requestedEndCycle, getExplicitSourceEndCycle(studioRef.current.lastValid));
+		const currentSongEndCycle = studioRef.current.songEndCycle;
+		const nextSongEndCycle = requestedEndCycle > currentSongEndCycle
+			? getTimelineCapacityForEndCycle(requestedEndCycle)
+			: Math.max(requestedEndCycle, getExplicitSourceEndCycle(studioRef.current.lastValid));
 		adapterRef.current?.setSongEndCycle(nextSongEndCycle);
 		patchStudio({
 			songEndCycle: nextSongEndCycle,
@@ -928,7 +941,13 @@ export default function Studio() {
 		async (trackId: string, startCycle: number, endCycle: number): Promise<CommitSourceResult> => {
 			cancelPendingTrackCommit();
 			const current = studioRef.current;
-			const timelineEndCycle = endCycle > current.songEndCycle ? EXTENDED_SONG_END_CYCLE : current.songEndCycle;
+			const requestedEndCycle = Math.max(
+				Number.isFinite(startCycle) ? startCycle : 0,
+				Number.isFinite(endCycle) ? endCycle : 0,
+			);
+			const timelineEndCycle = requestedEndCycle > current.songEndCycle
+				? getTimelineCapacityForEndCycle(requestedEndCycle)
+				: current.songEndCycle;
 			const range = normalizeTrackRange(startCycle, endCycle, timelineEndCycle);
 			const source = sourceForTrackMutation(current);
 			const nextSource = updateSourceTrackRange(source, trackId, range.startCycle, range.endCycle);
@@ -996,21 +1015,26 @@ export default function Studio() {
 			const rect = drag.lane.getBoundingClientRect();
 			if (!rect.width) return;
 			const songEndCycle = studioRef.current.songEndCycle;
-			const nextCycle = clamp(snapCycle(((event.clientX - rect.left) / rect.width) * songEndCycle), 0, songEndCycle);
+			// Accumulate pointer movement instead of remapping the absolute
+			// pointer position on every event. The timeline can grow while the
+			// pointer is outside its old boundary, which changes the grid scale;
+			// accumulating keeps the drag target stable across that reflow.
+			drag.pointerCycle = Math.max(0, drag.pointerCycle + ((event.clientX - drag.lastPointerClientX) / rect.width) * songEndCycle);
+			drag.lastPointerClientX = event.clientX;
+			const nextCycle = Math.max(0, snapCycle(drag.pointerCycle));
 
 			if (drag.edge === 'move') {
 				const delta = nextCycle - drag.pointerStartCycle;
-				const range = shiftTrackRange(drag.startCycle, drag.endCycle, delta, songEndCycle);
+				const range = shiftTrackRange(drag.startCycle, drag.endCycle, delta);
 				setTrackRange(drag.trackId, range.startCycle, range.endCycle);
 				return;
 			}
 
 			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === drag.trackId);
 			if (!details) return;
-			const timing = getTrackTimingForTimeline(details, studioRef.current.songEndCycle);
-			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, timing.endCycle - TIMELINE_SNAP_CYCLE) : timing.startCycle;
-			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, timing.startCycle + TIMELINE_SNAP_CYCLE) : timing.endCycle;
-			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.min(studioRef.current.songEndCycle, endCycle));
+			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, drag.endCycle - TIMELINE_SNAP_CYCLE) : drag.startCycle;
+			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, drag.startCycle + TIMELINE_SNAP_CYCLE) : drag.endCycle;
+			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.max(0, endCycle));
 		},
 		[setTrackRange],
 	);
@@ -1032,16 +1056,18 @@ export default function Studio() {
 			event.preventDefault();
 			event.stopPropagation();
 			const rect = lane.getBoundingClientRect();
-			const pointerStartCycle = rect.width
-				? clamp(snapCycle(((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle), 0, studioRef.current.songEndCycle)
+			const pointerCycle = rect.width
+				? Math.max(0, ((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle)
 				: timing.startCycle;
 			timingDragRef.current = {
 				trackId,
 				edge,
 				lane,
-				pointerStartCycle,
+				pointerStartCycle: snapCycle(pointerCycle),
 				startCycle: timing.startCycle,
 				endCycle: timing.endCycle,
+				pointerCycle,
+				lastPointerClientX: event.clientX,
 			};
 			window.addEventListener('pointermove', handleTimingPointerMove);
 			window.addEventListener('pointerup', stopTimingDrag);
@@ -1628,7 +1654,12 @@ export default function Studio() {
 				};
 			}
 
-			if (current.songEndCycle < EXTENDED_SONG_END_CYCLE) patchStudio({ songEndCycle: EXTENDED_SONG_END_CYCLE });
+			const nextSongEndCycle = getTimelineCapacityForEndCycle(current.songEndCycle + TIMELINE_SNAP_CYCLE);
+			if (nextSongEndCycle > current.songEndCycle) {
+				adapterRef.current?.setSongEndCycle(nextSongEndCycle);
+				patchStudio({ songEndCycle: nextSongEndCycle });
+				void persistStudioSnapshot();
+			}
 			const state = getWebMcpState();
 			return rememberMutation(makeMutationResult(
 				state,
@@ -1637,12 +1668,12 @@ export default function Studio() {
 				current.draft,
 				input.baseRevision,
 				true,
-				`Timeline is available through bar ${EXTENDED_SONG_END_CYCLE}.`,
+				`Timeline is available through bar ${state.timeline.songEndCycle}.`,
 				undefined,
 				['timeline'],
 			));
 		},
-		[getWebMcpState, patchStudio, rememberMutation],
+		[getWebMcpState, patchStudio, persistStudioSnapshot, rememberMutation],
 	);
 
 	const trackMutationForWebMcp = useCallback(
@@ -2049,7 +2080,9 @@ export default function Studio() {
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
 	const timelineCellCount = Math.max(1, Math.ceil(studio.songEndCycle / TIMELINE_SNAP_CYCLE));
 	const timelineSongCycles = Math.max(TIMELINE_SNAP_CYCLE, studio.songEndCycle);
-	const zoomOutCycles = Math.max(1, Math.min(timelineSongCycles, DEFAULT_SONG_END_CYCLE));
+	const zoomOutCycles = timelineSongCycles;
+	const nextTimelineEndCycle = getTimelineCapacityForEndCycle(studio.songEndCycle + TIMELINE_SNAP_CYCLE);
+	const timelineExtensionCycles = Math.max(0, nextTimelineEndCycle - studio.songEndCycle);
 	const timelineVisibleCycles = zoomOutCycles - (zoomOutCycles - 1) * (timelineZoom / 100);
 	const timelineAvailableWidth = Math.max(560, (timelineViewportWidth || 960) - TIMELINE_LABEL_MIN_WIDTH);
 	const timelineGridWidth = Math.max(560, timelineAvailableWidth * timelineSongCycles / timelineVisibleCycles * arrangementZoom);
@@ -2204,7 +2237,7 @@ export default function Studio() {
 							<div className="timeline-heading-cell">
 								<div className="arrangement-toolbar">
 									<button className="add-track-button" type="button" onClick={() => void addTrack()} disabled={isBusy} aria-label="Add track"><span aria-hidden="true">＋</span> Add track</button>
-									{studio.songEndCycle < EXTENDED_SONG_END_CYCLE ? <button className="extend-timeline-button" type="button" onClick={extendTimeline} disabled={isBusy} aria-label="Extend timeline to 137 bars" title="Extend the timeline to 137 bars">EXTEND 137</button> : null}
+									{timelineExtensionCycles > 0 ? <button className="extend-timeline-button" type="button" onClick={extendTimeline} disabled={isBusy} aria-label={`Extend timeline by ${formatCycle(timelineExtensionCycles)} bars`} title={`Extend the timeline by ${formatCycle(timelineExtensionCycles)} bars`}>EXTEND +{formatCycle(timelineExtensionCycles)}</button> : null}
 									<div className="timeline-zoom-controls" role="group" aria-label="Arrangement zoom">
 										<button className="timeline-zoom-button" type="button" onClick={() => adjustArrangementZoom(-TIMELINE_ZOOM_STEP)} disabled={arrangementZoom <= MIN_TIMELINE_ZOOM} aria-label="Zoom out arrangement" title="Zoom out arrangement">−</button>
 										<output className="timeline-zoom-value" aria-live="polite">{Math.round(arrangementZoom * 100)}%</output>
@@ -2320,7 +2353,7 @@ export default function Studio() {
 												if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
 												event.preventDefault();
 												const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE;
-												const range = shiftTrackRange(timing.startCycle, timing.endCycle, delta, studioRef.current.songEndCycle);
+												const range = shiftTrackRange(timing.startCycle, timing.endCycle, delta);
 												setTrackRange(block.id, range.startCycle, range.endCycle);
 											}}
 											role="button"
@@ -2330,7 +2363,7 @@ export default function Studio() {
 										>
 											<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - TIMELINE_SNAP_CYCLE), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
 											<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
-											<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + TIMELINE_SNAP_CYCLE, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
+											<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; setTrackRange(block.id, timing.startCycle, Math.max(timing.startCycle + TIMELINE_SNAP_CYCLE, timing.endCycle + delta)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
 										</div>
 										<span className={`lane-playhead ${studio.runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
 									</div>

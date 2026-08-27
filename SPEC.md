@@ -458,7 +458,7 @@ Source tools operate on the source document itself:
 - `write_strudel_source` replaces the draft source and validates it atomically.
 - `patch_strudel_source` applies exact, revision-checked text edits and validates the result.
 - `set_tempo` writes a 0–300 BPM value as `setcpm(bpm / quarterNotesPerCycle)` and `set_key` updates the canonical `const key` declaration; both validate through Strudel and return the shared source revision.
-- `extend_timeline` raises the project boundary from 30 to 137 bars without changing source text.
+- `extend_timeline` advances the project boundary by the next 30-bar page (capped at 137) without changing source text.
 - `inspect_strudel_state` returns source, parsed source blocks, recognized controls, diagnostics, and runtime status.
 - `validate_strudel_source` checks candidate source and returns diagnostics.
 - `control_playback` starts, pauses, or stops the derived Strudel runtime.
@@ -470,7 +470,7 @@ Track creation, removal, patterns, transpose, effects, mixer values, tempo, key,
 
 The tool registry should grow from real interaction needs rather than expose the entire command dispatcher automatically.
 
-The timeline starts with a 30-bar capacity and new tracks default to a four-bar range. The user or agent can extend the project boundary to 137 bars, and an explicit source range beyond bar 30 promotes the boundary automatically. Its zoom is view-only: the mountain/left end shows all available bars, the magnifier/right end shows one bar, and it opens at the midpoint.
+The timeline starts with a 30-bar capacity and new tracks default to a four-bar range. Dragging or lengthening a track beyond the current boundary adds the next 30-bar page (60, 90, 120, then 137); the user or agent can also advance the boundary with `extend_timeline`. Its zoom is view-only: the mountain/left end shows all available bars, the magnifier/right end shows one bar, and it opens at the midpoint.
 
 ## Musical model
 
