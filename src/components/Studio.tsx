@@ -15,6 +15,7 @@ import {
 	updateTrackPan,
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
+import { getSourceLineNumbers } from '../lib/project/editor';
 import { highlightStrudel } from '../lib/project/syntax-highlight';
 import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
 import { StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
@@ -147,10 +148,6 @@ const TRACK_COLORS = ['#d9ff68', '#8fe1ff', '#f0a3c7', '#c7a6ff'];
 const SOURCE_HISTORY_LIMIT = 100;
 const EDITOR_WIDTH_MIN = 280;
 const EDITOR_WIDTH_MAX = 560;
-
-function getLineNumbers(source: string): number[] {
-	return Array.from({ length: Math.max(1, source.split('\n').length) }, (_, index) => index + 1);
-}
 
 function getTrackColor(index: number): string {
 	return TRACK_COLORS[index % TRACK_COLORS.length];
@@ -991,7 +988,7 @@ export default function Studio() {
 	const isDirty = studio.draft !== studio.lastValid;
 	const isBusy = studio.phase === 'booting' || studio.phase === 'validating';
 	const canPlay = !isBusy && studio.runtime.audioState !== 'initializing';
-	const draftLines = useMemo(() => getLineNumbers(studio.draft), [studio.draft]);
+	const draftLines = useMemo(() => getSourceLineNumbers(studio.draft), [studio.draft]);
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
