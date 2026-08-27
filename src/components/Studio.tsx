@@ -31,6 +31,7 @@ import {
 	DEFAULT_TIMELINE_ZOOM,
 	getTimelineCapacityForEndCycle,
 	getTimelineCells,
+	getTimelineZoomForVisibleCycles,
 	MAX_TIMELINE_ZOOM,
 	MIN_TIMELINE_ZOOM,
 	TIMELINE_ZOOM_STEP,
@@ -392,7 +393,7 @@ export default function Studio() {
 	const [contextMenu, setContextMenu] = useState<{ trackId: string; x: number; y: number } | null>(null);
 	const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
 	const [renamingTrackValue, setRenamingTrackValue] = useState('');
-	const [timelineZoom, setTimelineZoom] = useState(50);
+	const [timelineZoom, setTimelineZoom] = useState(0);
 	const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
@@ -530,6 +531,7 @@ export default function Studio() {
 				getExplicitSourceEndCycle(project.source.lastValid),
 			);
 			const songEndCycle = getTimelineCapacityForEndCycle(normalizedEndCycle);
+			setTimelineZoom(getTimelineZoomForVisibleCycles(songEndCycle));
 			sourceHistoryRef.current = {
 				cursorSource: project.source.draft,
 				undo: [],
@@ -2084,6 +2086,7 @@ export default function Studio() {
 	const nextTimelineEndCycle = getTimelineCapacityForEndCycle(studio.songEndCycle + TIMELINE_SNAP_CYCLE);
 	const timelineExtensionCycles = Math.max(0, nextTimelineEndCycle - studio.songEndCycle);
 	const timelineVisibleCycles = zoomOutCycles - (zoomOutCycles - 1) * (timelineZoom / 100);
+	const timelineShowsQuarterBars = timelineVisibleCycles <= DEFAULT_SONG_END_CYCLE;
 	const timelineAvailableWidth = Math.max(560, (timelineViewportWidth || 960) - TIMELINE_LABEL_MIN_WIDTH);
 	const timelineGridWidth = Math.max(560, timelineAvailableWidth * timelineSongCycles / timelineVisibleCycles * arrangementZoom);
 	const timelineBarLabelStride = timelineLabelStride(timelineGridWidth / timelineSongCycles);
@@ -2232,7 +2235,7 @@ export default function Studio() {
 			</div>
 
 				<main className="daw-canvas" aria-label="Sushi workstation">
-					<section className="timeline-shell" ref={(element) => { timelineViewportRef.current = element; timelineShellRef.current = element; }} aria-labelledby="timeline-heading">
+					<section className={`timeline-shell ${timelineShowsQuarterBars ? '' : 'timeline-bars-only'}`} ref={(element) => { timelineViewportRef.current = element; timelineShellRef.current = element; }} aria-labelledby="timeline-heading">
 						<div className="timeline-head" style={timelineGridStyle}>
 							<div className="timeline-heading-cell">
 								<div className="arrangement-toolbar">

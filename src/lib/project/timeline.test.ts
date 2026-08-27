@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { clampTimelineZoom, getTimelineCapacityForEndCycle, getTimelineCellWidth, getTimelineCells } from './timeline';
+import { clampTimelineZoom, getTimelineCapacityForEndCycle, getTimelineCellWidth, getTimelineCells, getTimelineZoomForVisibleCycles } from './timeline';
 
 describe('arrangement timeline cells', () => {
 	test('expands the ruler beyond the default four cycles', () => {
@@ -28,6 +28,11 @@ describe('arrangement timeline cells', () => {
 		expect(getTimelineCapacityForEndCycle(60.25)).toBe(90);
 		expect(getTimelineCapacityForEndCycle(120.25)).toBe(137);
 		expect(getTimelineCapacityForEndCycle(200)).toBe(137);
+	});
+
+	test('opens loaded timelines at about 30 visible bars', () => {
+		expect(getTimelineZoomForVisibleCycles(30)).toBe(0);
+		expect(Math.round(137 - (137 - 1) * (getTimelineZoomForVisibleCycles(137) / 100))).toBe(30);
 	});
 
 	test('clamps arrangement zoom to usable quarter-note widths', () => {

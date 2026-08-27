@@ -935,6 +935,11 @@ a { color: inherit; }
 
 .lane-grid-lines .beat-start { border-left-color: var(--line); }
 
+/* At overview scales, keep bar boundaries readable without quarter-note noise. */
+.timeline-bars-only .timeline-ruler span:not(.bar-number) { border-left-color: transparent; }
+.timeline-bars-only .timeline-ruler span:not(.bar-number)::after { display: none; }
+.timeline-bars-only .lane-grid-lines span:not(.beat-start) { border-left-color: transparent; }
+
 .pattern-region {
 	position: absolute;
 	top: 4px;

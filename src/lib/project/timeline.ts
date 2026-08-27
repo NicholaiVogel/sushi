@@ -25,6 +25,16 @@ export function getTimelineCapacityForEndCycle(requiredEndCycle: number): number
 	return Math.min(EXTENDED_SONG_END_CYCLE, Math.ceil(safeEndCycle / DEFAULT_SONG_END_CYCLE) * DEFAULT_SONG_END_CYCLE);
 }
 
+/** Choose the slider position that opens a loaded timeline around the target number of visible bars. */
+export function getTimelineZoomForVisibleCycles(timelineEndCycle: number, targetVisibleCycles = DEFAULT_SONG_END_CYCLE): number {
+	const safeEndCycle = Number.isFinite(timelineEndCycle) && timelineEndCycle > 0 ? timelineEndCycle : DEFAULT_SONG_END_CYCLE;
+	const safeTarget = Number.isFinite(targetVisibleCycles) && targetVisibleCycles > 0
+		? Math.min(safeEndCycle, targetVisibleCycles)
+		: Math.min(safeEndCycle, DEFAULT_SONG_END_CYCLE);
+	if (safeEndCycle <= 1) return 0;
+	return Math.max(0, Math.min(100, Math.round(((safeEndCycle - safeTarget) / (safeEndCycle - 1)) * 100)));
+}
+
 export function clampTimelineZoom(value: number): number {
 	const safeValue = Number.isFinite(value) ? value : DEFAULT_TIMELINE_ZOOM;
 	const clamped = Math.max(MIN_TIMELINE_ZOOM, Math.min(MAX_TIMELINE_ZOOM, safeValue));
