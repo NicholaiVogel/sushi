@@ -22,6 +22,18 @@ describe('source mapper', () => {
 		expect(withPan).toContain('$: note("<e4 b3 g4 a4>").s("triangle").gain(0.16)');
 	});
 
+	test('projects and updates controls across a multiline chain', () => {
+		const source = `// @sushi-track {"id":"trk_multiline","name":"Lead","type":"synth","schema":1}\n$: n("<0 2 4>")\n  .s("sawtooth")\n  .gain(.5)\n  .room(.7)\n\n// @sushi-track {"id":"trk_other","name":"Other","type":"synth","schema":1}\n$: s("bd")`;
+		const [lead] = getSourceBlockDetails(source);
+		const updated = updateTrackGain(source, 'trk_multiline', 0.8);
+
+		expect(lead.gain).toBe(0.5);
+		expect(lead.gainEditable).toBe(true);
+		expect(updated).toContain('  .gain(0.8)');
+		expect(updated.match(/\.gain\(/g)?.length).toBe(1);
+		expect(updated).toContain('  .room(.7)\n\n// @sushi-track');
+	});
+
 	test('uses Strudel labels for mute and solo', () => {
 		const soloed = updateTrackMode(DEFAULT_SOURCE, pulseId, 'solo', true);
 		const unmuted = updateTrackMode(soloed, pulseId, 'solo', false);

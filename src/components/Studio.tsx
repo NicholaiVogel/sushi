@@ -80,9 +80,15 @@ function formatRevision(revision: number | null): string {
 	return revision === null ? '—' : `r${revision.toString().padStart(3, '0')}`;
 }
 
-function getErrorDiagnostic(revision: number, error: unknown, phase: SourceDiagnostic['phase']) {
-	const diagnostic = diagnosticFromError(revision, error);
+function getErrorDiagnostic(revision: number, error: unknown, phase: SourceDiagnostic['phase'], source: string) {
+	const diagnostic = diagnosticFromError(revision, error, source);
 	return { ...diagnostic, phase };
+}
+
+function getDiagnosticLocation(diagnostic: SourceDiagnostic): string {
+	if (!diagnostic.range) return '';
+	const column = diagnostic.range.column === undefined ? '' : `:${diagnostic.range.column}`;
+	return `LINE ${diagnostic.range.line}${column} · REV ${formatRevision(diagnostic.revision)}`;
 }
 
 const BEAT_LABELS = ['1', '1.1', '1.2', '1.3', '2', '2.1', '2.2', '2.3', '3', '3.1', '3.2', '3.3', '4', '4.1', '4.2', '4.3'];
@@ -157,7 +163,6 @@ export default function Studio() {
 				if (!mountedRef.current) return;
 				const initial = await adapter.evaluateSource(studioRef.current.lastValid, {
 					autoplay: false,
-					hushCurrent: false,
 				});
 				if (!mountedRef.current) return;
 
@@ -175,7 +180,7 @@ export default function Studio() {
 				} else {
 					patchStudio({
 						phase: 'error',
-						diagnostics: [diagnosticFromError(activeRevision, initial.error)],
+						diagnostics: [diagnosticFromError(activeRevision, initial.error, studioRef.current.lastValid)],
 						runtime: {
 							...studioRef.current.runtime,
 							audioState: 'error',
@@ -187,7 +192,7 @@ export default function Studio() {
 				if (!mountedRef.current) return;
 				patchStudio({
 					phase: 'error',
-					diagnostics: [getErrorDiagnostic(activeRevision, error, 'audio')],
+					diagnostics: [getErrorDiagnostic(activeRevision, error, 'audio', studioRef.current.lastValid)],
 					runtime: { ...studioRef.current.runtime, audioState: 'error', activeRevision: null },
 				});
 			}
@@ -224,7 +229,10 @@ export default function Studio() {
 			const baseRevision = studioRef.current.revision;
 			const revision = baseRevision + 1;
 			patchStudio({ draft: source, revision, phase: 'validating', diagnostics: [] });
-			const result = await adapter.evaluateSource(source, { autoplay: false, hushCurrent: false });
+			const result = await adapter.evaluateSource(source, {
+				autoplay: false,
+				restoreSource: studioRef.current.lastValid,
+			});
 
 			if (!mountedRef.current || studioRef.current.revision !== revision) return false;
 			if (result.ok) {
@@ -240,7 +248,7 @@ export default function Studio() {
 
 			patchStudio({
 				phase: 'error',
-				diagnostics: [diagnosticFromError(revision, result.error)],
+				diagnostics: [diagnosticFromError(revision, result.error, source)],
 				runtime: { ...studioRef.current.runtime, activeRevision: studioRef.current.activeRevision },
 			});
 			return false;
@@ -344,7 +352,7 @@ export default function Studio() {
 				} else {
 					patchStudio({
 						phase: 'error',
-						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio')],
+						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
 						runtime: { ...studioRef.current.runtime, audioState: 'error', transport: 'stopped' },
 					});
 				}
@@ -360,7 +368,7 @@ export default function Studio() {
 			} else {
 				patchStudio({
 					phase: 'error',
-					diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio')],
+					diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
 					runtime: { ...studioRef.current.runtime, audioState: 'error', transport: 'stopped' },
 				});
 			}
@@ -444,7 +452,7 @@ export default function Studio() {
 						/>
 					</div>
 					<p className="editor-help" id="source-help">Cmd/Ctrl + Enter to validate <span aria-hidden="true">·</span> {draftBlocks.length} marked {draftBlocks.length === 1 ? 'block' : 'blocks'}</p>
-					{studio.diagnostics.length ? <div className="sidebar-diagnostic" role="status" aria-live="polite"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span className="sidebar-diagnostic-revision">REV {formatRevision(studio.diagnostics[0].revision)}</span></div> : null}
+					{studio.diagnostics.length ? <div className="sidebar-diagnostic" role="status" aria-live="polite"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span className="sidebar-diagnostic-revision">{getDiagnosticLocation(studio.diagnostics[0]) || `REV ${formatRevision(studio.diagnostics[0].revision)}`}</span></div> : null}
 			</aside>
 
 				<main className="daw-canvas" aria-label="Sushi workstation">
@@ -501,7 +509,7 @@ export default function Studio() {
 						<div className="timeline-fill" aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines">{BEAT_LABELS.map((_, cell) => <span className={cell % 4 === 0 ? 'beat-start' : ''} key={cell} />)}</div></div></div>
 					</section>
 
-					{studio.diagnostics.length ? <div className="canvas-diagnostic" role="status" aria-live="polite"><div className="diagnostic-meta"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span>REV {formatRevision(studio.diagnostics[0].revision)}</span></div><p>{studio.diagnostics[0].message}</p></div> : null}
+					{studio.diagnostics.length ? <div className="canvas-diagnostic" role="status" aria-live="polite"><div className="diagnostic-meta"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span>{getDiagnosticLocation(studio.diagnostics[0]) || `REV ${formatRevision(studio.diagnostics[0].revision)}`}</span></div><p>{studio.diagnostics[0].message}</p>{studio.diagnostics[0].context ? <code className="diagnostic-context">{studio.diagnostics[0].context}</code> : null}</div> : null}
 				</main>
 			</div>
 		</div>

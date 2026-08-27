@@ -6,6 +6,7 @@ export interface SourceRange {
 	start: number;
 	end: number;
 	line: number;
+	column?: number;
 }
 
 export interface SourceDiagnostic {
@@ -15,6 +16,7 @@ export interface SourceDiagnostic {
 	code: string;
 	message: string;
 	range?: SourceRange;
+	context?: string;
 	cause?: string;
 }
 
@@ -101,12 +103,58 @@ export function getSourceBlocks(source: string): SourceBlockSummary[] {
 	return blocks;
 }
 
-export function diagnosticFromError(revision: number, error: unknown): SourceDiagnostic {
+type ErrorRecord = Record<string, unknown>;
+
+function asRecord(value: unknown): ErrorRecord | undefined {
+	return typeof value === 'object' && value !== null ? value as ErrorRecord : undefined;
+}
+
+function readNumber(value: unknown): number | undefined {
+	return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function errorLocation(error: unknown, message: string): { line: number; column?: number } | undefined {
+	const record = asRecord(error);
+	const location = asRecord(record?.loc) ?? asRecord(record?.location);
+	const locationLine = readNumber(location?.line) ?? readNumber(record?.lineNumber);
+	const locationColumn = readNumber(location?.column);
+	if (locationLine !== undefined) {
+		return {
+			line: locationLine,
+			column: locationColumn === undefined
+				? readNumber(record?.columnNumber)
+				: locationColumn + 1,
+		};
+	}
+
+	const lineAndColumn = message.match(/(?:line\s+)(\d+)[^\d]+column\s+(\d+)/i)
+		?? message.match(/\((\d+):(\d+)\)/);
+	if (!lineAndColumn) return undefined;
+	return { line: Number(lineAndColumn[1]), column: Number(lineAndColumn[2]) + 1 };
+}
+
+function rangeFromLocation(source: string, location: { line: number; column?: number }): SourceRange | undefined {
+	const lines = source.split('\n');
+	const line = Math.max(1, Math.min(location.line, lines.length));
+	const lineStart = lines.slice(0, line - 1).reduce((offset, current) => offset + current.length + 1, 0);
+	const lineText = lines[line - 1] ?? '';
+	const column = location.column === undefined ? undefined : Math.max(1, location.column);
+	const end = column === undefined
+		? lineStart + lineText.length
+		: Math.min(lineStart + lineText.length, lineStart + column);
+	return { start: lineStart, end: Math.max(lineStart, end), line, column };
+}
+
+export function diagnosticFromError(revision: number, error: unknown, source = ''): SourceDiagnostic {
 	const message = error instanceof Error ? error.message : String(error);
 	const lowerMessage = message.toLowerCase();
-	const phase: SourceDiagnostic['phase'] = lowerMessage.includes('syntax') || lowerMessage.includes('parse')
+	const record = asRecord(error);
+	const phase: SourceDiagnostic['phase'] = error instanceof SyntaxError || record?.name === 'SyntaxError' || lowerMessage.includes('syntax') || lowerMessage.includes('parse')
 		? 'parse'
 		: 'evaluate';
+	const location = errorLocation(error, message);
+	const range = source && location ? rangeFromLocation(source, location) : undefined;
+	const context = range ? source.split('\n')[range.line - 1] : undefined;
 
 	return {
 		revision,
@@ -114,5 +162,7 @@ export function diagnosticFromError(revision: number, error: unknown): SourceDia
 		severity: 'error',
 		code: phase === 'parse' ? 'STR_PARSE_FAILED' : 'STR_EVALUATION_FAILED',
 		message: message || 'Strudel could not evaluate this source.',
+		range,
+		context,
 	};
 }

@@ -9,8 +9,10 @@ interface StrudelModule {
 	hush?: () => void;
 }
 
+type StrudelModuleLoader = () => Promise<StrudelModule>;
+
 interface StrudelRepl {
-	evaluate(code: string, autostart?: boolean, shouldHush?: boolean): Promise<unknown>;
+	evaluate(code: string, autostart?: boolean): Promise<unknown>;
 	start(): Promise<void>;
 	stop(): void;
 	pause(): void;
@@ -30,20 +32,25 @@ export type AdapterResult =
  *
  * Importing @strudel/web at module evaluation time would execute its browser
  * setup during Astro's server build, so the package is intentionally loaded
- * inside init(). The third repl.evaluate argument is important: validation
- * can run without hushing the currently playing last-valid pattern.
+ * inside init(). Evaluation requests are serialized because the REPL reports
+ * errors through a shared callback. Failed candidates restore the last valid
+ * source because the REPL hushes before evaluating a new source document.
  */
 export class StrudelAdapter {
 	private module: StrudelModule | undefined;
 	private repl: StrudelRepl | undefined;
 	private initPromise: Promise<void> | undefined;
-	private evalError: unknown;
+	private evaluationQueue: Promise<void> = Promise.resolve();
+	private activeEvaluation: { error: unknown } | undefined;
 	private runtime: AdapterRuntimeUpdate = {
 		audioState: 'initializing',
 		transport: 'stopped',
 	};
 
-	public constructor(private readonly onRuntimeUpdate?: (update: AdapterRuntimeUpdate) => void) {}
+	public constructor(
+		private readonly onRuntimeUpdate?: (update: AdapterRuntimeUpdate) => void,
+		private readonly loadModule: StrudelModuleLoader = async () => (await import('@strudel/web')) as unknown as StrudelModule,
+	) {}
 
 	public async init(): Promise<void> {
 		if (this.initPromise) {
@@ -55,11 +62,11 @@ export class StrudelAdapter {
 				throw new Error('The Strudel audio runtime is only available in a browser.');
 			}
 
-			const module = (await import('@strudel/web')) as unknown as StrudelModule;
+			const module = await this.loadModule();
 			this.module = module;
 			this.repl = await module.initStrudel({
 				onEvalError: (error) => {
-					this.evalError = error;
+					if (this.activeEvaluation) this.activeEvaluation.error = error;
 				},
 				onToggle: (started) => {
 					this.setRuntime({
@@ -82,22 +89,36 @@ export class StrudelAdapter {
 
 	public async evaluateSource(
 		source: string,
-		options: { autoplay?: boolean; hushCurrent?: boolean } = {},
+		options: { autoplay?: boolean; restoreSource?: string } = {},
 	): Promise<AdapterResult> {
+		const evaluation = this.evaluationQueue.then(() => this.evaluateSourceNow(source, options));
+		this.evaluationQueue = evaluation.then(() => undefined, () => undefined);
+		return evaluation;
+	}
+
+	private async evaluateSourceNow(
+		source: string,
+		options: { autoplay?: boolean; restoreSource?: string },
+	): Promise<AdapterResult> {
+		await this.init();
+		const result = await this.evaluateRaw(source, options.autoplay ?? false);
+		if (!result.ok && options.restoreSource && options.restoreSource !== source) {
+			await this.evaluateRaw(options.restoreSource, false);
+		}
+		return result;
+	}
+
+	private async evaluateRaw(source: string, autoplay: boolean): Promise<AdapterResult> {
+		const currentEvaluation = { error: undefined as unknown };
+		this.activeEvaluation = currentEvaluation;
 		try {
-			await this.init();
 			if (!this.repl) {
 				throw new Error('Strudel did not return a browser REPL.');
 			}
 
-			this.evalError = undefined;
-			const pattern = await this.repl.evaluate(
-				source,
-				options.autoplay ?? false,
-				options.hushCurrent ?? false,
-			);
-			if (this.evalError) {
-				return { ok: false, error: this.evalError };
+			const pattern = await this.repl.evaluate(source, autoplay);
+			if (currentEvaluation.error) {
+				return { ok: false, error: currentEvaluation.error };
 			}
 			if (!pattern) {
 				return { ok: false, error: new Error('Strudel did not produce a playable pattern.') };
@@ -106,6 +127,8 @@ export class StrudelAdapter {
 			return { ok: true };
 		} catch (error) {
 			return { ok: false, error };
+		} finally {
+			if (this.activeEvaluation === currentEvaluation) this.activeEvaluation = undefined;
 		}
 	}
 
