@@ -2,6 +2,8 @@ export type AudioState = 'locked' | 'initializing' | 'ready' | 'error';
 
 export type TransportState = 'stopped' | 'playing' | 'paused';
 
+import { getParsedSourceBlocks } from './source-parser';
+
 export interface SourceRange {
 	start: number;
 	end: number;
@@ -80,29 +82,8 @@ export function createInitialProject(): ProjectDocumentV1 {
 	};
 }
 
-const markerPattern = /^\s*\/\/\s*@sushi-track\s+(\{.*\})\s*$/gm;
-
 export function getSourceBlocks(source: string): SourceBlockSummary[] {
-	const blocks: SourceBlockSummary[] = [];
-	for (const match of source.matchAll(markerPattern)) {
-		try {
-			const marker = JSON.parse(match[1]) as {
-				id?: string;
-				name?: string;
-				type?: SourceBlockSummary['type'];
-			};
-			blocks.push({
-				id: marker.id ?? `unmanaged-${blocks.length + 1}`,
-				name: marker.name ?? `Source block ${blocks.length + 1}`,
-				type: marker.type ?? 'unknown',
-				line: source.slice(0, match.index ?? 0).split('\n').length,
-			});
-		} catch {
-			// The Strudel evaluator owns validation. An incomplete marker should not
-			// make the studio itself fail to render the draft.
-		}
-	}
-	return blocks;
+	return getParsedSourceBlocks(source).map(({ id, name, type, line }) => ({ id, name, type, line }));
 }
 
 type ErrorRecord = Record<string, unknown>;

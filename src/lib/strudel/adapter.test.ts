@@ -138,4 +138,85 @@ describe('StrudelAdapter evaluation queue', () => {
 			}
 		}
 	});
+
+	test('preloads sample assets before starting the scheduler', async () => {
+		const calls: string[] = [];
+		const scheduler = { cps: 0.5, now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
+		const pattern = {
+			queryArc: () => [{ value: { s: 'bd', n: 0 }, hasOnset: () => true }],
+		};
+		let beforeStart: (() => void | Promise<void>) | undefined;
+		const fakeModule = {
+			initStrudel: async (options?: { beforeStart?: () => void | Promise<void> }) => {
+				beforeStart = options?.beforeStart;
+				return {
+					evaluate: async () => pattern,
+					start: async () => {
+						await beforeStart?.();
+						calls.push('start');
+					},
+					stop: () => undefined,
+					pause: () => undefined,
+					scheduler,
+				};
+			},
+			initAudio: async () => { calls.push('initAudio'); },
+			getSound: () => ({ data: { type: 'sample', samples: ['https://example.test/bd.wav'] } }),
+			getSampleBuffer: async () => { calls.push('preload'); return {}; },
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			expect(await adapter.evaluateSource('accepted')).toEqual({ ok: true });
+			expect(await adapter.play(4)).toEqual({ ok: true });
+			expect(calls).toEqual(['initAudio', 'preload', 'start']);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
+
+	test('preloads static sounds from a pasted source without relying on a fragile pattern query', async () => {
+		const calls: string[] = [];
+		const scheduler = { cps: 0.5, now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
+		const pattern = {
+			queryArc: () => { throw new Error('stack query should not be needed for static source'); },
+		};
+		const fakeModule = {
+			initStrudel: async () => ({
+				evaluate: async () => pattern,
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler,
+			}),
+			initAudio: async () => undefined,
+			getSound: (name: string) => name === 'bd' ? { data: { type: 'sample', samples: ['https://example.test/bd.wav'] } } : undefined,
+			getSampleBuffer: async (value: { s: string }) => { calls.push(value.s); return {}; },
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			expect(await adapter.evaluateSource('$: s("bd!4")')).toEqual({ ok: true });
+			expect(await adapter.play(4)).toEqual({ ok: true });
+			expect(calls).toEqual(['bd']);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
 });

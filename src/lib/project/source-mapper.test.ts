@@ -13,6 +13,17 @@ import {
 
 const pulseId = 'trk_01J4PULSE';
 
+const REGULAR_STRUDEL_SONG = [
+	'setcpm(90/4)',
+	'$: s("gm_string_ensemble_2").note(`<<E4,F#4,A4,C#5,G#5,G#6>!3 <E4,F#4,A4,C#5,F#5,F#6>!1 <D4,F#4,A4,C#5,C#6>!4>`).fast(4).rel(.1).vel(.5).diode("1.5:0.33")',
+	'$: ("gm_synth_bass_1").note("<F#2 D2 F#2 D2 B1!4>")',
+	'$: s("oberheimdmx_bd!4").speed(.8).diode(.6).postgain(1.7)',
+	'$: s("~ compurhythm8000_cp").fast(2).speed(.8)',
+	'$: s("~ korgkr55_sd ~ korgkr55_sd*2").mask("<0!7 1!1>").fast(2).speed("1.03").vel(.8)',
+	'$: s("~ rolandmc303_cp ~ ~").mask("<0!3 1!1>").fast(2).speed("1.1").vel(.9)',
+	'$: s("gm_synth_brass_2").note(`<B3,D4,F#4,A4>!3 <B3,D4,F#4,C#5>`).s("sawtooth").slow(2).room(.2).struct("x ~ x x").hp("275").resonance(0.6).dec(.9).diode("1.9:0.66").gain("1 0.9 0.7 0.8").vel(.16).mask("<0@4 1@4>")',
+].join('\n');
+
 describe('source mapper', () => {
 	test('projects marked labels and scalar chain controls', () => {
 		const [pulse, glass] = getSourceBlockDetails(DEFAULT_SOURCE);
@@ -102,5 +113,33 @@ describe('source mapper', () => {
 		const [pulse] = getSourceBlockDetails(arrangeSource);
 
 		expect(pulse.timing).toEqual({ mode: 'arrange', startCycle: 0, endCycle: 5 });
+	});
+
+	test('projects an ordinary seven-lane Strudel song without Sushi markers', () => {
+		const tracks = getSourceBlockDetails(REGULAR_STRUDEL_SONG);
+
+		expect(tracks).toHaveLength(7);
+		expect(tracks.map((track) => track.id)).toEqual([
+			'trk_source_01',
+			'trk_source_02',
+			'trk_source_03',
+			'trk_source_04',
+			'trk_source_05',
+			'trk_source_06',
+			'trk_source_07',
+		]);
+		expect(tracks.map((track) => track.name)).toEqual([
+			'GM String Ensemble 2',
+			'GM Synth Bass 1',
+			'Oberheim DMX BD',
+			'Compurhythm 8000 CP',
+			'Korg KR55 SD',
+			'Roland MC303 CP',
+			'GM Synth Brass 2',
+		]);
+		expect(tracks.map((track) => track.type)).toEqual(['synth', 'synth', 'drum', 'drum', 'drum', 'drum', 'synth']);
+		expect(tracks.map((track) => track.line)).toEqual([2, 3, 4, 5, 6, 7, 8]);
+		expect(getSourceGlobals(REGULAR_STRUDEL_SONG)).toMatchObject({ bpm: 90, quarterNotesPerCycle: 4 });
+		expect(tracks.every((track) => track.timing.mode === 'full' && track.timing.startCycle === 0 && track.timing.endCycle === 4)).toBe(true);
 	});
 });

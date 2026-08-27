@@ -7,6 +7,7 @@ import {
 	createWebMcpTools,
 	registerWebMcpTools,
 	sourceDiff,
+	getNativeModelContext,
 	type WebMcpController,
 	type WebMcpStateSnapshot,
 } from './tools';
@@ -46,6 +47,24 @@ function testController(): WebMcpController {
 }
 
 describe('WebMCP tool adapter', () => {
+	test('accepts an explicitly supplied native model context', () => {
+		const context = {} as WebMCP.ModelContext;
+		expect(getNativeModelContext(context)).toBe(context);
+	});
+
+	test('finds a model context exposed by an embedded browser host', () => {
+		const host = globalThis as typeof globalThis & { modelContext?: WebMCP.ModelContext };
+		const previous = host.modelContext;
+		const context = {} as WebMCP.ModelContext;
+		Object.defineProperty(host, 'modelContext', { configurable: true, value: context });
+		try {
+			expect(getNativeModelContext()).toBe(context);
+		} finally {
+			if (previous === undefined) Reflect.deleteProperty(host, 'modelContext');
+			else Object.defineProperty(host, 'modelContext', { configurable: true, value: previous });
+		}
+	});
+
 	test('exposes the contract tools and revision-aware schemas', () => {
 		const tools = createWebMcpTools(testController());
 		expect(tools.map((tool) => tool.name)).toEqual([...WEBMCP_TOOL_NAMES]);

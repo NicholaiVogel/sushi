@@ -1,3 +1,4 @@
+import { getParsedSourceBlocks } from './source-parser';
 import type { SourceBlockSummary, SourceRange } from './model';
 
 /**
@@ -19,12 +20,6 @@ export interface SourceBlockDetails extends SourceBlockSummary {
 	soloed: boolean;
 }
 
-type Marker = {
-	id?: string;
-	name?: string;
-	type?: SourceBlockSummary['type'];
-};
-
 export interface SourceGlobals {
 	bpm: number;
 	quarterNotesPerCycle: number;
@@ -39,7 +34,6 @@ export interface TrackTiming {
 	endCycle: number;
 }
 
-const markerLinePattern = /^\s*\/\/\s*@sushi-track\s+(\{.*\})\s*$/;
 const labelPattern = /^(\s*)([A-Za-z_$][\w$]*)(\s*):(\s*)(.*)$/;
 const numericLiteral = '[-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?';
 const DEFAULT_BPM = 84;
@@ -93,44 +87,8 @@ export function getSourceTrackTiming(expression: string): TrackTiming {
 	return { mode: 'full', startCycle: 0, endCycle: DEFAULT_TRACK_END_CYCLE };
 }
 
-function parseMarker(line: string): Marker | undefined {
-	const match = line.match(markerLinePattern);
-	if (!match) return undefined;
-
-	try {
-		return JSON.parse(match[1]) as Marker;
-	} catch {
-		return undefined;
-	}
-}
-
-function lineOffsets(source: string): number[] {
-	const lines = source.split('\n');
-	const offsets: number[] = [];
-	let offset = 0;
-	for (const line of lines) {
-		offsets.push(offset);
-		offset += line.length + 1;
-	}
-	return offsets;
-}
-
 function withoutCarriageReturn(line: string): { body: string; ending: string } {
 	return line.endsWith('\r') ? { body: line.slice(0, -1), ending: '\r' } : { body: line, ending: '' };
-}
-
-function markerIndices(lines: string[]): number[] {
-	return lines.flatMap((line, index) => markerLinePattern.test(withoutCarriageReturn(line).body) ? [index] : []);
-}
-
-function findExpressionLine(lines: string[], markerIndex: number, nextMarkerIndex: number | undefined): number | undefined {
-	const end = nextMarkerIndex ?? lines.length;
-	for (let index = markerIndex + 1; index < end; index += 1) {
-		const { body } = withoutCarriageReturn(lines[index]);
-		if (!body.trim() || body.trim().startsWith('//')) continue;
-		return index;
-	}
-	return undefined;
 }
 
 function modeFromLabel(label: string | undefined): { muted: boolean; soloed: boolean } {
@@ -152,84 +110,32 @@ function hasMethod(expression: string, method: 'gain' | 'pan'): boolean {
 }
 
 export function getSourceBlockDetails(source: string): SourceBlockDetails[] {
-	const lines = source.split('\n');
-	const offsets = lineOffsets(source);
-	const markers = markerIndices(lines);
-	const details: SourceBlockDetails[] = [];
-
-	for (let markerPosition = 0; markerPosition < markers.length; markerPosition += 1) {
-		const markerIndex = markers[markerPosition];
-		const { body: markerLine } = withoutCarriageReturn(lines[markerIndex]);
-		const marker = parseMarker(markerLine);
-		if (!marker) continue;
-
-		const sourceStart = offsets[markerIndex];
-		const nextMarkerIndex = markers[markerPosition + 1];
-		const blockEnd = nextMarkerIndex === undefined ? source.length : offsets[nextMarkerIndex];
-		const expressionIndex = findExpressionLine(lines, markerIndex, nextMarkerIndex);
-		const summary: SourceBlockSummary = {
-			id: marker.id ?? `unmanaged-${details.length + 1}`,
-			name: marker.name ?? `Source block ${details.length + 1}`,
-			type: marker.type ?? 'unknown',
-			line: markerIndex + 1,
-		};
-
-		if (expressionIndex === undefined) {
-			details.push({
-				...summary,
-				sourceRange: { start: sourceStart, end: blockEnd, line: markerIndex + 1 },
+	return getParsedSourceBlocks(source).map((block): SourceBlockDetails => {
+		if (!block.expressionRange || !block.label || block.expression === undefined) {
+			return {
+				...block,
 				timing: { mode: 'full', startCycle: 0, endCycle: DEFAULT_TRACK_END_CYCLE },
 				gainEditable: false,
 				panEditable: false,
 				muted: false,
 				soloed: false,
-			});
-			continue;
+			};
 		}
 
-		const expressionStart = offsets[expressionIndex];
-		const firstLine = withoutCarriageReturn(lines[expressionIndex]);
-		const label = firstLine.body.match(labelPattern);
-		if (!label) {
-			details.push({
-				...summary,
-				sourceRange: { start: sourceStart, end: blockEnd, line: markerIndex + 1 },
-				expressionRange: { start: expressionStart, end: blockEnd, line: expressionIndex + 1 },
-				timing: getSourceTrackTiming(source.slice(expressionStart, blockEnd)),
-				gainEditable: false,
-				panEditable: false,
-				muted: false,
-				soloed: false,
-			});
-			continue;
-		}
-
-		const [, , executableLabel, , , firstLineExpression] = label;
-		const continuation = source.slice(expressionStart + lines[expressionIndex].length, blockEnd);
-		const expression = `${firstLineExpression}${firstLine.ending}${continuation}`;
-		const modes = modeFromLabel(executableLabel);
-		const timing = getSourceTrackTiming(expression);
+		const expression = block.expression;
+		const modes = modeFromLabel(block.label);
 		const gain = numericMethodValue(expression, 'gain');
 		const pan = numericMethodValue(expression, 'pan');
-		const gainEditable = !hasMethod(expression, 'gain') || gain !== undefined;
-		const panEditable = !hasMethod(expression, 'pan') || pan !== undefined;
-
-		details.push({
-			...summary,
-			sourceRange: { start: sourceStart, end: blockEnd, line: markerIndex + 1 },
-			expressionRange: { start: expressionStart, end: blockEnd, line: expressionIndex + 1 },
-			timing,
-			label: executableLabel,
-			expression,
+		return {
+			...block,
+			timing: getSourceTrackTiming(expression),
 			gain,
 			pan,
-			gainEditable,
-			panEditable,
+			gainEditable: !hasMethod(expression, 'gain') || gain !== undefined,
+			panEditable: !hasMethod(expression, 'pan') || pan !== undefined,
 			...modes,
-		});
-	}
-
-	return details;
+		};
+	});
 }
 
 function replaceExpressionBlock(

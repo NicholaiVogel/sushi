@@ -156,6 +156,29 @@ export interface WebMcpRegistration {
 	dispose: () => void;
 }
 
+/**
+ * Resolve the browser-provided WebMCP surface without assuming a single host
+ * placement. Chromium builds have exposed ModelContext on the document, while
+ * embedded app browsers may provide the same native object on navigator or
+ * window. Keeping this lookup in one place also makes the feature detection
+ * testable without requiring a real browser implementation.
+ */
+export function getNativeModelContext(context?: WebMCP.ModelContext): WebMCP.ModelContext | undefined {
+	if (context) return context;
+	const globalWithModelContext = globalThis as typeof globalThis & { modelContext?: WebMCP.ModelContext };
+	if (globalWithModelContext.modelContext) return globalWithModelContext.modelContext;
+	if (typeof document !== 'undefined' && document.modelContext) return document.modelContext;
+	if (typeof navigator !== 'undefined') {
+		const navigatorWithModelContext = navigator as Navigator & { modelContext?: WebMCP.ModelContext };
+		if (navigatorWithModelContext.modelContext) return navigatorWithModelContext.modelContext;
+	}
+	if (typeof window !== 'undefined') {
+		const windowWithModelContext = window as Window & { modelContext?: WebMCP.ModelContext };
+		if (windowWithModelContext.modelContext) return windowWithModelContext.modelContext;
+	}
+	return undefined;
+}
+
 interface ToolOptions {
 	signal: AbortSignal;
 }
@@ -435,7 +458,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 				version: STRUDEL_REFERENCE_VERSION,
 				query: input.query,
 				kind: input.kind,
-				results: lookupStrudelReference(input.query, input.kind as StrudelReferenceKind | undefined, input.limit as number | undefined) as StrudelReferenceEntry[],
+				results: lookupStrudelReference(input.query as string, input.kind as StrudelReferenceKind | undefined, input.limit as number | undefined) as StrudelReferenceEntry[],
 			}));
 		}),
 
@@ -482,7 +505,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 }
 
 export async function registerWebMcpTools(controller: WebMcpController, context?: WebMCP.ModelContext): Promise<WebMcpRegistration> {
-	const modelContext = context ?? (typeof document !== 'undefined' ? document.modelContext : undefined);
+	const modelContext = getNativeModelContext(context);
 	if (!modelContext) return { available: false, toolNames: [], dispose: () => undefined };
 
 	const abortController = new AbortController();

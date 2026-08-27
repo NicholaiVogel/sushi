@@ -15,10 +15,12 @@ import {
 	updateTrackPan,
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
+import { highlightStrudel } from '../lib/project/syntax-highlight';
 import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
 import { StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
 import {
 	applyTextEdits,
+	getNativeModelContext,
 	registerWebMcpTools,
 	sourceDiff,
 	type SourceMutationInput,
@@ -142,8 +144,9 @@ function getDiagnosticLocation(diagnostic: SourceDiagnostic): string {
 
 const BEAT_LABELS = ['1', '1.1', '1.2', '1.3', '2', '2.1', '2.2', '2.3', '3', '3.1', '3.2', '3.3', '4', '4.1', '4.2', '4.3'];
 const TRACK_COLORS = ['#d9ff68', '#8fe1ff', '#f0a3c7', '#c7a6ff'];
-const TRACK_LEVELS = [72, 46, 61, 38, 57, 68, 44, 76, 50, 64, 40, 70, 55, 47, 63, 42];
 const SOURCE_HISTORY_LIMIT = 100;
+const EDITOR_WIDTH_MIN = 280;
+const EDITOR_WIDTH_MAX = 560;
 
 function getLineNumbers(source: string): number[] {
 	return Array.from({ length: Math.max(1, source.split('\n').length) }, (_, index) => index + 1);
@@ -208,9 +211,14 @@ function makeMutationResult(
 
 export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
+	const [editorWidth, setEditorWidth] = useState(350);
 	const studioRef = useRef(studio);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
 	const mountedRef = useRef(true);
+	const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
+	const sourceHighlightRef = useRef<HTMLPreElement | null>(null);
+	const editorGutterRef = useRef<HTMLDivElement | null>(null);
+	const editorResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 	const pendingTrackSourceRef = useRef<string | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const timingDragRef = useRef<{ trackId: string; edge: 'start' | 'end'; lane: HTMLElement } | null>(null);
@@ -224,6 +232,52 @@ export default function Studio() {
 	const sourceTransactionsRef = useRef(new Map<string, WebMcpMutationResult>());
 	const webmcpRegistrationRef = useRef<WebMcpRegistration | null>(null);
 	const webmcpAvailableRef = useRef(false);
+
+	const syncEditorScroll = useCallback(() => {
+		const editor = sourceEditorRef.current;
+		if (!editor) return;
+		if (sourceHighlightRef.current) {
+			sourceHighlightRef.current.scrollTop = editor.scrollTop;
+			sourceHighlightRef.current.scrollLeft = editor.scrollLeft;
+		}
+		if (editorGutterRef.current) editorGutterRef.current.scrollTop = editor.scrollTop;
+	}, []);
+
+	const handleEditorResizePointerMove = useCallback((event: PointerEvent) => {
+		const drag = editorResizeRef.current;
+		if (!drag) return;
+		setEditorWidth(clamp(drag.startWidth + event.clientX - drag.startX, EDITOR_WIDTH_MIN, EDITOR_WIDTH_MAX));
+	}, []);
+
+	const stopEditorResize = useCallback(() => {
+		editorResizeRef.current = null;
+		window.removeEventListener('pointermove', handleEditorResizePointerMove);
+		window.removeEventListener('pointerup', stopEditorResize);
+		window.removeEventListener('pointercancel', stopEditorResize);
+	}, [handleEditorResizePointerMove]);
+
+	const startEditorResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+		if (event.button !== 0) return;
+		event.preventDefault();
+		editorResizeRef.current = { startX: event.clientX, startWidth: editorWidth };
+		window.addEventListener('pointermove', handleEditorResizePointerMove);
+		window.addEventListener('pointerup', stopEditorResize);
+		window.addEventListener('pointercancel', stopEditorResize);
+	}, [editorWidth, handleEditorResizePointerMove, stopEditorResize]);
+
+	const handleEditorResizeKeyDown = useCallback((event: ReactKeyboardEvent<HTMLButtonElement>) => {
+		if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return;
+		event.preventDefault();
+		if (event.key === 'Home') {
+			setEditorWidth(EDITOR_WIDTH_MIN);
+			return;
+		}
+		if (event.key === 'End') {
+			setEditorWidth(EDITOR_WIDTH_MAX);
+			return;
+		}
+		setEditorWidth((current) => clamp(current + (event.key === 'ArrowRight' ? 16 : -16), EDITOR_WIDTH_MIN, EDITOR_WIDTH_MAX));
+	}, []);
 
 	const patchStudio = useCallback((patch: Partial<StudioState>) => {
 		const next = { ...studioRef.current, ...patch };
@@ -487,6 +541,7 @@ export default function Studio() {
 	);
 
 	useEffect(() => stopTimingDrag, [stopTimingDrag]);
+	useEffect(() => stopEditorResize, [stopEditorResize]);
 
 	const setTrackGain = useCallback(
 		(trackId: string, value: number) => updateTrackSource(trackId, (source) => updateTrackGain(source, trackId, value)),
@@ -633,7 +688,7 @@ export default function Studio() {
 			runtime: current.runtime,
 			phase: current.phase,
 			persistenceState: current.persistenceState,
-			webmcp: { available: webmcpAvailableRef.current },
+			webmcp: { available: webmcpAvailableRef.current || Boolean(getNativeModelContext()) },
 		};
 	}, []);
 
@@ -941,6 +996,11 @@ export default function Studio() {
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
+	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
+
+	useEffect(() => {
+		syncEditorScroll();
+	}, [studio.draft, syncEditorScroll]);
 
 	return (
 		<div className="studio-shell">
@@ -972,7 +1032,7 @@ export default function Studio() {
 						<span className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>
 						<span className="transport-cycle" aria-live="polite">CYCLE {formatCycle(studio.runtime.currentCycle)}</span>
 						<span className="transport-divider" aria-hidden="true" />
-						<span className="transport-readout">{studio.runtime.transport.toUpperCase()}</span>
+						<span className="transport-readout">{studio.runtime.audioState === 'initializing' ? 'PREPARING' : studio.runtime.transport.toUpperCase()}</span>
 					</div>
 				</div>
 				<div className="topbar-right">
@@ -980,37 +1040,56 @@ export default function Studio() {
 				</div>
 			</header>
 
-			<div className="studio-body">
+			<div className="studio-body" style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
 				<aside className="source-sidebar" aria-label="Strudel source editor">
 					<div className="source-editor-shell">
-						<div className="editor-gutter" aria-hidden="true">{draftLines.map((line) => <span key={line}>{line.toString().padStart(2, '0')}</span>)}</div>
-						<label className="sr-only" htmlFor="source-editor">Strudel source draft</label>
-						<textarea
-							id="source-editor"
-							className="source-editor"
-							value={studio.draft}
+						<div className="editor-gutter" ref={editorGutterRef} aria-hidden="true">{draftLines.map((line) => <span key={line}>{line.toString().padStart(2, '0')}</span>)}</div>
+						<div className="editor-code-layer">
+							<pre ref={sourceHighlightRef} className="source-highlight" aria-hidden="true" dangerouslySetInnerHTML={{ __html: highlightedSource }} />
+							<label className="sr-only" htmlFor="source-editor">Strudel source draft</label>
+							<textarea
+								id="source-editor"
+								ref={sourceEditorRef}
+								className="source-editor"
+								value={studio.draft}
 							onChange={(event) => {
-								const nextDraft = event.target.value;
-								patchStudio({
-									draft: nextDraft,
-									...(studioRef.current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
-								});
-							}}
-							onKeyDown={(event) => {
-								if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-									event.preventDefault();
-									void dispatch({ type: 'writeSource', source: studioRef.current.draft });
-								}
-							}}
-							spellCheck={false}
-							autoCapitalize="off"
-							wrap="off"
-							aria-describedby="source-help"
-						/>
+									const nextDraft = event.target.value;
+									patchStudio({
+										draft: nextDraft,
+										...(studioRef.current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
+									});
+								}}
+								onScroll={syncEditorScroll}
+								onKeyDown={(event) => {
+									if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+										event.preventDefault();
+										void dispatch({ type: 'writeSource', source: studioRef.current.draft });
+									}
+								}}
+								spellCheck={false}
+								autoCapitalize="off"
+								wrap="off"
+								aria-describedby="source-help"
+							/>
+						</div>
 					</div>
 					<p className="editor-help" id="source-help">Cmd/Ctrl + Enter to validate <span aria-hidden="true">·</span> {draftBlocks.length} marked {draftBlocks.length === 1 ? 'block' : 'blocks'}</p>
 					{studio.diagnostics.length ? <div className="sidebar-diagnostic" role="status" aria-live="polite"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span className="sidebar-diagnostic-revision">{getDiagnosticLocation(studio.diagnostics[0]) || `REV ${formatRevision(studio.diagnostics[0].revision)}`}</span></div> : null}
 			</aside>
+			<div className="editor-resize-divider">
+				<button
+					className="editor-resize-handle"
+					type="button"
+					onPointerDown={startEditorResize}
+					onKeyDown={handleEditorResizeKeyDown}
+					aria-label="Resize source editor"
+					aria-orientation="vertical"
+					aria-valuemin={EDITOR_WIDTH_MIN}
+					aria-valuemax={EDITOR_WIDTH_MAX}
+					aria-valuenow={editorWidth}
+					title="Drag to resize source editor"
+				/>
+			</div>
 
 				<main className="daw-canvas" aria-label="Sushi workstation">
 					<section className="timeline-shell" aria-labelledby="timeline-heading">
@@ -1075,7 +1154,6 @@ export default function Studio() {
 								</div>
 							);
 						})}
-						<div className="master-lane"><div className="track-header master-header"><span className="track-number">—</span><span className="master-mark" aria-hidden="true">∿</span><div className="track-name-wrap"><strong>MASTER</strong><span>OUTPUT BUS <span aria-hidden="true">·</span> STRUDEL</span></div><span className="master-db">0.0 dB</span></div><div className="master-meter" aria-label="Master output meter">{TRACK_LEVELS.slice(0, 12).map((level, index) => <span key={index} style={{ '--level': `${level}%` } as CSSProperties} />)}</div></div>
 						<div className="timeline-fill" aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines">{BEAT_LABELS.map((_, cell) => <span className={cell % 4 === 0 ? 'beat-start' : ''} key={cell} />)}</div><span className="lane-playhead timeline-fill-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} /></div></div>
 					</section>
 

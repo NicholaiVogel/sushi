@@ -16,3 +16,13 @@ declare module '@strudel/web' {
 	export function hush(): void;
 	export function evaluate(code: string, autoplay?: boolean): Promise<unknown>;
 }
+
+declare module '@strudel/soundfonts' {
+	export function registerSoundfonts(): void;
+	export function getFontBufferSource(name: string, value: Record<string, any>, audioContext: AudioContext): Promise<AudioBufferSourceNode>;
+}
+
+declare module '@strudel/soundfonts/gm.mjs' {
+	const soundfonts: Record<string, string[]>;
+	export default soundfonts;
+}
