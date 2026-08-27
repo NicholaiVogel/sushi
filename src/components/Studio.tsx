@@ -2238,15 +2238,19 @@ export default function Studio() {
 							const gain = trackDetails?.gain ?? 1;
 							const pan = trackDetails?.pan ?? 0.5;
 							const timing = getTrackTimingForTimeline(trackDetails, studio.songEndCycle);
-							const clipStart = clamp(timing.startCycle / studio.songEndCycle, 0, 1);
 							const displayTiming = getTrackDisplayTiming(timing, studio.songEndCycle);
-							const clipEnd = clamp(displayTiming.displayEndCycle / studio.songEndCycle, clipStart + 0.01, 1);
+							// A newly created lane is a four-bar editable clip even though
+							// its source pattern is repeatable. Only expand visibly longer
+							// loop ranges through the project boundary.
+							const showLoopSpan = displayTiming.repeating && timing.endCycle > DEFAULT_TRACK_END_CYCLE;
+							const clipStart = clamp(timing.startCycle / studio.songEndCycle, 0, 1);
+							const clipEnd = clamp((showLoopSpan ? displayTiming.displayEndCycle : timing.endCycle) / studio.songEndCycle, clipStart + 0.01, 1);
 							const loopHandlePosition = clipEnd > clipStart
 								? clamp((timing.endCycle / studio.songEndCycle - clipStart) / (clipEnd - clipStart), 0.01, 1)
 								: 1;
 							const loopWidth = Math.max(1, (timing.endCycle - timing.startCycle) * Math.max(1, Math.round(sourceGlobals.quarterNotesPerCycle)) * timelineCellWidth);
 							const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
-							const displayLabel = displayTiming.repeating && displayTiming.displayEndCycle > timing.endCycle
+							const displayLabel = showLoopSpan
 								? `${timingLabel} · LOOP TO ${formatCycle(displayTiming.displayEndCycle)}`
 								: timingLabel;
 							return (
@@ -2325,7 +2329,7 @@ export default function Studio() {
 									<div className="lane-grid" style={{ ...timelineGridStyle, '--track-color': trackColor } as CSSProperties}>
 										<div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-hidden="true">{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'beat-start' : ''} key={index} />)}</div>
 										<div
-											className={`pattern-region ${displayTiming.repeating ? 'pattern-region-looping' : ''}`}
+											className={`pattern-region ${showLoopSpan ? 'pattern-region-looping' : ''}`}
 											style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd, '--loop-handle-position': loopHandlePosition, '--loop-width': `${loopWidth}px` } as CSSProperties}
 											onPointerDown={(event) => startTimingDrag(event, block.id, 'move')}
 											onKeyDown={(event) => {
