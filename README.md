@@ -24,6 +24,7 @@ The current vertical slice is a source-first DAW workstation at `/`:
 - A BandLab-minimal arrangement surface pairs a numbered bar ruler, compact track-control strips, source clips, and a Zed-inspired, line-numbered Strudel source sidebar.
 - New sessions start with only the canonical `setcpm(150 / 4)` and `const key = "E:minor"` header; the first track is added explicitly.
 - The top transport includes a 0–300 BPM control centered at 150 and a musical-key dropdown. Both rewrite the canonical source header and evaluate through Strudel immediately.
+- The session header includes three curated, loadable garden presets. Loading one replaces the editor through the validated source pipeline, names the session after the preset, and leaves the previous source available through Undo.
 - **Add track** appends a valid synth block to the source and commits it through the same Strudel evaluation path as an editor change.
 - Track gain and pan controls rewrite numeric `.gain(...)` and `.pan(...)` calls in the marked Strudel expression and evaluate the updated source immediately.
 - Mute and solo use Strudel's source labels (`_$:` and `S$:`), so their state is visible and editable in the source editor. Unsupported chain values remain source-visible and are not presented as editable scalar controls.

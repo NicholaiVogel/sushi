@@ -27,6 +27,7 @@ import {
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
 import { getSourceLineNumbers, replaceSourceSelection } from '../lib/project/editor';
+import { EDITOR_PRESETS, type EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
 	getTimelineZoomForVisibleCycles,
@@ -121,7 +122,7 @@ interface TimingDrag {
 	lastPointerClientX: number;
 }
 
-type HeaderPopover = 'tempo' | 'key' | 'help' | 'length';
+type HeaderPopover = 'tempo' | 'key' | 'help' | 'length' | 'presets';
 
 const SONG_LENGTH_PRESETS = [4, 8, 16, 30, 60, 120] as const;
 const TIMELINE_ZOOM_BUTTON_STEP = 10;
@@ -1272,6 +1273,19 @@ export default function Studio() {
 		await persistStudioSnapshot(imported, generation);
 	}, [bumpSourceHistory, cancelPendingTrackCommit, patchStudio, persistStudioSnapshot]);
 
+	const loadEditorPreset = useCallback(async (preset: EditorPreset) => {
+		cancelPendingTrackCommit();
+		const current = studioRef.current;
+		const result = await commitSource(preset.source, { expectedRevision: current.revision });
+		if (!result.ok) return;
+
+		const presetEndCycle = getTimelineCapacityForEndCycle(Math.max(DEFAULT_SONG_END_CYCLE, getExplicitSourceEndCycle(preset.source)));
+		adapterRef.current?.setSongEndCycle(presetEndCycle);
+		patchStudio({ projectName: preset.name, songEndCycle: presetEndCycle });
+		setOpenHeaderPopover(null);
+		await persistStudioSnapshot();
+	}, [cancelPendingTrackCommit, commitSource, patchStudio, persistStudioSnapshot]);
+
 	const toggleTrackMode = useCallback(
 		(trackId: string, mode: 'mute' | 'solo', active: boolean) => updateTrackSource(trackId, (source) => updateTrackMode(source, trackId, mode, active)),
 		[updateTrackSource],
@@ -2191,6 +2205,26 @@ export default function Studio() {
 					<div className="session-name-row">
 						<label className="sr-only" htmlFor="project-name">Project name</label>
 						<input id="project-name" className="project-name-input" value={studio.projectName ?? 'First light'} onChange={(event) => patchStudio({ projectName: event.target.value })} onBlur={() => { void persistStudioSnapshot(); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} aria-label="Project name" title="Rename project" />
+						<div className="topbar-preset-control">
+							<button className="topbar-preset-button" type="button" onClick={() => setOpenHeaderPopover((current) => current === 'presets' ? null : 'presets')} disabled={isBusy} aria-expanded={openHeaderPopover === 'presets'} aria-haspopup="dialog" aria-label="Load a preset" title="Load a preset">Presets</button>
+							{openHeaderPopover === 'presets' ? (
+								<div className="topbar-preset-popover" role="dialog" aria-label="Load a preset">
+									<div className="preset-popover-heading">
+										<strong className="topbar-popover-title">Load a preset</strong>
+										<span>Replace the editor source. Undo restores the current source.</span>
+									</div>
+									<div className="preset-list">
+										{EDITOR_PRESETS.map((preset) => (
+											<button className="preset-option" type="button" key={preset.id} onClick={() => void loadEditorPreset(preset)} disabled={isBusy}>
+												<span className="preset-option-heading"><strong>{preset.name}</strong><small>{preset.bpm} BPM · {preset.key}</small></span>
+												<span className="preset-option-description">{preset.description}</span>
+												<span className="preset-option-meta">{preset.lanes} SOURCE LANES</span>
+											</button>
+										))}
+									</div>
+								</div>
+							) : null}
+						</div>
 						<span className={`save-state ${isDirty || studio.persistenceState === 'loading' ? 'save-state-dirty' : ''}`} title={studio.persistenceState === 'unavailable' ? 'IndexedDB is unavailable; this session will not persist after reload.' : 'Project state is saved locally'}><span className="save-dot" aria-hidden="true" />{saveStateLabel}</span>
 					</div>
 					<div className="topbar-transport" aria-label="Transport controls">
