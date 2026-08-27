@@ -7,7 +7,7 @@ describe('StrudelAdapter evaluation queue', () => {
 		let releaseFirst: (() => void) | undefined;
 		let onEvalError: ((error: unknown) => void) | undefined;
 		const fakeModule = {
-			initStrudel: async (options?: { onEvalError?: (error: unknown) => void }) => {
+			initStrudel: async (options?: { onEvalError?: (error: unknown) => void; onToggle?: (started: boolean) => void }) => {
 				onEvalError = options?.onEvalError;
 				return {
 					evaluate: async (code: string) => {
@@ -22,6 +22,7 @@ describe('StrudelAdapter evaluation queue', () => {
 					start: async () => undefined,
 					stop: () => undefined,
 					pause: () => undefined,
+					scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
 				};
 			},
 		};

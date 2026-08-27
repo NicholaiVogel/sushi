@@ -39,6 +39,7 @@ export interface ProjectDocumentV1 {
 	};
 	timeline: {
 		quarterNotesPerCycle: { numerator: number; denominator: number };
+		songEndCycle?: number;
 	};
 	assets: [];
 }
@@ -73,6 +74,7 @@ export function createInitialProject(): ProjectDocumentV1 {
 		},
 		timeline: {
 			quarterNotesPerCycle: { numerator: 4, denominator: 1 },
+			songEndCycle: 4,
 		},
 		assets: [],
 	};

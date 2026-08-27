@@ -39,5 +39,7 @@ Sushi is a source-first browser DAW for a beginner and an agent sharing one musi
 | Invalid draft is visible and non-destructive | Commit preserves `lastValid` and `activeRevision`, then renders diagnostics |
 | Track controls are source-backed | Gain/pan rewrite numeric Strudel chain calls; mute/solo rewrite `_$:`/`S$:` labels and re-evaluate through `StrudelAdapter` |
 | Projects reopen from local storage | IndexedDB restores the project name, draft, last-valid source, and revision before the runtime boots |
+| Timeline timing stays source-backed | `seqPLoop(...)` ranges render as cycle/second spans; dragging either clip edge rewrites the marked source block |
+| Transport follows Strudel's scheduler | Play, pause/resume, stop-to-zero, seek, live cycle progress, and song-end stop use the adapter scheduler |
 | Source state is inspectable | Draft, last-valid source, diagnostics, and active revision are visible together |
 | Layout remains usable on narrow screens | Responsive CSS recomposes the workspace below 860px |

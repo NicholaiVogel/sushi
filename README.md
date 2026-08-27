@@ -16,7 +16,7 @@ Strudel source is canonical. `$:` blocks become tracks, recognized method chains
 
 See [SPEC.md](./SPEC.md) for the canonical product and architecture specification.
 
-## Slice 0: runtime proof
+## Current vertical slice
 
 The current vertical slice is a source-first DAW workstation at `/`:
 
@@ -26,7 +26,8 @@ The current vertical slice is a source-first DAW workstation at `/`:
 - Track gain and pan controls rewrite numeric `.gain(...)` and `.pan(...)` calls in the marked Strudel expression and evaluate the updated source immediately.
 - Mute and solo use Strudel's source labels (`_$:` and `S$:`), so their state is visible and editable in the source editor. Unsupported chain values remain source-visible and are not presented as editable scalar controls.
 - Project name, draft source, last-valid source, and revisions autosave to IndexedDB and restore before the initial Strudel evaluation.
-- `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns Play/Stop.
+- Tempo, key, track ranges, and derived seconds are projected from committed Strudel source. Dragging a clip edge writes a `seqPLoop(...)` range back into that track's source block.
+- `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns play, pause, resume, stop, seek, cycle progress, and song-end handling.
 - Source edits stay in a draft until **Commit source** evaluates them through Strudel.
 - Failed evaluations remain visible as diagnostics while the last-valid source and active revision stay playable.
 - Audio waits for an explicit Play gesture to satisfy browser autoplay policy.

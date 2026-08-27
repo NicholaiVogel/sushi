@@ -10,6 +10,7 @@ export interface SourceBlockDetails extends SourceBlockSummary {
 	expressionRange?: SourceRange;
 	label?: string;
 	expression?: string;
+	timing: TrackTiming;
 	gain?: number;
 	pan?: number;
 	gainEditable: boolean;
@@ -24,9 +25,73 @@ type Marker = {
 	type?: SourceBlockSummary['type'];
 };
 
+export interface SourceGlobals {
+	bpm: number;
+	quarterNotesPerCycle: number;
+	key: string;
+}
+
+export type TrackTimingMode = 'full' | 'seqPLoop' | 'arrange';
+
+export interface TrackTiming {
+	mode: TrackTimingMode;
+	startCycle: number;
+	endCycle: number;
+}
+
 const markerLinePattern = /^\s*\/\/\s*@sushi-track\s+(\{.*\})\s*$/;
 const labelPattern = /^(\s*)([A-Za-z_$][\w$]*)(\s*):(\s*)(.*)$/;
 const numericLiteral = '[-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?';
+const DEFAULT_BPM = 84;
+const DEFAULT_QUARTER_NOTES_PER_CYCLE = 4;
+const DEFAULT_TRACK_END_CYCLE = 4;
+
+export function getSourceGlobals(source: string): SourceGlobals {
+	const tempoMatch = source.match(new RegExp(`\\bsetcpm\\s*\\(\\s*(${numericLiteral})(?:\\s*\\/\\s*(${numericLiteral}))?\\s*\\)`));
+	const parsedBpm = tempoMatch ? Number(tempoMatch[1]) : DEFAULT_BPM;
+	const parsedQuarterNotes = tempoMatch?.[2] ? Number(tempoMatch[2]) : DEFAULT_QUARTER_NOTES_PER_CYCLE;
+	const keyMatch = source.match(/^\s*(?:const|let|var)\s+key\s*=\s*["']([^"']+)["']/m);
+	return {
+		bpm: Number.isFinite(parsedBpm) && parsedBpm > 0 ? parsedBpm : DEFAULT_BPM,
+		quarterNotesPerCycle: Number.isFinite(parsedQuarterNotes) && parsedQuarterNotes > 0 ? parsedQuarterNotes : DEFAULT_QUARTER_NOTES_PER_CYCLE,
+		key: keyMatch?.[1] ?? 'E:minor',
+	};
+}
+
+export function cyclesToSeconds(cycles: number, globals: SourceGlobals): number {
+	return cycles * 60 * globals.quarterNotesPerCycle / globals.bpm;
+}
+
+export function secondsToCycles(seconds: number, globals: SourceGlobals): number {
+	return seconds * globals.bpm / (60 * globals.quarterNotesPerCycle);
+}
+
+export function getSourceTrackTiming(expression: string): TrackTiming {
+	const trimmed = expression.trim();
+	if (trimmed.startsWith('seqPLoop(')) {
+		const pairs = Array.from(trimmed.matchAll(new RegExp(`\\[\\s*(${numericLiteral})\\s*,\\s*(${numericLiteral})\\s*,`, 'g')))
+			.map((match) => ({ start: Number(match[1]), end: Number(match[2]) }))
+			.filter((pair) => Number.isFinite(pair.start) && Number.isFinite(pair.end) && pair.end > pair.start);
+		if (pairs.length) {
+			return {
+				mode: 'seqPLoop',
+				startCycle: Math.min(...pairs.map((pair) => pair.start)),
+				endCycle: Math.max(...pairs.map((pair) => pair.end)),
+			};
+		}
+	}
+
+	if (trimmed.startsWith('arrange(')) {
+		const durations = Array.from(trimmed.matchAll(new RegExp(`\\[\\s*(${numericLiteral})\\s*,`, 'g')))
+			.map((match) => Number(match[1]))
+			.filter((duration) => Number.isFinite(duration) && duration > 0);
+		if (durations.length) {
+			return { mode: 'arrange', startCycle: 0, endCycle: durations.reduce((total, duration) => total + duration, 0) };
+		}
+	}
+
+	return { mode: 'full', startCycle: 0, endCycle: DEFAULT_TRACK_END_CYCLE };
+}
 
 function parseMarker(line: string): Marker | undefined {
 	const match = line.match(markerLinePattern);
@@ -113,6 +178,7 @@ export function getSourceBlockDetails(source: string): SourceBlockDetails[] {
 			details.push({
 				...summary,
 				sourceRange: { start: sourceStart, end: blockEnd, line: markerIndex + 1 },
+				timing: { mode: 'full', startCycle: 0, endCycle: DEFAULT_TRACK_END_CYCLE },
 				gainEditable: false,
 				panEditable: false,
 				muted: false,
@@ -129,6 +195,7 @@ export function getSourceBlockDetails(source: string): SourceBlockDetails[] {
 				...summary,
 				sourceRange: { start: sourceStart, end: blockEnd, line: markerIndex + 1 },
 				expressionRange: { start: expressionStart, end: blockEnd, line: expressionIndex + 1 },
+				timing: getSourceTrackTiming(source.slice(expressionStart, blockEnd)),
 				gainEditable: false,
 				panEditable: false,
 				muted: false,
@@ -141,6 +208,7 @@ export function getSourceBlockDetails(source: string): SourceBlockDetails[] {
 		const continuation = source.slice(expressionStart + lines[expressionIndex].length, blockEnd);
 		const expression = `${firstLineExpression}${firstLine.ending}${continuation}`;
 		const modes = modeFromLabel(executableLabel);
+		const timing = getSourceTrackTiming(expression);
 		const gain = numericMethodValue(expression, 'gain');
 		const pan = numericMethodValue(expression, 'pan');
 		const gainEditable = !hasMethod(expression, 'gain') || gain !== undefined;
@@ -150,6 +218,7 @@ export function getSourceBlockDetails(source: string): SourceBlockDetails[] {
 			...summary,
 			sourceRange: { start: sourceStart, end: blockEnd, line: markerIndex + 1 },
 			expressionRange: { start: expressionStart, end: blockEnd, line: expressionIndex + 1 },
+			timing,
 			label: executableLabel,
 			expression,
 			gain,
@@ -218,6 +287,27 @@ export function updateTrackGain(source: string, trackId: string, value: number):
 
 export function updateTrackPan(source: string, trackId: string, value: number): string {
 	return updateNumericMethod(source, trackId, 'pan', value);
+}
+
+export function updateTrackRange(source: string, trackId: string, startCycle: number, endCycle: number): string {
+	const start = Number.isFinite(startCycle) ? Math.max(0, startCycle) : 0;
+	const end = Number.isFinite(endCycle) ? Math.max(start + 0.25, endCycle) : start + 0.25;
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const rangePattern = new RegExp(`(seqPLoop\\(\\s*\\[\\s*)${numericLiteral}(\\s*,\\s*)${numericLiteral}`);
+		if (rangePattern.test(expression)) {
+			return {
+				label,
+				expression: expression.replace(rangePattern, `$1${formatNumber(start)}$2${formatNumber(end)}`),
+			};
+		}
+
+		const trailingWhitespace = expression.match(/\s*$/)?.[0] ?? '';
+		const expressionBody = trailingWhitespace ? expression.slice(0, -trailingWhitespace.length) : expression;
+		return {
+			label,
+			expression: `seqPLoop([${formatNumber(start)}, ${formatNumber(end)}, ${expressionBody}])${trailingWhitespace}`,
+		};
+	});
 }
 
 export function updateTrackMode(

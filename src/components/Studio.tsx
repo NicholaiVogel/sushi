@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
 	createInitialProject,
 	diagnosticFromError,
@@ -8,9 +8,12 @@ import {
 } from '../lib/project/model';
 import {
 	getSourceBlockDetails,
+	getSourceGlobals,
+	cyclesToSeconds,
 	updateTrackGain,
 	updateTrackMode,
 	updateTrackPan,
+	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
 import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
 import { StrudelAdapter, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
@@ -24,6 +27,7 @@ interface StudioState {
 	lastValid: string;
 	revision: number;
 	activeRevision: number | null;
+	songEndCycle: number;
 	diagnostics: SourceDiagnostic[];
 	phase: StudioPhase;
 	persistenceState: PersistenceState;
@@ -33,6 +37,8 @@ interface StudioState {
 type StudioCommand =
 	| { type: 'writeSource'; source: string }
 	| { type: 'play' }
+	| { type: 'pause' }
+	| { type: 'seek'; cycle: number }
 	| { type: 'stop' };
 
 function createInitialStudioState(): StudioState {
@@ -43,6 +49,7 @@ function createInitialStudioState(): StudioState {
 		lastValid: project.source.lastValid,
 		revision: project.source.revision,
 		activeRevision: 0,
+		songEndCycle: project.timeline.songEndCycle ?? 4,
 		diagnostics: [],
 		phase: 'booting',
 		persistenceState: 'loading',
@@ -66,6 +73,10 @@ function snapshotFromStudio(studio: StudioState): StoredProjectSnapshot {
 				draft: studio.draft,
 				lastValid: studio.lastValid,
 				revision: studio.revision,
+			},
+			timeline: {
+				...project.timeline,
+				songEndCycle: studio.songEndCycle,
 			},
 		},
 		activeRevision: studio.activeRevision,
@@ -107,6 +118,26 @@ function getTrackLabel(type: string): string {
 	return type === 'unknown' ? 'SOURCE' : type.toUpperCase();
 }
 
+function clamp(value: number, min: number, max: number): number {
+	return Math.max(min, Math.min(max, value));
+}
+
+function formatClock(seconds: number): string {
+	const totalSeconds = Math.max(0, Math.floor(seconds));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const remainder = totalSeconds % 60;
+	return [hours, minutes, remainder].map((value) => value.toString().padStart(2, '0')).join(':');
+}
+
+function formatCycle(cycle: number): string {
+	return Number(cycle.toFixed(2)).toString();
+}
+
+function formatKey(key: string): string {
+	return key.replace(':', ' ').toUpperCase();
+}
+
 export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
 	const studioRef = useRef(studio);
@@ -114,6 +145,9 @@ export default function Studio() {
 	const mountedRef = useRef(true);
 	const pendingTrackSourceRef = useRef<string | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const timingDragRef = useRef<{ trackId: string; edge: 'start' | 'end'; lane: HTMLElement } | null>(null);
+	const timelineSeekDragRef = useRef<HTMLElement | null>(null);
+	const timelineSeekCycleRef = useRef<number | null>(null);
 
 	const patchStudio = useCallback((patch: Partial<StudioState>) => {
 		const next = { ...studioRef.current, ...patch };
@@ -154,6 +188,7 @@ export default function Studio() {
 				lastValid: project.source.lastValid,
 				revision: project.source.revision,
 				activeRevision,
+				songEndCycle: project.timeline.songEndCycle ?? 4,
 				persistenceState,
 				runtime: { ...studioRef.current.runtime, activeRevision },
 			});
@@ -219,7 +254,7 @@ export default function Studio() {
 		}, 220);
 
 		return () => clearTimeout(timeout);
-	}, [patchStudio, studio.activeRevision, studio.draft, studio.lastValid, studio.persistenceState, studio.projectName, studio.revision]);
+	}, [patchStudio, studio.activeRevision, studio.draft, studio.lastValid, studio.persistenceState, studio.projectName, studio.revision, studio.songEndCycle]);
 
 	const commitSource = useCallback(
 		async (source: string): Promise<boolean> => {
@@ -303,6 +338,50 @@ export default function Studio() {
 		[patchStudio, queueTrackCommit],
 	);
 
+	const setTrackRange = useCallback(
+		(trackId: string, startCycle: number, endCycle: number) => updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, startCycle, endCycle)),
+		[updateTrackSource],
+	);
+
+	const handleTimingPointerMove = useCallback(
+		(event: PointerEvent) => {
+			const drag = timingDragRef.current;
+			if (!drag) return;
+
+			const rect = drag.lane.getBoundingClientRect();
+			if (!rect.width) return;
+			const nextCycle = clamp(Math.round(((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle * 4) / 4, 0, studioRef.current.songEndCycle);
+			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === drag.trackId);
+			if (!details) return;
+			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, details.timing.endCycle - 0.25) : details.timing.startCycle;
+			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, details.timing.startCycle + 0.25) : details.timing.endCycle;
+			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.min(studioRef.current.songEndCycle, endCycle));
+		},
+		[setTrackRange],
+	);
+
+	const stopTimingDrag = useCallback(() => {
+		timingDragRef.current = null;
+		window.removeEventListener('pointermove', handleTimingPointerMove);
+		window.removeEventListener('pointerup', stopTimingDrag);
+		window.removeEventListener('pointercancel', stopTimingDrag);
+	}, [handleTimingPointerMove]);
+
+	const startTimingDrag = useCallback(
+		(event: ReactPointerEvent<HTMLButtonElement>, trackId: string, edge: 'start' | 'end') => {
+			const lane = event.currentTarget.closest('.lane-grid');
+			if (!(lane instanceof HTMLElement)) return;
+			event.preventDefault();
+			timingDragRef.current = { trackId, edge, lane };
+			window.addEventListener('pointermove', handleTimingPointerMove);
+			window.addEventListener('pointerup', stopTimingDrag);
+			window.addEventListener('pointercancel', stopTimingDrag);
+		},
+		[handleTimingPointerMove, stopTimingDrag],
+	);
+
+	useEffect(() => stopTimingDrag, [stopTimingDrag]);
+
 	const setTrackGain = useCallback(
 		(trackId: string, value: number) => updateTrackSource(trackId, (source) => updateTrackGain(source, trackId, value)),
 		[updateTrackSource],
@@ -338,7 +417,7 @@ export default function Studio() {
 					if (!committed) return;
 				}
 
-				const result = await adapter.play();
+				const result = await adapter.play(current.songEndCycle);
 				if (result.ok) {
 					patchStudio({
 						phase: 'ready',
@@ -359,11 +438,42 @@ export default function Studio() {
 				return;
 			}
 
+			if (command.type === 'pause') {
+				const result = await adapter.pause();
+				if (result.ok) {
+					patchStudio({
+						phase: studioRef.current.diagnostics.length ? 'error' : 'ready',
+						runtime: { ...studioRef.current.runtime, transport: 'paused' },
+					});
+				} else {
+					patchStudio({
+						phase: 'error',
+						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
+						runtime: { ...studioRef.current.runtime, audioState: 'error' },
+					});
+				}
+				return;
+			}
+
+			if (command.type === 'seek') {
+				const targetCycle = clamp(command.cycle, 0, studioRef.current.songEndCycle);
+				const result = await adapter.seek(targetCycle);
+				if (result.ok) {
+					patchStudio({ runtime: { ...studioRef.current.runtime, currentCycle: targetCycle } });
+				} else {
+					patchStudio({
+						phase: 'error',
+						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
+					});
+				}
+				return;
+			}
+
 			const result = await adapter.stop();
 			if (result.ok) {
 				patchStudio({
 					phase: studioRef.current.diagnostics.length ? 'error' : 'ready',
-					runtime: { ...studioRef.current.runtime, transport: 'stopped' },
+					runtime: { ...studioRef.current.runtime, transport: 'stopped', currentCycle: 0 },
 				});
 			} else {
 				patchStudio({
@@ -376,15 +486,97 @@ export default function Studio() {
 		[cancelPendingTrackCommit, commitSource, patchStudio],
 	);
 
+	const seekTimelineAtClientX = useCallback(
+		(clientX: number, ruler: HTMLElement) => {
+			const rect = ruler.getBoundingClientRect();
+			if (!rect.width) return;
+			const songEndCycle = studioRef.current.songEndCycle;
+			const cycle = clamp(Math.round(((clientX - rect.left) / rect.width) * songEndCycle * 4) / 4, 0, songEndCycle);
+			if (timelineSeekCycleRef.current === cycle) return;
+			timelineSeekCycleRef.current = cycle;
+			void dispatch({ type: 'seek', cycle });
+		},
+		[dispatch],
+	);
+
+	const handleTimelineSeekPointerMove = useCallback(
+		(event: PointerEvent) => {
+			const ruler = timelineSeekDragRef.current;
+			if (ruler) seekTimelineAtClientX(event.clientX, ruler);
+		},
+		[seekTimelineAtClientX],
+	);
+
+	const stopTimelineSeekDrag = useCallback(() => {
+		timelineSeekDragRef.current = null;
+		timelineSeekCycleRef.current = null;
+		window.removeEventListener('pointermove', handleTimelineSeekPointerMove);
+		window.removeEventListener('pointerup', stopTimelineSeekDrag);
+		window.removeEventListener('pointercancel', stopTimelineSeekDrag);
+	}, [handleTimelineSeekPointerMove]);
+
+	const startTimelineSeekDrag = useCallback(
+		(event: ReactPointerEvent<HTMLButtonElement>) => {
+			if (event.button !== 0) return;
+			const ruler = event.currentTarget.closest('.timeline-ruler');
+			if (!(ruler instanceof HTMLElement)) return;
+			event.preventDefault();
+			timelineSeekDragRef.current = ruler;
+			timelineSeekCycleRef.current = null;
+			seekTimelineAtClientX(event.clientX, ruler);
+			window.addEventListener('pointermove', handleTimelineSeekPointerMove);
+			window.addEventListener('pointerup', stopTimelineSeekDrag);
+			window.addEventListener('pointercancel', stopTimelineSeekDrag);
+		},
+		[handleTimelineSeekPointerMove, seekTimelineAtClientX, stopTimelineSeekDrag],
+	);
+
+	const handleTimelineSeekKeyDown = useCallback(
+		(event: ReactKeyboardEvent<HTMLButtonElement>) => {
+			const currentCycle = clamp(studioRef.current.runtime.currentCycle, 0, studioRef.current.songEndCycle);
+			let nextCycle: number | null = null;
+			switch (event.key) {
+				case 'ArrowLeft':
+					nextCycle = currentCycle - 0.25;
+					break;
+				case 'ArrowRight':
+					nextCycle = currentCycle + 0.25;
+					break;
+				case 'PageUp':
+					nextCycle = currentCycle - 1;
+					break;
+				case 'PageDown':
+					nextCycle = currentCycle + 1;
+					break;
+				case 'Home':
+					nextCycle = 0;
+					break;
+				case 'End':
+					nextCycle = studioRef.current.songEndCycle;
+					break;
+				default:
+					return;
+			}
+			event.preventDefault();
+			void dispatch({ type: 'seek', cycle: clamp(nextCycle, 0, studioRef.current.songEndCycle) });
+		},
+		[dispatch],
+	);
+
+	useEffect(() => stopTimelineSeekDrag, [stopTimelineSeekDrag]);
+
 	const blocks = useMemo(() => getSourceBlocks(studio.lastValid), [studio.lastValid]);
 	const draftBlocks = useMemo(() => getSourceBlocks(studio.draft), [studio.draft]);
 	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft).map((block) => [block.id, block])), [studio.draft]);
 	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid).map((block) => [block.id, block])), [studio.lastValid]);
+	const sourceGlobals = useMemo(() => getSourceGlobals(studio.lastValid), [studio.lastValid]);
 	const isDirty = studio.draft !== studio.lastValid;
 	const isBusy = studio.phase === 'booting' || studio.phase === 'validating';
 	const canPlay = !isBusy && studio.runtime.audioState !== 'initializing';
 	const draftLines = useMemo(() => getLineNumbers(studio.draft), [studio.draft]);
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
+	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
+	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 
 	return (
@@ -411,15 +603,17 @@ export default function Studio() {
 							</button>
 						</div>
 						<span className="topbar-action-divider" aria-hidden="true" />
-						<button className="transport-button transport-stop" type="button" onClick={() => void dispatch({ type: 'stop' })} disabled={!canPlay || studio.runtime.transport === 'stopped'} aria-label="Stop playback">■</button>
-						<button className="transport-button transport-play" type="button" onClick={() => void dispatch({ type: 'play' })} disabled={!canPlay} aria-label="Play accepted source">▶</button>
-						<span className="transport-clock" aria-live="polite">00:00:00</span>
+						<button className="transport-button transport-stop" type="button" onClick={() => void dispatch({ type: 'stop' })} disabled={!canPlay || (studio.runtime.transport === 'stopped' && studio.runtime.currentCycle === 0)} aria-label="Stop playback" title="Stop and return to cycle zero">■</button>
+						<button className="transport-button transport-play" type="button" onClick={() => void dispatch({ type: 'play' })} disabled={!canPlay} aria-label={studio.runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'} title={studio.runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'}>▶</button>
+						<button className="transport-button transport-pause" type="button" onClick={() => void dispatch({ type: 'pause' })} disabled={!canPlay || studio.runtime.transport !== 'playing'} aria-label="Pause playback" title="Pause at the current cycle">Ⅱ</button>
+						<span className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>
+						<span className="transport-cycle" aria-live="polite">CYCLE {formatCycle(studio.runtime.currentCycle)}</span>
 						<span className="transport-divider" aria-hidden="true" />
-						<span className="transport-readout">{studio.runtime.transport === 'playing' ? 'PLAYING' : 'STOPPED'}</span>
+						<span className="transport-readout">{studio.runtime.transport.toUpperCase()}</span>
 					</div>
 				</div>
 				<div className="topbar-right">
-					<div className="topbar-metrics" aria-label="Project settings"><span>84 BPM</span><span>4/4</span><span>E MIN</span></div>
+					<div className="topbar-metrics" aria-label="Project settings"><span>{formatCycle(sourceGlobals.bpm)} BPM</span><span>{formatCycle(sourceGlobals.quarterNotesPerCycle)} Q/C</span><span>{formatKey(sourceGlobals.key)}</span><span>{formatCycle(songEndSeconds)}s</span></div>
 				</div>
 			</header>
 
@@ -462,15 +656,24 @@ export default function Studio() {
 								<div className="arrangement-toolbar">
 									<button className="add-track-button" type="button" onClick={() => void addTrack()} disabled={isBusy} aria-label="Add track"><span aria-hidden="true">＋</span> Add track</button>
 								</div>
+								<span className="timeline-duration">{formatCycle(studio.songEndCycle)} cycles · {formatCycle(songEndSeconds)}s</span>
 								<span className="sr-only" id="timeline-heading">{activeLaneCount} source lanes</span>
 							</div>
-							<div className="timeline-ruler" aria-label="Arrangement beats">{BEAT_LABELS.map((label, index) => <span className={index % 4 === 0 ? 'bar-number' : ''} key={label}>{label}</span>)}</div>
+							<div className="timeline-ruler" aria-label="Arrangement beats">
+								{BEAT_LABELS.map((label, index) => <span className={index % 4 === 0 ? 'bar-number' : ''} key={label}>{label}</span>)}
+								<button className="timeline-seek-surface" type="button" onPointerDown={startTimelineSeekDrag} onKeyDown={handleTimelineSeekKeyDown} disabled={isBusy} aria-label={`Seek playhead, cycle ${formatCycle(studio.runtime.currentCycle)}, ${formatClock(currentSeconds)}`} title="Click or drag to seek" />
+								<i className="timeline-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
+							</div>
 						</div>
 						{blocks.map((block, index) => {
 							const trackColor = getTrackColor(index);
 							const trackDetails = draftTrackDetails.get(block.id) ?? validTrackDetails.get(block.id);
 							const gain = trackDetails?.gain ?? 1;
 							const pan = trackDetails?.pan ?? 0.5;
+							const timing = trackDetails?.timing ?? { mode: 'full' as const, startCycle: 0, endCycle: studio.songEndCycle };
+							const clipStart = clamp(timing.startCycle / studio.songEndCycle, 0, 1);
+							const clipEnd = clamp(timing.endCycle / studio.songEndCycle, clipStart + 0.01, 1);
+							const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
 							return (
 								<div className="track-lane" key={block.id}>
 									<div className="track-header" style={{ '--track-color': trackColor } as CSSProperties}>
@@ -499,14 +702,18 @@ export default function Studio() {
 									</div>
 									<div className="lane-grid" style={{ '--track-color': trackColor } as CSSProperties}>
 										<div className="lane-grid-lines" aria-hidden="true">{BEAT_LABELS.map((_, cell) => <span className={cell % 4 === 0 ? 'beat-start' : ''} key={cell} />)}</div>
-										<div className="pattern-region"><span>{block.name.toUpperCase()}</span><small>STRUDEL SOURCE</small></div>
-										<span className={`lane-playhead ${studio.runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} aria-hidden="true" />
+										<div className="pattern-region" style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd } as CSSProperties} title={`${block.name}: ${timingLabel}`}>
+											<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -0.25 : 0.25; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - 0.25), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
+											<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
+											<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -0.25 : 0.25; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + 0.25, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
+										</div>
+										<span className={`lane-playhead ${studio.runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
 									</div>
 								</div>
 							);
 						})}
 						<div className="master-lane"><div className="track-header master-header"><span className="track-number">—</span><span className="master-mark" aria-hidden="true">∿</span><div className="track-name-wrap"><strong>MASTER</strong><span>OUTPUT BUS <span aria-hidden="true">·</span> STRUDEL</span></div><span className="master-db">0.0 dB</span></div><div className="master-meter" aria-label="Master output meter">{TRACK_LEVELS.slice(0, 12).map((level, index) => <span key={index} style={{ '--level': `${level}%` } as CSSProperties} />)}</div></div>
-						<div className="timeline-fill" aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines">{BEAT_LABELS.map((_, cell) => <span className={cell % 4 === 0 ? 'beat-start' : ''} key={cell} />)}</div></div></div>
+						<div className="timeline-fill" aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines">{BEAT_LABELS.map((_, cell) => <span className={cell % 4 === 0 ? 'beat-start' : ''} key={cell} />)}</div><span className="lane-playhead timeline-fill-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} /></div></div>
 					</section>
 
 					{studio.diagnostics.length ? <div className="canvas-diagnostic" role="status" aria-live="polite"><div className="diagnostic-meta"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span>{getDiagnosticLocation(studio.diagnostics[0]) || `REV ${formatRevision(studio.diagnostics[0].revision)}`}</span></div><p>{studio.diagnostics[0].message}</p>{studio.diagnostics[0].context ? <code className="diagnostic-context">{studio.diagnostics[0].context}</code> : null}</div> : null}
