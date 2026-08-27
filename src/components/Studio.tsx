@@ -14,7 +14,6 @@ import {
 import {
 	getSourceBlockDetails,
 	getSourceGlobals,
-	getTrackDisplayTiming,
 	cyclesToSeconds,
 	updateSourceKey,
 	updateSourceQuarterNotesPerCycle,
@@ -31,7 +30,6 @@ import { getSourceLineNumbers } from '../lib/project/editor';
 import {
 	clampTimelineZoom,
 	DEFAULT_TIMELINE_ZOOM,
-	getTimelineCellWidth,
 	getTimelineCells,
 	MAX_TIMELINE_ZOOM,
 	MIN_TIMELINE_ZOOM,
@@ -2049,7 +2047,6 @@ export default function Studio() {
 	const cycleStep = getSourceCycleStep(studio.lastValid);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
-	const timelineCellWidth = getTimelineCellWidth(arrangementZoom);
 	const timelineCellCount = Math.max(1, Math.ceil(studio.songEndCycle / TIMELINE_SNAP_CYCLE));
 	const timelineSongCycles = Math.max(TIMELINE_SNAP_CYCLE, studio.songEndCycle);
 	const zoomOutCycles = Math.max(1, Math.min(timelineSongCycles, DEFAULT_SONG_END_CYCLE));
@@ -2237,22 +2234,9 @@ export default function Studio() {
 							const gain = trackDetails?.gain ?? 1;
 							const pan = trackDetails?.pan ?? 0.5;
 							const timing = getTrackTimingForTimeline(trackDetails, studio.songEndCycle);
-							const displayTiming = getTrackDisplayTiming(timing, studio.songEndCycle);
-							// A newly created lane is a four-bar editable clip even though
-							// its source pattern is repeatable. Use the range duration—not
-							// the absolute end—so moving a four-bar clip past bar four
-							// does not turn it into a full-project visual span.
-							const showLoopSpan = displayTiming.repeating && timing.endCycle - timing.startCycle > DEFAULT_TRACK_END_CYCLE;
 							const clipStart = clamp(timing.startCycle / studio.songEndCycle, 0, 1);
-							const clipEnd = clamp((showLoopSpan ? displayTiming.displayEndCycle : timing.endCycle) / studio.songEndCycle, clipStart + 0.01, 1);
-							const loopHandlePosition = clipEnd > clipStart
-								? clamp((timing.endCycle / studio.songEndCycle - clipStart) / (clipEnd - clipStart), 0.01, 1)
-								: 1;
-							const loopWidth = Math.max(1, (timing.endCycle - timing.startCycle) * Math.max(1, Math.round(sourceGlobals.quarterNotesPerCycle)) * timelineCellWidth);
+							const clipEnd = clamp(timing.endCycle / studio.songEndCycle, clipStart + 0.01, 1);
 							const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
-							const displayLabel = showLoopSpan
-								? `${timingLabel} · LOOP TO ${formatCycle(displayTiming.displayEndCycle)}`
-								: timingLabel;
 							return (
 								<div
 									className={`track-lane ${selectedTrackId === block.id ? 'track-lane-selected' : ''}`}
@@ -2329,8 +2313,8 @@ export default function Studio() {
 									<div className="lane-grid" style={{ ...timelineGridStyle, '--track-color': trackColor } as CSSProperties}>
 										<div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-hidden="true">{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'beat-start' : ''} key={index} />)}</div>
 										<div
-											className={`pattern-region ${showLoopSpan ? 'pattern-region-looping' : ''}`}
-											style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd, '--loop-handle-position': loopHandlePosition, '--loop-width': `${loopWidth}px` } as CSSProperties}
+											className="pattern-region"
+											style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd } as CSSProperties}
 											onPointerDown={(event) => startTimingDrag(event, block.id, 'move')}
 											onKeyDown={(event) => {
 												if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
@@ -2345,7 +2329,7 @@ export default function Studio() {
 											title={`${block.name}: drag to move in quarter-cycle steps`}
 										>
 											<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - TIMELINE_SNAP_CYCLE), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
-											<span>{block.name.toUpperCase()}</span><small>{displayLabel}</small>
+											<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
 											<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + TIMELINE_SNAP_CYCLE, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
 										</div>
 										<span className={`lane-playhead ${studio.runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
