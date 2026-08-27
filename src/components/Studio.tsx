@@ -196,10 +196,6 @@ function formatCycle(cycle: number): string {
 	return Number(cycle.toFixed(2)).toString();
 }
 
-function formatKey(key: string): string {
-	return key.replace(':', ' ').toUpperCase();
-}
-
 function getExplicitSourceEndCycle(source: string): number {
 	return getSourceBlockDetails(source)
 		.filter((block) => block.timing.mode !== 'full')
@@ -841,7 +837,9 @@ export default function Studio() {
 		const link = document.createElement('a');
 		link.href = url;
 		link.download = projectFileName(studioRef.current.projectName);
+		document.body?.append(link);
 		link.click();
+		link.remove();
 		window.setTimeout(() => URL.revokeObjectURL(url), 0);
 	}, []);
 

@@ -86,6 +86,27 @@ describe('WebMCP tool adapter', () => {
 		}
 	});
 
+	test('prefers the canonical document model context over legacy host fallbacks', () => {
+		const host = globalThis as typeof globalThis & {
+			document?: { modelContext?: WebMCP.ModelContext };
+			modelContext?: WebMCP.ModelContext;
+		};
+		const previousDocument = Object.getOwnPropertyDescriptor(host, 'document');
+		const previousContext = Object.getOwnPropertyDescriptor(host, 'modelContext');
+		const canonical = { registerTool: async () => undefined } as unknown as WebMCP.ModelContext;
+		const legacy = { registerTool: async () => undefined } as unknown as WebMCP.ModelContext;
+		Object.defineProperty(host, 'document', { configurable: true, value: { modelContext: canonical } });
+		Object.defineProperty(host, 'modelContext', { configurable: true, value: legacy });
+		try {
+			expect(getNativeModelContext()).toBe(canonical);
+		} finally {
+			if (previousDocument) Object.defineProperty(host, 'document', previousDocument);
+			else Reflect.deleteProperty(host, 'document');
+			if (previousContext) Object.defineProperty(host, 'modelContext', previousContext);
+			else Reflect.deleteProperty(host, 'modelContext');
+		}
+	});
+
 	test('ignores a host model-context getter that throws', () => {
 		const host = globalThis as typeof globalThis & { modelContext?: WebMCP.ModelContext };
 		const previous = Object.getOwnPropertyDescriptor(host, 'modelContext');
