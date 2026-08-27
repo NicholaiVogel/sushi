@@ -25,6 +25,7 @@ The current vertical slice is a source-first DAW workstation at `/`:
 - **Add track** appends a valid synth block to the source and commits it through the same Strudel evaluation path as an editor change.
 - Track gain and pan controls rewrite numeric `.gain(...)` and `.pan(...)` calls in the marked Strudel expression and evaluate the updated source immediately.
 - Mute and solo use Strudel's source labels (`_$:` and `S$:`), so their state is visible and editable in the source editor. Unsupported chain values remain source-visible and are not presented as editable scalar controls.
+- Project name, draft source, last-valid source, and revisions autosave to IndexedDB and restore before the initial Strudel evaluation.
 - `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns Play/Stop.
 - Source edits stay in a draft until **Commit source** evaluates them through Strudel.
 - Failed evaluations remain visible as diagnostics while the last-valid source and active revision stay playable.

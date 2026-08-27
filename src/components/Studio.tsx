@@ -12,9 +12,11 @@ import {
 	updateTrackMode,
 	updateTrackPan,
 } from '../lib/project/source-mapper';
+import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
 import { StrudelAdapter, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
 
 type StudioPhase = 'booting' | 'ready' | 'validating' | 'error';
+type PersistenceState = 'loading' | 'ready' | 'unavailable';
 
 interface StudioState {
 	projectName: string;
@@ -24,6 +26,7 @@ interface StudioState {
 	activeRevision: number | null;
 	diagnostics: SourceDiagnostic[];
 	phase: StudioPhase;
+	persistenceState: PersistenceState;
 	runtime: RuntimeState;
 }
 
@@ -42,12 +45,30 @@ function createInitialStudioState(): StudioState {
 		activeRevision: 0,
 		diagnostics: [],
 		phase: 'booting',
+		persistenceState: 'loading',
 		runtime: {
 			audioState: 'initializing',
 			transport: 'stopped',
 			activeRevision: 0,
 			currentCycle: 0,
 		},
+	};
+}
+
+function snapshotFromStudio(studio: StudioState): StoredProjectSnapshot {
+	const project = createInitialProject();
+	return {
+		project: {
+			...project,
+			name: studio.projectName,
+			source: {
+				...project.source,
+				draft: studio.draft,
+				lastValid: studio.lastValid,
+				revision: studio.revision,
+			},
+		},
+		activeRevision: studio.activeRevision,
 	};
 }
 
@@ -108,6 +129,29 @@ export default function Studio() {
 		adapterRef.current = adapter;
 
 		const boot = async () => {
+			const fallbackProject = createInitialProject();
+			let stored: StoredProjectSnapshot | null = null;
+			let persistenceState: PersistenceState = 'ready';
+
+			try {
+				stored = await loadProjectSnapshot(fallbackProject.id);
+			} catch {
+				persistenceState = 'unavailable';
+			}
+
+			if (!mountedRef.current) return;
+			const project = stored?.project ?? fallbackProject;
+			const activeRevision = stored?.activeRevision ?? project.source.revision;
+			patchStudio({
+				projectName: project.name,
+				draft: project.source.draft,
+				lastValid: project.source.lastValid,
+				revision: project.source.revision,
+				activeRevision,
+				persistenceState,
+				runtime: { ...studioRef.current.runtime, activeRevision },
+			});
+
 			try {
 				await adapter.init();
 				if (!mountedRef.current) return;
@@ -125,13 +169,13 @@ export default function Studio() {
 							...studioRef.current.runtime,
 							audioState: 'locked',
 							transport: 'stopped',
-							activeRevision: 0,
+							activeRevision,
 						},
 					});
 				} else {
 					patchStudio({
 						phase: 'error',
-						diagnostics: [diagnosticFromError(0, initial.error)],
+						diagnostics: [diagnosticFromError(activeRevision, initial.error)],
 						runtime: {
 							...studioRef.current.runtime,
 							audioState: 'error',
@@ -143,7 +187,7 @@ export default function Studio() {
 				if (!mountedRef.current) return;
 				patchStudio({
 					phase: 'error',
-					diagnostics: [getErrorDiagnostic(0, error, 'audio')],
+					diagnostics: [getErrorDiagnostic(activeRevision, error, 'audio')],
 					runtime: { ...studioRef.current.runtime, audioState: 'error', activeRevision: null },
 				});
 			}
@@ -156,6 +200,21 @@ export default function Studio() {
 			adapterRef.current = null;
 		};
 	}, [patchRuntime, patchStudio]);
+
+	useEffect(() => {
+		if (studio.persistenceState !== 'ready') return undefined;
+
+		const snapshot = snapshotFromStudio(studioRef.current);
+		const timeout = setTimeout(() => {
+			void saveProjectSnapshot(snapshot.project.id, snapshot).catch(() => {
+				if (mountedRef.current && studioRef.current.persistenceState === 'ready') {
+					patchStudio({ persistenceState: 'unavailable' });
+				}
+			});
+		}, 220);
+
+		return () => clearTimeout(timeout);
+	}, [patchStudio, studio.activeRevision, studio.draft, studio.lastValid, studio.persistenceState, studio.projectName, studio.revision]);
 
 	const commitSource = useCallback(
 		async (source: string): Promise<boolean> => {
@@ -318,6 +377,7 @@ export default function Studio() {
 	const canPlay = !isBusy && studio.runtime.audioState !== 'initializing';
 	const draftLines = useMemo(() => getLineNumbers(studio.draft), [studio.draft]);
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
+	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 
 	return (
 		<div className="studio-shell">
@@ -331,7 +391,7 @@ export default function Studio() {
 					<div className="session-name-row">
 						<label className="sr-only" htmlFor="project-name">Project name</label>
 						<input id="project-name" className="project-name-input" value={studio.projectName ?? 'First light'} onChange={(event) => patchStudio({ projectName: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} aria-label="Project name" title="Rename project" />
-						<span className={`save-state ${isDirty ? 'save-state-dirty' : ''}`}><span className="save-dot" aria-hidden="true" />{isDirty ? 'DRAFT' : 'SAVED'}</span>
+						<span className={`save-state ${isDirty || studio.persistenceState === 'loading' ? 'save-state-dirty' : ''}`} title={studio.persistenceState === 'unavailable' ? 'IndexedDB is unavailable; this session will not persist after reload.' : 'Project state is saved locally'}><span className="save-dot" aria-hidden="true" />{saveStateLabel}</span>
 					</div>
 					<div className="topbar-transport" aria-label="Transport controls">
 						<div className="topbar-source-actions" aria-label="Source actions">
