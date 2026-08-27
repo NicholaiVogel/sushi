@@ -179,7 +179,10 @@ function formatRevision(revision: number | null): string {
 }
 
 function getErrorDiagnostic(revision: number, error: unknown, phase: SourceDiagnostic['phase'], source: string) {
-	const diagnostic = diagnosticFromError(revision, error, source);
+	// Browser audio errors often carry an implementation-generated lineNumber
+	// (Firefox commonly reports 1:1). They are transport failures, not source
+	// locations, so do not attach that misleading range to an audio diagnostic.
+	const diagnostic = diagnosticFromError(revision, error, phase === 'audio' ? '' : source);
 	return { ...diagnostic, phase };
 }
 

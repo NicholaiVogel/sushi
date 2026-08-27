@@ -391,6 +391,116 @@ describe('StrudelAdapter evaluation queue', () => {
 		}
 	});
 
+	test('keeps playback running when a browser cannot decode an audio asset', async () => {
+		const calls: string[] = [];
+		let starts = 0;
+		let beforeStart: (() => void | Promise<void>) | undefined;
+		const scheduler = { cps: 0.5, now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
+		const pattern = {
+			queryArc: () => [{ value: { s: 'bd', n: 0 }, hasOnset: () => true }],
+		};
+		const fakeModule = {
+			initStrudel: async (options?: { beforeStart?: () => void | Promise<void> }) => {
+				beforeStart = options?.beforeStart;
+				return {
+					evaluate: async () => pattern,
+					start: async () => {
+						await beforeStart?.();
+						starts += 1;
+					},
+					stop: () => undefined,
+					pause: () => undefined,
+					scheduler,
+				};
+			},
+			getSound: () => ({ data: { type: 'sample', samples: ['https://example.test/bd.wav'] } }),
+			getSampleBuffer: async () => {
+				calls.push('preload');
+				throw new Error('decodeAudioData failed');
+			},
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			expect(await adapter.evaluateSource('$: s("bd")')).toEqual({ ok: true });
+			expect(await adapter.play(4)).toEqual({ ok: true });
+			expect(calls).toEqual(['preload']);
+			expect(starts).toBe(1);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
+
+	test('does not turn optional sample-map failures into an evaluation failure', async () => {
+		const calls: string[] = [];
+		let starts = 0;
+		let beforeStart: (() => void | Promise<void>) | undefined;
+		const scheduler = { cps: 0.5, now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
+		const pattern = { queryArc: () => [] };
+		const fakeModule = {
+			initStrudel: async (options?: { prebake?: () => void | Promise<void>; beforeStart?: () => void | Promise<void> }) => {
+				await options?.prebake?.();
+				beforeStart = options?.beforeStart;
+				return {
+					evaluate: async () => pattern,
+					start: async () => {
+						await beforeStart?.();
+						starts += 1;
+					},
+					stop: () => undefined,
+					pause: () => undefined,
+					scheduler,
+				};
+			},
+			samples: async (path: string) => {
+				calls.push(path);
+				throw new Error('sample map request blocked');
+			},
+			aliasBank: async () => {
+				calls.push('aliases');
+				throw new Error('alias map request blocked');
+			},
+			registerSound: () => undefined,
+			getAudioContext: () => ({ state: 'running' }) as unknown as AudioContext,
+			getADSRValues: () => [0, 0, 1, 0],
+			getParamADSR: () => undefined,
+			getSoundIndex: () => 0,
+			getPitchEnvelope: () => undefined,
+			onceEnded: () => undefined,
+			releaseAudioNode: () => undefined,
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			expect(await adapter.evaluateSource('accepted')).toEqual({ ok: true });
+			expect(await adapter.play(4)).toEqual({ ok: true });
+			expect(calls).toEqual([
+				'github:tidalcycles/dirt-samples',
+				'https://strudel.b-cdn.net/tidal-drum-machines.json',
+				'aliases',
+			]);
+			expect(starts).toBe(1);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
+
 	test('preloads static sounds from a pasted source without relying on a fragile pattern query', async () => {
 		const calls: string[] = [];
 		const scheduler = { cps: 0.5, now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };

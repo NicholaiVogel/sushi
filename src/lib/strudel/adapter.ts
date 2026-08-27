@@ -1,4 +1,5 @@
 import { DEFAULT_SONG_END_CYCLE, type AudioState, type TransportState } from '../project/model';
+import soundfontDefinitions from '@strudel/soundfonts/gm.mjs';
 
 interface StrudelModule {
 	initStrudel(options?: {
@@ -55,6 +56,8 @@ type PreloadValue = Record<string, any> & {
 };
 
 const MAX_PRELOAD_HAPS = 4096;
+const MAX_PRELOAD_VARIANTS = 24;
+const AUDIO_ASSET_TIMEOUT_MS = 8_000;
 
 const soundCallPattern = /(?:^|[.\s])(?:s|sound)\s*\(\s*(['"`])([\s\S]*?)\1\s*\)/g;
 const directSoundPattern = /\(\s*(['"`])([\s\S]*?)\1\s*\)\s*\.note\s*\(/g;
@@ -84,7 +87,7 @@ function collectSourceAudioAssets(source: string): SourceAudioAsset[] {
 
 	return [...assets.entries()].map(([name, assetNotes]) => ({
 		name,
-		notes: [...(assetNotes.size ? assetNotes : notes)].slice(0, 64),
+		notes: [...(assetNotes.size ? assetNotes : notes)].slice(0, MAX_PRELOAD_VARIANTS),
 	}));
 }
 
@@ -99,16 +102,51 @@ function appendRuntimeSilence(source: string): string {
 }
 
 let soundfontRuntimePromise: Promise<SoundfontRuntime> | undefined;
-let soundfontDefinitionsPromise: Promise<{ default: SoundfontDefinition }> | undefined;
 
 function loadSoundfontRuntime(): Promise<SoundfontRuntime> {
 	if (!soundfontRuntimePromise) soundfontRuntimePromise = import('@strudel/soundfonts') as Promise<SoundfontRuntime>;
 	return soundfontRuntimePromise;
 }
 
-function loadSoundfontDefinitions(): Promise<{ default: SoundfontDefinition }> {
-	if (!soundfontDefinitionsPromise) soundfontDefinitionsPromise = import('@strudel/soundfonts/gm.mjs') as Promise<{ default: SoundfontDefinition }>;
-	return soundfontDefinitionsPromise;
+function reportAudioAssetIssue(label: string, error: unknown): void {
+	const message = error instanceof Error ? error.message : String(error);
+	console.warn(`[sushi] ${label} could not be prepared; playback will continue without it. ${message}`);
+}
+
+/**
+ * Audio assets are an optional runtime dependency. A failed fetch/decode must
+ * not reject the scheduler's start, and a decoder that never calls either
+ * callback must not leave the transport stuck in PREPARING forever (Firefox's
+ * decodeAudioData implementation has historically exposed both behaviors for
+ * unsupported data).
+ */
+function settleAudioAsset(start: () => Promise<unknown> | unknown, label: string): Promise<void> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			resolve();
+		};
+		const timeout = setTimeout(() => {
+			reportAudioAssetIssue(label, new Error(`timed out after ${AUDIO_ASSET_TIMEOUT_MS}ms`));
+			finish();
+		}, AUDIO_ASSET_TIMEOUT_MS);
+
+		let task: Promise<unknown>;
+		try {
+			task = Promise.resolve(start());
+		} catch (error) {
+			reportAudioAssetIssue(label, error);
+			finish();
+			return;
+		}
+		task.then(finish, (error) => {
+			reportAudioAssetIssue(label, error);
+			finish();
+		});
+	});
 }
 
 /**
@@ -122,11 +160,10 @@ async function registerSoundfontsOnModule(module: StrudelModule): Promise<void> 
 		throw new Error('The Strudel runtime does not expose the soundfont registration hooks.');
 	}
 
-	const [soundfontRuntime, definitionsModule] = await Promise.all([
-		loadSoundfontRuntime(),
-		loadSoundfontDefinitions(),
-	]);
-	const definitions = definitionsModule.default;
+	// Keep the instrument table local and deterministic. The soundfont runtime
+	// itself is loaded lazily from the trigger/preload path because it brings in
+	// browser-only Web Audio helpers and should not be able to break source boot.
+	const definitions = soundfontDefinitions as SoundfontDefinition;
 	Object.entries(definitions).forEach(([name, fonts]) => {
 		module.registerSound?.(name, async (time, value, onended) => {
 			const [attack, decay, sustain, release] = module.getADSRValues?.([
@@ -141,6 +178,7 @@ async function registerSoundfontsOnModule(module: StrudelModule): Promise<void> 
 			const context = module.getAudioContext?.();
 			if (!context || !font) throw new Error(`Could not load soundfont ${name}`);
 
+			const soundfontRuntime = await loadSoundfontRuntime();
 			const bufferSource = await soundfontRuntime.getFontBufferSource(font, value, context);
 			bufferSource.start(time);
 			const envGain = context.createGain();
@@ -236,6 +274,7 @@ export class StrudelAdapter {
 	private activePattern: StrudelPattern | undefined;
 	private activeSource = '';
 	private preloadPromise: Promise<void> | undefined;
+	private sampleBankPromise: Promise<void> | undefined;
 	private initPromise: Promise<void> | undefined;
 	private evaluationQueue: Promise<void> = Promise.resolve();
 	private activeEvaluation: { error: unknown } | undefined;
@@ -274,15 +313,11 @@ export class StrudelAdapter {
 					// evaluating user code, so ordinary Strudel snippets resolve the same
 					// sounds in Sushi instead of silently dropping unsupported layers.
 					await registerSoundfontsOnModule(module);
-					await Promise.all([
-						module.samples?.('github:tidalcycles/dirt-samples', undefined, { prebake: true }),
-						module.samples?.(
-							'https://strudel.b-cdn.net/tidal-drum-machines.json',
-							'https://strudel.b-cdn.net/tidal-drum-machines/machines/',
-							{ prebake: true, tag: 'drum-machines' },
-						),
-					]);
-					await module.aliasBank?.('https://strudel.b-cdn.net/tidal-drum-machines-alias.json');
+					// Fetching the optional sample maps during init made a CORS/CDN or
+					// decoder failure look like a source-evaluation failure and prevented
+					// Firefox from reaching the first user-gesture Play. Start the work in
+					// the background; beforeStart waits for this bounded, best-effort task.
+					this.sampleBankPromise = this.preloadSampleBanks(module);
 				},
 				beforeStart: () => this.preloadActivePattern(),
 				onEvalError: (error) => {
@@ -323,6 +358,7 @@ export class StrudelAdapter {
 			this.activePattern = undefined;
 			this.activeSource = '';
 			this.preloadPromise = undefined;
+			this.sampleBankPromise = undefined;
 			this.activeEvaluation = undefined;
 			this.stopCycleTimer();
 			try {
@@ -641,6 +677,27 @@ export class StrudelAdapter {
 		if ((context.state as AudioContextState) !== 'running') throw new AudioLockedError();
 	}
 
+	private async preloadSampleBanks(module: StrudelModule): Promise<void> {
+		await Promise.all([
+			settleAudioAsset(
+				() => module.samples?.('github:tidalcycles/dirt-samples', undefined, { prebake: true }),
+				'the Dirt sample map',
+			),
+			settleAudioAsset(
+				() => module.samples?.(
+					'https://strudel.b-cdn.net/tidal-drum-machines.json',
+					'https://strudel.b-cdn.net/tidal-drum-machines/machines/',
+					{ prebake: true, tag: 'drum-machines' },
+				),
+				'the drum-machine sample map',
+			),
+		]);
+		await settleAudioAsset(
+			() => module.aliasBank?.('https://strudel.b-cdn.net/tidal-drum-machines-alias.json'),
+			'the drum-machine aliases',
+		);
+	}
+
 	/** Update the finite transport boundary without restarting the REPL. */
 	public setSongEndCycle(songEndCycle?: number): void {
 		const nextEndCycle = Number.isFinite(songEndCycle) && songEndCycle !== undefined && songEndCycle > 0 ? songEndCycle : undefined;
@@ -676,6 +733,7 @@ export class StrudelAdapter {
 
 		this.preloadPromise = (async () => {
 			this.setRuntime({ audioState: 'initializing' });
+			if (this.sampleBankPromise) await this.sampleBankPromise;
 			const endCycle = this.songEndCycle ?? DEFAULT_SONG_END_CYCLE;
 			const cps = typeof repl.scheduler.cps === 'number' && Number.isFinite(repl.scheduler.cps) ? repl.scheduler.cps : 0.5;
 			const audioContext = module.getAudioContext?.();
@@ -683,9 +741,10 @@ export class StrudelAdapter {
 			const pending = new Map<string, Promise<unknown>>();
 			const enqueueSound = async (soundName: string, data: Record<string, any> | undefined, notes: Array<string | number>, values: PreloadValue[] = []) => {
 				if (!data || typeof data !== 'object') return;
-				const variants: PreloadValue[] = values.length
+				const variants: PreloadValue[] = (values.length
 					? values
-					: (notes.length ? notes : ['c3']).map((note) => ({ note }));
+					: (notes.length ? notes : ['c3']).map((note) => ({ note })))
+					.slice(0, MAX_PRELOAD_VARIANTS);
 
 				if (data.type === 'sample' && data.samples && module.getSampleBuffer) {
 					// Array banks select a file with `n`; note-keyed banks select a
@@ -694,11 +753,16 @@ export class StrudelAdapter {
 					// that the scheduler will request.
 					const sampleVariants = Array.isArray(data.samples)
 						? (values.length ? variants : [{ note: notes[0] ?? 'c3', n: 0 }])
-						: variants;
+						: variants.slice(0, MAX_PRELOAD_VARIANTS);
 					for (const variant of sampleVariants) {
 						const value = { ...variant, s: soundName, n: variant.n ?? 0, note: variant.note ?? 'c3' };
 						const key = `sample:${soundName}:${String(value.n)}:${String(value.note)}`;
-						if (!pending.has(key)) pending.set(key, module.getSampleBuffer(value, data.samples));
+						if (!pending.has(key)) {
+							pending.set(key, settleAudioAsset(
+								() => module.getSampleBuffer?.(value, data.samples),
+								`sample ${soundName}:${String(value.n)}`,
+							));
+						}
 					}
 					return;
 				}
@@ -711,12 +775,21 @@ export class StrudelAdapter {
 						const noteKey = variant.freq ?? variant.note ?? 'c3';
 						const key = `soundfont:${font}:${String(noteKey)}`;
 						if (!pending.has(key)) {
-							soundfontRuntime ??= await loadSoundfontRuntime();
+							try {
+								soundfontRuntime ??= await loadSoundfontRuntime();
+							} catch (error) {
+								reportAudioAssetIssue('the soundfont runtime', error);
+								return;
+							}
+							const runtime = soundfontRuntime;
+							if (!runtime) return;
 							pending.set(
 								key,
-								soundfontRuntime.getFontBufferSource(font, { ...variant, s: soundName, n: variant.n ?? 0, note: variant.note ?? 'c3' }, audioContext).then((source) => {
-									source.disconnect();
-								}),
+								settleAudioAsset(
+									() => runtime.getFontBufferSource(font, { ...variant, s: soundName, n: variant.n ?? 0, note: variant.note ?? 'c3' }, audioContext)
+										.then((source) => { source.disconnect(); }),
+									`soundfont ${font}:${String(noteKey)}`,
+								),
 							);
 						}
 					}
@@ -880,6 +953,7 @@ export class StrudelAdapter {
 		this.activePattern = undefined;
 		this.activeSource = '';
 		this.preloadPromise = undefined;
+		this.sampleBankPromise = undefined;
 		try {
 			repl?.stop();
 			module?.hush?.();
