@@ -2,6 +2,50 @@ import { describe, expect, test } from 'bun:test';
 import { isAudioLockedError, StrudelAdapter } from './adapter';
 
 describe('StrudelAdapter evaluation queue', () => {
+	test('registers editor-only Strudel compatibility helpers', async () => {
+		const registrations: string[] = [];
+		const scheduler = { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
+		const fakeModule = {
+			register: (name: string) => {
+				registrations.push(name);
+				return (...args: unknown[]) => args[1];
+			},
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler,
+			}),
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		const hadSlider = 'sliderWithID' in globalThis;
+		const originalSlider = (globalThis as typeof globalThis & { sliderWithID?: unknown }).sliderWithID;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		Reflect.deleteProperty(globalThis, 'sliderWithID');
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			await adapter.init();
+
+			expect(registrations).toEqual(['sliderWithID', '_pianoroll', '_scope']);
+			expect(typeof (globalThis as typeof globalThis & { sliderWithID?: unknown }).sliderWithID).toBe('function');
+			adapter.destroy();
+		} finally {
+			if (hadSlider) {
+				Object.defineProperty(globalThis, 'sliderWithID', { configurable: true, value: originalSlider });
+			} else {
+				Reflect.deleteProperty(globalThis, 'sliderWithID');
+			}
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
+
 	test('serializes evaluations so callback errors stay with their request', async () => {
 		const started: string[] = [];
 		let releaseFirst: (() => void) | undefined;

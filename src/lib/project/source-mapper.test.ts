@@ -310,6 +310,14 @@ describe('source mapper', () => {
 		expect(tracks.every((track) => track.timing.mode === 'full' && track.timing.startCycle === 0 && track.timing.endCycle === 4)).toBe(true);
 	});
 
+	test('projects every ordinary source lane without a fixed count cap', () => {
+		const source = Array.from({ length: 12 }, (_, index) => `$: s("sawtooth") // lane ${index + 1}`).join('\n');
+		const tracks = getSourceBlockDetails(source);
+
+		expect(tracks).toHaveLength(12);
+		expect(tracks.map((track) => track.id)).toEqual(Array.from({ length: 12 }, (_, index) => `trk_source_${(index + 1).toString().padStart(2, '0')}`));
+	});
+
 	test('keeps generated projection IDs away from authored marker IDs', () => {
 		const source = [
 			'$: s("bd")',

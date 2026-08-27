@@ -8,6 +8,8 @@ interface StrudelModule {
 		prebake?: () => void | Promise<void>;
 		beforeStart?: () => void | Promise<void>;
 	}): Promise<StrudelRepl>;
+	register?: (name: string, func: (...args: any[]) => unknown, patternify?: boolean) => unknown;
+	Pattern?: { prototype: Record<string, unknown> };
 	initAudio?: (options?: Record<string, unknown>) => Promise<void>;
 	hush?: () => void;
 	aliasBank?: (path: string) => Promise<void>;
@@ -99,6 +101,34 @@ function isHeaderOnlyAstError(error: unknown): boolean {
 function appendRuntimeSilence(source: string): string {
 	const trimmed = source.trimEnd();
 	return `${trimmed}${trimmed ? '\n\n' : ''}silence`;
+}
+
+/**
+ * The Strudel transpiler rewrites `slider(...)` to `sliderWithID(...)`. The
+ * full Strudel editor supplies that helper, while Sushi intentionally does not
+ * render inline widgets. Keep those sources playable by treating the widget
+ * as its value and ignoring its editor-only bounds.
+ */
+function registerSushiCompatibility(module: StrudelModule): void {
+	const globalScope = globalThis as typeof globalThis & { sliderWithID?: unknown };
+	if (typeof globalScope.sliderWithID !== 'function') {
+		const valuePassthrough = (_id: unknown, value: unknown, _min: unknown, _max: unknown) => value;
+		const registered = module.register?.('sliderWithID', valuePassthrough, false);
+		// `register` adds functions to Strudel's private scope. The web bundle
+		// copies that scope to `globalThis` during its built-in prebake, so
+		// registrations made by an embedding app must expose the returned wrapper
+		// themselves.
+		globalScope.sliderWithID = typeof registered === 'function' ? registered : valuePassthrough;
+	}
+
+	// These drawing hooks are supplied by strudel.cc's editor packages, not by
+	// @strudel/web. Sushi has its own timeline and does not render those canvases,
+	// but keeping them as identity methods means a pasted Strudel song remains
+	// evaluable instead of failing before any of its audible layers are loaded.
+	for (const name of ['_pianoroll', '_scope']) {
+		if (typeof module.Pattern?.prototype[name] === 'function') continue;
+		module.register?.(name, (pattern: unknown) => pattern);
+	}
 }
 
 let soundfontRuntimePromise: Promise<SoundfontRuntime> | undefined;
@@ -308,6 +338,7 @@ export class StrudelAdapter {
 			this.module = module;
 			this.repl = await module.initStrudel({
 				prebake: async () => {
+					registerSushiCompatibility(module);
 					// @strudel/web only registers oscillator synths by default. Strudel.cc
 					// adds its GM soundfonts and the two sample collections below before
 					// evaluating user code, so ordinary Strudel snippets resolve the same
@@ -336,6 +367,9 @@ export class StrudelAdapter {
 					}
 				},
 			});
+			// Keep editor-only Strudel helpers available after initialization too;
+			// this is idempotent when the prebake hook already installed them.
+			registerSushiCompatibility(module);
 			if (this.destroyed) {
 				try {
 					this.repl.stop();

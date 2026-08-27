@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent as ReactChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent as ReactChangeEvent, type ClipboardEvent as ReactClipboardEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
 	createInitialProject,
 	DEFAULT_SONG_END_CYCLE,
@@ -26,7 +26,7 @@ import {
 	updateTrackPan,
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
-import { getSourceLineNumbers } from '../lib/project/editor';
+import { getSourceLineNumbers, replaceSourceSelection } from '../lib/project/editor';
 import {
 	getTimelineCapacityForEndCycle,
 	getTimelineZoomForVisibleCycles,
@@ -800,6 +800,39 @@ export default function Studio() {
 		pendingTrackSourceRef.current = null;
 	}, []);
 
+	const handleEditorPaste = useCallback(
+		(event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+			const pastedText = event.clipboardData.getData('text/plain');
+			if (!pastedText) return;
+
+			event.preventDefault();
+			const editor = event.currentTarget;
+			const current = studioRef.current;
+			const replacement = replaceSourceSelection(
+				current.draft,
+				pastedText,
+				editor.selectionStart,
+				editor.selectionEnd,
+			);
+			const baseRevision = current.revision;
+			cancelPendingTrackCommit();
+			patchStudio({
+				draft: replacement.source,
+				...(current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
+			});
+			// A complete paste is an intentional source replacement. Validate it as
+			// one transaction so the timeline follows the pasted song immediately;
+			// invalid source stays a draft and is surfaced with diagnostics.
+			void commitSource(replacement.source, { expectedRevision: baseRevision });
+			requestAnimationFrame(() => {
+				if (sourceEditorRef.current !== editor) return;
+				editor.setSelectionRange(replacement.caret, replacement.caret);
+				syncEditorScroll();
+			});
+		},
+		[cancelPendingTrackCommit, commitSource, patchStudio, syncEditorScroll],
+	);
+
 	const queueTrackCommit = useCallback(
 		(source: string, baseRevision: number) => {
 			pendingTrackSourceRef.current = { source, baseRevision };
@@ -1371,6 +1404,12 @@ export default function Studio() {
 				const current = studioRef.current;
 				const expectedRevision = current.revision;
 				const draftHasNotBeenEvaluated = current.diagnostics.length === 0;
+				if (current.draft !== current.lastValid && !draftHasNotBeenEvaluated) {
+					// Never start the previously accepted song when the visible editor
+					// contains a rejected draft. The old behavior made a failed paste
+					// sound like an unrelated song and obscured the actual source error.
+					return { ok: false, error: current.diagnostics[0] };
+				}
 				if ((current.draft !== current.lastValid && draftHasNotBeenEvaluated) || current.activeRevision === null) {
 					const committed = await commitSource(current.draft, { expectedRevision });
 					if (!committed.ok) {
@@ -2286,7 +2325,8 @@ export default function Studio() {
 								ref={sourceEditorRef}
 								className="source-editor"
 								value={studio.draft}
-							onChange={(event) => {
+								onPaste={handleEditorPaste}
+								onChange={(event) => {
 									const nextDraft = event.target.value;
 									patchStudio({
 										draft: nextDraft,

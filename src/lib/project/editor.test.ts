@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { getSourceLineNumbers } from './editor';
+import { getSourceLineNumbers, replaceSourceSelection } from './editor';
 
 describe('source editor line model', () => {
 	test('keeps gutter entries aligned with logical source lines', () => {
@@ -8,5 +8,16 @@ describe('source editor line model', () => {
 
 	test('keeps an empty source addressable at line one', () => {
 		expect(getSourceLineNumbers('')).toEqual([1]);
+	});
+
+	test('replaces pasted text and returns the post-paste caret', () => {
+		expect(replaceSourceSelection('alpha\nomega', 'middle\n', 6, 6)).toEqual({
+			source: 'alpha\nmiddle\nomega',
+			caret: 13,
+		});
+	});
+
+	test('normalizes reversed or out-of-range selections', () => {
+		expect(replaceSourceSelection('abcdef', 'X', 99, 2)).toEqual({ source: 'abX', caret: 3 });
 	});
 });

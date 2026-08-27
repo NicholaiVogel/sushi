@@ -153,8 +153,9 @@ function errorLocation(error: unknown, message: string): { line: number; column?
 
 	const lineAndColumn = message.match(/(?:line\s+)(\d+)[^\d]+column\s+(\d+)/i)
 		?? message.match(/\((\d+):(\d+)\)/);
-	if (!lineAndColumn) return undefined;
-	return { line: Number(lineAndColumn[1]), column: Number(lineAndColumn[2]) + 1 };
+	if (lineAndColumn) return { line: Number(lineAndColumn[1]), column: Number(lineAndColumn[2]) + 1 };
+	const lineOnly = message.match(/\bline\s+(\d+)\b/i);
+	return lineOnly ? { line: Number(lineOnly[1]) } : undefined;
 }
 
 function rangeFromLocation(source: string, location: { line: number; column?: number }): SourceRange | undefined {

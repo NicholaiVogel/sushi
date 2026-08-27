@@ -23,6 +23,17 @@ describe('source diagnostics', () => {
 		expect(diagnostic.context).toBe('$: s("bd")');
 	});
 
+	test('extracts a line from Strudel mini parser messages without a column', () => {
+		const source = Array.from({ length: 92 }, (_, index) => `line ${index + 1}`).join('\n');
+		const diagnostic = diagnosticFromError(9, new Error('[mini] parse error at line 92: expected a pattern'), source);
+
+		expect(diagnostic).toMatchObject({
+			phase: 'parse',
+			range: { line: 92 },
+			context: 'line 92',
+		});
+	});
+
 	test('preserves the audio-lock code for agent-visible playback diagnostics', () => {
 		const error = Object.assign(new Error('Audio is locked.'), { code: 'AUDIO_LOCKED' });
 		const diagnostic = diagnosticFromError(9, error);
