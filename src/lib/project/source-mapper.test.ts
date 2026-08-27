@@ -142,4 +142,10 @@ describe('source mapper', () => {
 		expect(getSourceGlobals(REGULAR_STRUDEL_SONG)).toMatchObject({ bpm: 90, quarterNotesPerCycle: 4 });
 		expect(tracks.every((track) => track.timing.mode === 'full' && track.timing.startCycle === 0 && track.timing.endCycle === 4)).toBe(true);
 	});
+
+	test('uses the project boundary for full-length tracks', () => {
+		const [track] = getSourceBlockDetails(DEFAULT_SOURCE, 16);
+
+		expect(track.timing).toEqual({ mode: 'full', startCycle: 0, endCycle: 16 });
+	});
 });

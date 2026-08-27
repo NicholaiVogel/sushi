@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
 	createInitialProject,
+	DEFAULT_SONG_END_CYCLE,
 	diagnosticFromError,
 	getSourceBlocks,
 	type RuntimeState,
@@ -16,6 +17,7 @@ import {
 	updateTrackRange as updateSourceTrackRange,
 } from '../lib/project/source-mapper';
 import { getSourceLineNumbers } from '../lib/project/editor';
+import { getTimelineCells, TIMELINE_CELL_WIDTH } from '../lib/project/timeline';
 import { highlightStrudel } from '../lib/project/syntax-highlight';
 import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
 import { StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
@@ -90,7 +92,7 @@ function createInitialStudioState(): StudioState {
 		lastValid: project.source.lastValid,
 		revision: project.source.revision,
 		activeRevision: 0,
-		songEndCycle: project.timeline.songEndCycle ?? 4,
+		songEndCycle: project.timeline.songEndCycle ?? DEFAULT_SONG_END_CYCLE,
 		diagnostics: [],
 		phase: 'booting',
 		persistenceState: 'loading',
@@ -143,7 +145,6 @@ function getDiagnosticLocation(diagnostic: SourceDiagnostic): string {
 	return `LINE ${diagnostic.range.line}${column} · REV ${formatRevision(diagnostic.revision)}`;
 }
 
-const BEAT_LABELS = ['1', '1.1', '1.2', '1.3', '2', '2.1', '2.2', '2.3', '3', '3.1', '3.2', '3.3', '4', '4.1', '4.2', '4.3'];
 const TRACK_COLORS = ['#d9ff68', '#8fe1ff', '#f0a3c7', '#c7a6ff'];
 const SOURCE_HISTORY_LIMIT = 100;
 const EDITOR_WIDTH_MIN = 280;
@@ -175,6 +176,12 @@ function formatCycle(cycle: number): string {
 
 function formatKey(key: string): string {
 	return key.replace(':', ' ').toUpperCase();
+}
+
+function getExplicitSourceEndCycle(source: string): number {
+	return getSourceBlockDetails(source)
+		.filter((block) => block.timing.mode !== 'full')
+		.reduce((endCycle, block) => Math.max(endCycle, block.timing.endCycle), 0);
 }
 
 function sourceEntityIds(state: WebMcpStateSnapshot): string[] {
@@ -308,6 +315,17 @@ export default function Studio() {
 
 			if (!mountedRef.current) return;
 			const project = stored?.project ?? fallbackProject;
+			const storedEndCycle = project.timeline.songEndCycle;
+			const configuredEndCycle = typeof storedEndCycle === 'number' && Number.isFinite(storedEndCycle) && storedEndCycle > 0
+				? storedEndCycle
+				: DEFAULT_SONG_END_CYCLE;
+			// Projects created before the editable timeline boundary used four
+			// cycles implicitly. Upgrade that legacy default while preserving any
+			// explicit arrange/seqPLoop range already present in the source.
+			const normalizedEndCycle = Math.max(
+				storedEndCycle === 4 ? DEFAULT_SONG_END_CYCLE : configuredEndCycle,
+				getExplicitSourceEndCycle(project.source.lastValid),
+			);
 			const activeRevision = stored?.activeRevision ?? project.source.revision;
 			sourceHistoryRef.current = {
 				cursorSource: project.source.draft,
@@ -321,7 +339,7 @@ export default function Studio() {
 				lastValid: project.source.lastValid,
 				revision: project.source.revision,
 				activeRevision,
-				songEndCycle: project.timeline.songEndCycle ?? 4,
+				songEndCycle: normalizedEndCycle,
 				persistenceState,
 				runtime: { ...studioRef.current.runtime, activeRevision },
 			});
@@ -415,9 +433,13 @@ export default function Studio() {
 
 			if (!mountedRef.current || studioRef.current.revision !== revision) return { ok: false, changed: false, previousSource, source, revision };
 			if (result.ok) {
+				const explicitEndCycle = getExplicitSourceEndCycle(source);
+				const nextSongEndCycle = Math.max(studioRef.current.songEndCycle, explicitEndCycle);
+				adapter.setSongEndCycle(nextSongEndCycle);
 				patchStudio({
 					lastValid: source,
 					activeRevision: revision,
+					songEndCycle: nextSongEndCycle,
 					diagnostics: [],
 					phase: 'ready',
 					runtime: { ...studioRef.current.runtime, activeRevision: revision },
@@ -499,6 +521,14 @@ export default function Studio() {
 		(trackId: string, startCycle: number, endCycle: number) => updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, startCycle, endCycle)),
 		[updateTrackSource],
 	);
+
+	const setSongEndCycle = useCallback((value: number) => {
+		if (!Number.isFinite(value) || value <= 0) return;
+		const requestedEndCycle = Math.max(0.25, Math.round(value * 4) / 4);
+		const nextSongEndCycle = Math.max(requestedEndCycle, getExplicitSourceEndCycle(studioRef.current.lastValid));
+		adapterRef.current?.setSongEndCycle(nextSongEndCycle);
+		patchStudio({ songEndCycle: nextSongEndCycle });
+	}, [patchStudio]);
 
 	const handleTimingPointerMove = useCallback(
 		(event: PointerEvent) => {
@@ -653,7 +683,7 @@ export default function Studio() {
 		const current = studioRef.current;
 		const project = createInitialProject();
 		const globals = getSourceGlobals(current.lastValid);
-		const tracks = getSourceBlockDetails(current.lastValid).map((track) => ({
+		const tracks = getSourceBlockDetails(current.lastValid, current.songEndCycle).map((track) => ({
 			id: track.id,
 			name: track.name,
 			type: track.type,
@@ -982,8 +1012,8 @@ export default function Studio() {
 
 	const blocks = useMemo(() => getSourceBlocks(studio.lastValid), [studio.lastValid]);
 	const draftBlocks = useMemo(() => getSourceBlocks(studio.draft), [studio.draft]);
-	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft).map((block) => [block.id, block])), [studio.draft]);
-	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid).map((block) => [block.id, block])), [studio.lastValid]);
+	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft, studio.songEndCycle).map((block) => [block.id, block])), [studio.draft, studio.songEndCycle]);
+	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid, studio.songEndCycle).map((block) => [block.id, block])), [studio.lastValid, studio.songEndCycle]);
 	const sourceGlobals = useMemo(() => getSourceGlobals(studio.lastValid), [studio.lastValid]);
 	const isDirty = studio.draft !== studio.lastValid;
 	const isBusy = studio.phase === 'booting' || studio.phase === 'validating';
@@ -992,6 +1022,7 @@ export default function Studio() {
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
+	const timelineCells = useMemo(() => getTimelineCells(studio.songEndCycle), [studio.songEndCycle]);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
 
@@ -1089,17 +1120,25 @@ export default function Studio() {
 			</div>
 
 				<main className="daw-canvas" aria-label="Sushi workstation">
-					<section className="timeline-shell" aria-labelledby="timeline-heading">
+					<section className="timeline-shell" style={{ '--timeline-cell-count': timelineCells.length, '--timeline-content-width': `${timelineCells.length * TIMELINE_CELL_WIDTH}px` } as CSSProperties} aria-labelledby="timeline-heading">
 						<div className="timeline-head">
 							<div className="timeline-heading-cell">
 								<div className="arrangement-toolbar">
 									<button className="add-track-button" type="button" onClick={() => void addTrack()} disabled={isBusy} aria-label="Add track"><span aria-hidden="true">＋</span> Add track</button>
 								</div>
-								<span className="timeline-duration">{formatCycle(studio.songEndCycle)} cycles · {formatCycle(songEndSeconds)}s</span>
+								<div className="timeline-duration">
+									<label className="timeline-length-control">
+										<span className="sr-only">Arrangement length in cycles</span>
+										<input type="number" min="0.25" step="0.25" value={formatCycle(studio.songEndCycle)} onChange={(event) => setSongEndCycle(Number(event.target.value))} aria-label="Arrangement length in cycles" title="Set arrangement length in cycles" />
+										<span>cycles</span>
+									</label>
+									<span aria-hidden="true">·</span>
+									<span>{formatCycle(songEndSeconds)}s</span>
+								</div>
 								<span className="sr-only" id="timeline-heading">{activeLaneCount} source lanes</span>
 							</div>
 							<div className="timeline-ruler" aria-label="Arrangement beats">
-								{BEAT_LABELS.map((label, index) => <span className={index % 4 === 0 ? 'bar-number' : ''} key={label}>{label}</span>)}
+								{timelineCells.map((cell) => <span className={cell.barStart ? 'bar-number' : ''} key={cell.label}>{cell.label}</span>)}
 								<button className="timeline-seek-surface" type="button" onPointerDown={startTimelineSeekDrag} onKeyDown={handleTimelineSeekKeyDown} disabled={isBusy} aria-label={`Seek playhead, cycle ${formatCycle(studio.runtime.currentCycle)}, ${formatClock(currentSeconds)}`} title="Click or drag to seek" />
 								<i className="timeline-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
 							</div>
@@ -1139,8 +1178,8 @@ export default function Studio() {
 											</div>
 										</div>
 									</div>
-									<div className="lane-grid" style={{ '--track-color': trackColor } as CSSProperties}>
-										<div className="lane-grid-lines" aria-hidden="true">{BEAT_LABELS.map((_, cell) => <span className={cell % 4 === 0 ? 'beat-start' : ''} key={cell} />)}</div>
+										<div className="lane-grid" style={{ '--track-color': trackColor } as CSSProperties}>
+											<div className="lane-grid-lines" aria-hidden="true">{timelineCells.map((cell) => <span className={cell.barStart ? 'beat-start' : ''} key={cell.label} />)}</div>
 										<div className="pattern-region" style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd } as CSSProperties} title={`${block.name}: ${timingLabel}`}>
 											<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -0.25 : 0.25; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - 0.25), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
 											<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
@@ -1151,7 +1190,7 @@ export default function Studio() {
 								</div>
 							);
 						})}
-						<div className="timeline-fill" aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines">{BEAT_LABELS.map((_, cell) => <span className={cell % 4 === 0 ? 'beat-start' : ''} key={cell} />)}</div><span className="lane-playhead timeline-fill-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} /></div></div>
+						<div className="timeline-fill" aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines">{timelineCells.map((cell) => <span className={cell.barStart ? 'beat-start' : ''} key={cell.label} />)}</div><span className="lane-playhead timeline-fill-playhead" style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} /></div></div>
 					</section>
 
 					{studio.diagnostics.length ? <div className="canvas-diagnostic" role="status" aria-live="polite"><div className="diagnostic-meta"><span className="error-mark" aria-hidden="true">!</span><span>{getDiagnosticLabel(studio.diagnostics[0])}</span><span>{getDiagnosticLocation(studio.diagnostics[0]) || `REV ${formatRevision(studio.diagnostics[0].revision)}`}</span></div><p>{studio.diagnostics[0].message}</p>{studio.diagnostics[0].context ? <code className="diagnostic-context">{studio.diagnostics[0].context}</code> : null}</div> : null}

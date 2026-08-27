@@ -60,7 +60,7 @@ export function secondsToCycles(seconds: number, globals: SourceGlobals): number
 	return seconds * globals.bpm / (60 * globals.quarterNotesPerCycle);
 }
 
-export function getSourceTrackTiming(expression: string): TrackTiming {
+export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAULT_TRACK_END_CYCLE): TrackTiming {
 	const trimmed = expression.trim();
 	if (trimmed.startsWith('seqPLoop(')) {
 		const pairs = Array.from(trimmed.matchAll(new RegExp(`\\[\\s*(${numericLiteral})\\s*,\\s*(${numericLiteral})\\s*,`, 'g')))
@@ -84,7 +84,7 @@ export function getSourceTrackTiming(expression: string): TrackTiming {
 		}
 	}
 
-	return { mode: 'full', startCycle: 0, endCycle: DEFAULT_TRACK_END_CYCLE };
+	return { mode: 'full', startCycle: 0, endCycle: defaultEndCycle };
 }
 
 function withoutCarriageReturn(line: string): { body: string; ending: string } {
@@ -109,12 +109,12 @@ function hasMethod(expression: string, method: 'gain' | 'pan'): boolean {
 	return new RegExp(`\\.${method}\\s*\\(`).test(expression);
 }
 
-export function getSourceBlockDetails(source: string): SourceBlockDetails[] {
+export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_TRACK_END_CYCLE): SourceBlockDetails[] {
 	return getParsedSourceBlocks(source).map((block): SourceBlockDetails => {
 		if (!block.expressionRange || !block.label || block.expression === undefined) {
 			return {
 				...block,
-				timing: { mode: 'full', startCycle: 0, endCycle: DEFAULT_TRACK_END_CYCLE },
+				timing: { mode: 'full', startCycle: 0, endCycle: defaultEndCycle },
 				gainEditable: false,
 				panEditable: false,
 				muted: false,
@@ -128,7 +128,7 @@ export function getSourceBlockDetails(source: string): SourceBlockDetails[] {
 		const pan = numericMethodValue(expression, 'pan');
 		return {
 			...block,
-			timing: getSourceTrackTiming(expression),
+			timing: getSourceTrackTiming(expression, defaultEndCycle),
 			gain,
 			pan,
 			gainEditable: !hasMethod(expression, 'gain') || gain !== undefined,

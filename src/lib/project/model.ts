@@ -46,6 +46,9 @@ export interface ProjectDocumentV1 {
 	assets: [];
 }
 
+/** Default working range for a new arrangement, expressed in Strudel cycles. */
+export const DEFAULT_SONG_END_CYCLE = 16;
+
 export interface SourceBlockSummary {
 	id: string;
 	name: string;
@@ -76,7 +79,7 @@ export function createInitialProject(): ProjectDocumentV1 {
 		},
 		timeline: {
 			quarterNotesPerCycle: { numerator: 4, denominator: 1 },
-			songEndCycle: 4,
+			songEndCycle: DEFAULT_SONG_END_CYCLE,
 		},
 		assets: [],
 	};

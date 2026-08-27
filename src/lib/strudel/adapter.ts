@@ -1,4 +1,4 @@
-import type { AudioState, TransportState } from '../project/model';
+import { DEFAULT_SONG_END_CYCLE, type AudioState, type TransportState } from '../project/model';
 
 interface StrudelModule {
 	initStrudel(options?: {
@@ -394,6 +394,11 @@ export class StrudelAdapter {
 		}
 	}
 
+	/** Update the finite transport boundary without restarting the REPL. */
+	public setSongEndCycle(songEndCycle?: number): void {
+		this.songEndCycle = Number.isFinite(songEndCycle) && songEndCycle !== undefined && songEndCycle > 0 ? songEndCycle : undefined;
+	}
+
 	/**
 	 * Resolve the sounds used by the accepted pattern before starting the clock.
 	 * Strudel registers sample and soundfont definitions during prebake, but the
@@ -412,7 +417,7 @@ export class StrudelAdapter {
 
 		this.preloadPromise = (async () => {
 			this.setRuntime({ audioState: 'initializing' });
-			const endCycle = this.songEndCycle ?? 4;
+			const endCycle = this.songEndCycle ?? DEFAULT_SONG_END_CYCLE;
 			const cps = typeof repl.scheduler.cps === 'number' && Number.isFinite(repl.scheduler.cps) ? repl.scheduler.cps : 0.5;
 			const audioContext = module.getAudioContext?.();
 			let soundfontRuntime: SoundfontRuntime | undefined;

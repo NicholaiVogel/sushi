@@ -467,7 +467,28 @@ a { color: inherit; }
 	z-index: 5;
 }
 
-.timeline-duration { margin-top: 5px; color: var(--ink-muted); font-family: var(--mono); font-size: 8px; letter-spacing: 0.04em; }
+.timeline-duration { display: flex; align-items: center; gap: 6px; margin-top: 5px; color: var(--ink-muted); font-family: var(--mono); font-size: 8px; letter-spacing: 0.04em; }
+
+.timeline-length-control { display: inline-flex; align-items: center; gap: 4px; }
+
+.timeline-length-control input {
+	width: 42px;
+	padding: 0;
+	border: 0;
+	border-bottom: 1px solid transparent;
+	outline: 0;
+	background: transparent;
+	color: var(--ink-soft);
+	font: inherit;
+	font-variant-numeric: tabular-nums;
+	text-align: right;
+}
+
+.timeline-length-control input:hover,
+.timeline-length-control input:focus { border-bottom-color: var(--accent); color: var(--accent); }
+
+.timeline-length-control input::-webkit-inner-spin-button,
+.timeline-length-control input::-webkit-outer-spin-button { margin: 0; opacity: 0.4; }
 
 .arrangement-toolbar { display: flex; align-items: center; gap: 7px; width: 100%; }
 
