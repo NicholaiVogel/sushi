@@ -28,14 +28,14 @@ The current vertical slice is a source-first DAW workstation at `/`:
 - Project name, draft source, last-valid source, and revisions autosave to IndexedDB and restore before the initial Strudel evaluation.
 - Tempo, key, track ranges, and derived seconds are projected from committed Strudel source. Dragging a clip edge writes a `seqPLoop(...)` range back into that track's source block.
 - `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns play, pause, resume, stop, seek, cycle progress, and song-end handling.
-- When the browser exposes `document.modelContext`, the studio registers the Slice 3 WebMCP tools for state inspection, source read/write/patch, validation, local reference lookup, playback, and revision-aware undo/redo. Transactions are idempotent, stale revisions return structured conflicts, and agent edits share the human source history.
+- When the browser exposes a usable `document.modelContext`, the studio waits briefly for late host injection before registering the Slice 3 WebMCP tools for state inspection, source read/write/patch, validation, local reference lookup, playback, and revision-aware undo/redo. Transactions are idempotent, stale revisions return structured conflicts, and agent edits share the human source history.
 - Source edits stay in a draft until **Commit source** evaluates them through Strudel.
 - Failed evaluations remain visible as diagnostics while the last-valid source and active revision stay playable.
 - Audio waits for an explicit Play gesture to satisfy browser autoplay policy.
 
 The source fixture and project state live in `src/lib/project/model.ts`. The visual execution contract for this slice is recorded in [DESIGN-BRIEF.md](./DESIGN-BRIEF.md).
 
-WebMCP is an optional browser enhancement. The client feature-detects `document.modelContext`, registers the Slice 3 tool set when it is available, and leaves the normal browser studio unchanged when it is not.
+WebMCP is an optional browser enhancement. The client feature-detects the canonical `document.modelContext` surface (with legacy host fallbacks), waits for a usable `registerTool` method when an embedded browser installs it after hydration, and leaves the normal browser studio unchanged when it is not available. Registration is tied to the React lifecycle so teardown aborts both late discovery and partially completed registrations. Source-bearing tools declare WebMCP read-only and untrusted-content hints so hosts can apply their normal safety policy. Astro dev/preview and Cloudflare Pages responses send `Origin-Agent-Cluster: ?1` and the default `tools` Permissions Policy. The bounded transaction cache deduplicates concurrent/retried calls within a session; persisted source revisions make accepted edits safe to replay after reload, while the cache itself is intentionally not a cross-browser transaction ledger. For production Chrome origin-trial access, provide the trial token as `PUBLIC_WEBMCP_ORIGIN_TRIAL_TOKEN` at build time. Local Chrome testing can use `chrome://flags/#enable-webmcp-testing` without a token.
 
 ## Commands
 

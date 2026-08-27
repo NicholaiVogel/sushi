@@ -4,6 +4,7 @@ import {
 	DEFAULT_SONG_END_CYCLE,
 	diagnosticFromError,
 	getSourceBlocks,
+	getSourceIdentityDiagnostics,
 	type RuntimeState,
 	type SourceDiagnostic,
 } from '../lib/project/model';
@@ -29,12 +30,12 @@ import {
 } from '../lib/project/timeline';
 import { highlightStrudel } from '../lib/project/syntax-highlight';
 import { loadProjectSnapshot, saveProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
-import { StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
+import { isAudioLockedError, StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
 import {
 	applyTextEdits,
-	getNativeModelContext,
 	registerWebMcpTools,
 	sourceDiff,
+	waitForNativeModelContext,
 	type SourceMutationInput,
 	type SourcePatchInput,
 	type WebMcpController,
@@ -45,6 +46,7 @@ import {
 	type WebMcpStateSnapshot,
 	type WebMcpValidationResult,
 } from '../lib/webmcp/tools';
+import { stableSerialize, TransactionCache, TransactionReuseError } from '../lib/webmcp/transaction-cache';
 
 type StudioPhase = 'booting' | 'ready' | 'validating' | 'error';
 type PersistenceState = 'loading' | 'ready' | 'unavailable';
@@ -63,7 +65,7 @@ interface StudioState {
 }
 
 type StudioCommand =
-	| { type: 'writeSource'; source: string }
+	| { type: 'writeSource'; source: string; expectedRevision?: number }
 	| { type: 'play' }
 	| { type: 'pause' }
 	| { type: 'seek'; cycle: number }
@@ -91,6 +93,10 @@ interface CommitSourceResult {
 	source: string;
 	revision: number;
 	error?: SourceDiagnostic;
+	conflict?: {
+		expectedRevision: number;
+		actualRevision: number;
+	};
 }
 
 function createInitialStudioState(): StudioState {
@@ -193,6 +199,11 @@ function getExplicitSourceEndCycle(source: string): number {
 		.reduce((endCycle, block) => Math.max(endCycle, block.timing.endCycle), 0);
 }
 
+function getSourceCycleStep(source: string): number {
+	const quarterNotesPerCycle = getSourceGlobals(source).quarterNotesPerCycle;
+	return 1 / Math.max(1, Math.round(quarterNotesPerCycle));
+}
+
 function sourceEntityIds(state: WebMcpStateSnapshot): string[] {
 	return ['source', ...state.tracks.map((track) => track.id)];
 }
@@ -227,14 +238,17 @@ export default function Studio() {
 	const [editorWidth, setEditorWidth] = useState(350);
 	const [arrangementZoom, setArrangementZoom] = useState(DEFAULT_TIMELINE_ZOOM);
 	const studioRef = useRef(studio);
+	const studioGenerationRef = useRef(0);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
 	const mountedRef = useRef(true);
 	const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
 	const sourceHighlightRef = useRef<HTMLPreElement | null>(null);
 	const editorGutterRef = useRef<HTMLDivElement | null>(null);
 	const editorResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
-	const pendingTrackSourceRef = useRef<string | null>(null);
+	const pendingTrackSourceRef = useRef<{ source: string; baseRevision: number } | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const sourceCommitQueueRef = useRef<Promise<void>>(Promise.resolve());
+	const persistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const timingDragRef = useRef<{ trackId: string; edge: 'start' | 'end'; lane: HTMLElement } | null>(null);
 	const timelineSeekDragRef = useRef<HTMLElement | null>(null);
 	const timelineSeekCycleRef = useRef<number | null>(null);
@@ -245,7 +259,7 @@ export default function Studio() {
 		undo: [],
 		redo: [],
 	});
-	const sourceTransactionsRef = useRef(new Map<string, WebMcpMutationResult>());
+	const sourceTransactionsRef = useRef(new TransactionCache<WebMcpMutationResult>(SOURCE_HISTORY_LIMIT));
 	const webmcpRegistrationRef = useRef<WebMcpRegistration | null>(null);
 	const webmcpAvailableRef = useRef(false);
 
@@ -310,9 +324,12 @@ export default function Studio() {
 	);
 
 	useEffect(() => {
+		const generation = studioGenerationRef.current + 1;
+		studioGenerationRef.current = generation;
 		mountedRef.current = true;
 		const adapter = new StrudelAdapter(patchRuntime);
 		adapterRef.current = adapter;
+		const isCurrentSession = () => mountedRef.current && studioGenerationRef.current === generation;
 
 		const boot = async () => {
 			const fallbackProject = createInitialProject();
@@ -325,17 +342,18 @@ export default function Studio() {
 				persistenceState = 'unavailable';
 			}
 
-			if (!mountedRef.current) return;
+			if (!isCurrentSession()) return;
 			const project = stored?.project ?? fallbackProject;
 			const storedEndCycle = project.timeline.songEndCycle;
 			const configuredEndCycle = typeof storedEndCycle === 'number' && Number.isFinite(storedEndCycle) && storedEndCycle > 0
 				? storedEndCycle
 				: DEFAULT_SONG_END_CYCLE;
 			// Projects created before the editable timeline boundary used four
-			// cycles implicitly. Upgrade that legacy default while preserving any
-			// explicit arrange/seqPLoop range already present in the source.
+			// cycles implicitly. Upgrade that legacy default once while preserving
+			// an intentional four-cycle boundary saved by the current schema.
+			const legacyTimeline = project.timeline.songEndCycleVersion !== 1;
 			const normalizedEndCycle = Math.max(
-				storedEndCycle === 4 ? DEFAULT_SONG_END_CYCLE : configuredEndCycle,
+				legacyTimeline && storedEndCycle === 4 ? DEFAULT_SONG_END_CYCLE : configuredEndCycle,
 				getExplicitSourceEndCycle(project.source.lastValid),
 			);
 			const activeRevision = stored?.activeRevision ?? project.source.revision;
@@ -358,16 +376,40 @@ export default function Studio() {
 
 			try {
 				await adapter.init();
-				if (!mountedRef.current) return;
+				if (!isCurrentSession()) return;
+				const identityDiagnostics = getSourceIdentityDiagnostics(activeRevision, studioRef.current.lastValid);
+				if (identityDiagnostics.length) {
+					patchStudio({
+						phase: 'error',
+						diagnostics: identityDiagnostics,
+						runtime: { ...studioRef.current.runtime, audioState: 'error', activeRevision: null },
+					});
+					return;
+				}
 				const initial = await adapter.evaluateSource(studioRef.current.lastValid, {
 					autoplay: false,
 				});
-				if (!mountedRef.current) return;
+				if (!isCurrentSession()) return;
 
 				if (initial.ok) {
+					let draftDiagnostics: SourceDiagnostic[] = [];
+					if (studioRef.current.draft !== studioRef.current.lastValid) {
+						const identityDiagnostics = getSourceIdentityDiagnostics(studioRef.current.revision, studioRef.current.draft);
+						if (identityDiagnostics.length) {
+							draftDiagnostics = identityDiagnostics;
+						} else {
+							try {
+								const draftValidation = await adapter.validateSource(studioRef.current.draft, studioRef.current.lastValid);
+								if (!draftValidation.ok) draftDiagnostics = [diagnosticFromError(studioRef.current.revision, draftValidation.error, studioRef.current.draft)];
+							} catch (error) {
+								draftDiagnostics = [diagnosticFromError(studioRef.current.revision, error, studioRef.current.draft)];
+							}
+						}
+					}
+					if (!isCurrentSession()) return;
 					patchStudio({
-						phase: 'ready',
-						diagnostics: [],
+						phase: draftDiagnostics.length ? 'error' : 'ready',
+						diagnostics: draftDiagnostics,
 						runtime: {
 							...studioRef.current.runtime,
 							audioState: 'locked',
@@ -387,7 +429,7 @@ export default function Studio() {
 					});
 				}
 			} catch (error) {
-				if (!mountedRef.current) return;
+				if (!isCurrentSession()) return;
 				patchStudio({
 					phase: 'error',
 					diagnostics: [getErrorDiagnostic(activeRevision, error, 'audio', studioRef.current.lastValid)],
@@ -399,62 +441,142 @@ export default function Studio() {
 		void boot();
 		return () => {
 			mountedRef.current = false;
+			studioGenerationRef.current += 1;
+			if (trackCommitTimerRef.current !== null) {
+				clearTimeout(trackCommitTimerRef.current);
+				trackCommitTimerRef.current = null;
+			}
+			pendingTrackSourceRef.current = null;
 			adapter.destroy();
 			adapterRef.current = null;
 		};
 	}, [patchRuntime, patchStudio]);
 
+	const persistStudioSnapshot = useCallback(async (
+		snapshot: StoredProjectSnapshot = snapshotFromStudio(studioRef.current),
+		generation = studioGenerationRef.current,
+	): Promise<void> => {
+		const operation = persistenceQueueRef.current.then(async () => {
+			// A queued autosave can outlive a React island. Do not let a stale
+			// session write after teardown (especially same-revision metadata such
+			// as a project rename) or a remounted session overwrite newer state.
+			if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+			await saveProjectSnapshot(snapshot.project.id, snapshot);
+		});
+		persistenceQueueRef.current = operation.then(() => undefined, () => undefined);
+		try {
+			await operation;
+		} catch {
+			if (mountedRef.current && studioGenerationRef.current === generation && studioRef.current.persistenceState === 'ready') {
+				patchStudio({ persistenceState: 'unavailable' });
+			}
+		}
+	}, [patchStudio]);
+
 	useEffect(() => {
 		if (studio.persistenceState !== 'ready') return undefined;
 
 		const snapshot = snapshotFromStudio(studioRef.current);
+		const generation = studioGenerationRef.current;
 		const timeout = setTimeout(() => {
-			void saveProjectSnapshot(snapshot.project.id, snapshot).catch(() => {
-				if (mountedRef.current && studioRef.current.persistenceState === 'ready') {
-					patchStudio({ persistenceState: 'unavailable' });
-				}
-			});
+			void persistStudioSnapshot(snapshot, generation);
 		}, 220);
 
 		return () => clearTimeout(timeout);
-	}, [patchStudio, studio.activeRevision, studio.draft, studio.lastValid, studio.persistenceState, studio.projectName, studio.revision, studio.songEndCycle]);
+	}, [persistStudioSnapshot, studio.activeRevision, studio.draft, studio.lastValid, studio.persistenceState, studio.projectName, studio.revision, studio.songEndCycle]);
 
 	const commitSource = useCallback(
-		async (source: string, options: { recordHistory?: boolean } = {}): Promise<CommitSourceResult> => {
-			const adapter = adapterRef.current;
-			const current = studioRef.current;
-			const previousSource = sourceHistoryRef.current.cursorSource;
-			if (!adapter) return { ok: false, changed: false, previousSource, source, revision: current.revision, error: diagnosticFromError(current.revision, new Error('The Strudel runtime is not ready.'), source) };
-			if (source === current.lastValid && current.diagnostics.length === 0 && source === current.draft) {
-				sourceHistoryRef.current.cursorSource = source;
-				return { ok: true, changed: false, previousSource, source, revision: current.revision };
-			}
+		(source: string, options: { recordHistory?: boolean; expectedRevision?: number } = {}): Promise<CommitSourceResult> => {
+			const operationGeneration = studioGenerationRef.current;
+			const operation = sourceCommitQueueRef.current.then(async (): Promise<CommitSourceResult> => {
+				const current = studioRef.current;
+				const previousSource = sourceHistoryRef.current.cursorSource;
+				if (!mountedRef.current || studioGenerationRef.current !== operationGeneration) {
+					return {
+						ok: false,
+						changed: false,
+						previousSource,
+						source,
+						revision: current.revision,
+						error: diagnosticFromError(current.revision, new Error('The studio session is no longer active.'), source),
+					};
+				}
+				const adapter = adapterRef.current;
+				if (!adapter) return { ok: false, changed: false, previousSource, source, revision: current.revision, error: diagnosticFromError(current.revision, new Error('The Strudel runtime is not ready.'), source) };
+				if (options.expectedRevision !== undefined && current.revision !== options.expectedRevision) {
+					return { ok: false, changed: false, previousSource, source, revision: current.revision, conflict: { expectedRevision: options.expectedRevision, actualRevision: current.revision } };
+				}
+				const hasSourceDiagnostics = current.diagnostics.some((diagnostic) => diagnostic.phase !== 'audio');
+				if (source === current.lastValid && source === current.draft && !hasSourceDiagnostics) {
+					sourceHistoryRef.current.cursorSource = source;
+					return { ok: true, changed: false, previousSource, source, revision: current.revision };
+				}
+				// Re-submitting the same rejected draft is a no-op. Preserve its
+				// diagnostic and revision instead of manufacturing another history
+				// entry for identical source bytes.
+				if (source === current.draft && current.phase === 'error' && current.diagnostics.length > 0) {
+					sourceHistoryRef.current.cursorSource = source;
+					return { ok: false, changed: false, previousSource, source, revision: current.revision, error: current.diagnostics[0] };
+				}
 
-			const baseRevision = current.revision;
-			const revision = baseRevision + 1;
-			patchStudio({ draft: source, revision, phase: 'validating', diagnostics: [] });
-			let result: AdapterResult;
-			try {
-				result = await adapter.evaluateSource(source, {
-					autoplay: false,
-					restoreSource: current.lastValid,
-				});
-			} catch (error) {
-				result = { ok: false, error };
-			}
+				const baseRevision = current.revision;
+				const revision = baseRevision + 1;
+				patchStudio({ draft: source, revision, phase: 'validating', diagnostics: [] });
+				const identityDiagnostics = getSourceIdentityDiagnostics(revision, source);
+				if (identityDiagnostics.length) {
+					const diagnostic = identityDiagnostics[0];
+					patchStudio({
+						phase: 'error',
+						diagnostics: identityDiagnostics,
+						runtime: { ...studioRef.current.runtime, activeRevision: studioRef.current.activeRevision },
+					});
+					sourceHistoryRef.current.cursorSource = source;
+					if (options.recordHistory !== false && source !== previousSource) {
+						sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
+						if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
+						sourceHistoryRef.current.redo = [];
+					}
+						if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
+						return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
+				}
+				let result: AdapterResult;
+				try {
+					result = await adapter.evaluateSource(source, {
+						autoplay: false,
+						restoreSource: current.lastValid,
+					});
+				} catch (error) {
+					result = { ok: false, error };
+				}
 
-			if (!mountedRef.current || studioRef.current.revision !== revision) return { ok: false, changed: false, previousSource, source, revision };
-			if (result.ok) {
-				const explicitEndCycle = getExplicitSourceEndCycle(source);
-				const nextSongEndCycle = Math.max(studioRef.current.songEndCycle, explicitEndCycle);
-				adapter.setSongEndCycle(nextSongEndCycle);
+				if (!mountedRef.current || studioGenerationRef.current !== operationGeneration) return { ok: false, changed: false, previousSource, source, revision };
+				if (result.ok) {
+					const explicitEndCycle = getExplicitSourceEndCycle(source);
+					const nextSongEndCycle = Math.max(studioRef.current.songEndCycle, explicitEndCycle);
+					adapter.setSongEndCycle(nextSongEndCycle);
+					patchStudio({
+						lastValid: source,
+						activeRevision: revision,
+						songEndCycle: nextSongEndCycle,
+						diagnostics: [],
+						phase: 'ready',
+						runtime: { ...studioRef.current.runtime, activeRevision: revision },
+					});
+					sourceHistoryRef.current.cursorSource = source;
+					if (options.recordHistory !== false && source !== previousSource) {
+						sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
+						if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
+						sourceHistoryRef.current.redo = [];
+					}
+						if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
+					return { ok: true, changed: source !== previousSource, previousSource, source, revision };
+				}
+
+				const diagnostic = diagnosticFromError(revision, result.error, source);
 				patchStudio({
-					lastValid: source,
-					activeRevision: revision,
-					songEndCycle: nextSongEndCycle,
-					diagnostics: [],
-					phase: 'ready',
-					runtime: { ...studioRef.current.runtime, activeRevision: revision },
+					phase: 'error',
+					diagnostics: [diagnostic],
+					runtime: { ...studioRef.current.runtime, activeRevision: studioRef.current.activeRevision },
 				});
 				sourceHistoryRef.current.cursorSource = source;
 				if (options.recordHistory !== false && source !== previousSource) {
@@ -462,24 +584,13 @@ export default function Studio() {
 					if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
 					sourceHistoryRef.current.redo = [];
 				}
-				return { ok: true, changed: source !== previousSource, previousSource, source, revision };
-			}
-
-			const diagnostic = diagnosticFromError(revision, result.error, source);
-			patchStudio({
-				phase: 'error',
-				diagnostics: [diagnostic],
-				runtime: { ...studioRef.current.runtime, activeRevision: studioRef.current.activeRevision },
+				if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
+				return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
 			});
-			sourceHistoryRef.current.cursorSource = source;
-			if (options.recordHistory !== false && source !== previousSource) {
-				sourceHistoryRef.current.undo.push({ before: previousSource, after: source, beforeRevision: baseRevision, afterRevision: revision });
-				if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
-				sourceHistoryRef.current.redo = [];
-			}
-			return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
+			sourceCommitQueueRef.current = operation.then(() => undefined, () => undefined);
+			return operation;
 		},
-		[patchStudio],
+		[patchStudio, persistStudioSnapshot],
 	);
 
 	const cancelPendingTrackCommit = useCallback(() => {
@@ -491,14 +602,14 @@ export default function Studio() {
 	}, []);
 
 	const queueTrackCommit = useCallback(
-		(source: string) => {
-			pendingTrackSourceRef.current = source;
+		(source: string, baseRevision: number) => {
+			pendingTrackSourceRef.current = { source, baseRevision };
 			if (trackCommitTimerRef.current !== null) clearTimeout(trackCommitTimerRef.current);
 			trackCommitTimerRef.current = setTimeout(() => {
-				const queuedSource = pendingTrackSourceRef.current;
+				const queuedEdit = pendingTrackSourceRef.current;
 				pendingTrackSourceRef.current = null;
 				trackCommitTimerRef.current = null;
-				if (queuedSource !== null) void commitSource(queuedSource);
+				if (queuedEdit !== null) void commitSource(queuedEdit.source, { expectedRevision: queuedEdit.baseRevision });
 			}, 120);
 		},
 		[commitSource],
@@ -508,11 +619,19 @@ export default function Studio() {
 
 	const addTrack = useCallback(async () => {
 		cancelPendingTrackCommit();
+		const baseRevision = studioRef.current.revision;
 		const currentSource = studioRef.current.draft.trimEnd();
 		const nextTrackNumber = getSourceBlocks(currentSource).length + 1;
-		const trackId = `trk_${Date.now().toString(36).toUpperCase()}`;
+		const existingIds = new Set(getSourceBlocks(currentSource).map((track) => track.id));
+		let trackId = '';
+		while (!trackId || existingIds.has(trackId)) {
+			const randomUuid = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+				? crypto.randomUUID().toUpperCase()
+				: `${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+			trackId = `trk_${randomUuid}`;
+		}
 		const nextSource = `${currentSource}\n\n// @sushi-track {"id":"${trackId}","name":"Track ${nextTrackNumber}","type":"synth","schema":1}\n$: note("<c3 e3 g3 a3>").s("sine").gain(0.18)\n`;
-		await commitSource(nextSource);
+		await commitSource(nextSource, { expectedRevision: baseRevision });
 	}, [cancelPendingTrackCommit, commitSource]);
 
 	const updateTrackSource = useCallback(
@@ -520,27 +639,35 @@ export default function Studio() {
 			const currentSource = studioRef.current.draft;
 			const nextSource = update(currentSource);
 			if (nextSource === currentSource) return;
+			const baseRevision = studioRef.current.revision;
 			patchStudio({
 				draft: nextSource,
 				...(studioRef.current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
 			});
-			queueTrackCommit(nextSource);
+			queueTrackCommit(nextSource, baseRevision);
 		},
 		[patchStudio, queueTrackCommit],
 	);
 
 	const setTrackRange = useCallback(
-		(trackId: string, startCycle: number, endCycle: number) => updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, startCycle, endCycle)),
+		(trackId: string, startCycle: number, endCycle: number) => updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, startCycle, endCycle, getSourceCycleStep(source))),
 		[updateTrackSource],
 	);
 
 	const setSongEndCycle = useCallback((value: number) => {
 		if (!Number.isFinite(value) || value <= 0) return;
-		const requestedEndCycle = Math.max(0.25, Math.round(value * 4) / 4);
+		const cycleStep = getSourceCycleStep(studioRef.current.lastValid);
+		const requestedEndCycle = Math.max(cycleStep, Math.round(value / cycleStep) * cycleStep);
 		const nextSongEndCycle = Math.max(requestedEndCycle, getExplicitSourceEndCycle(studioRef.current.lastValid));
 		adapterRef.current?.setSongEndCycle(nextSongEndCycle);
-		patchStudio({ songEndCycle: nextSongEndCycle });
-	}, [patchStudio]);
+		patchStudio({
+			songEndCycle: nextSongEndCycle,
+			...(studioRef.current.runtime.currentCycle > nextSongEndCycle ? { runtime: { ...studioRef.current.runtime, currentCycle: nextSongEndCycle } } : {}),
+		});
+		// Timeline edits are project data too. Persist immediately so a reload
+		// cannot lose a boundary change made between autosave ticks.
+		void persistStudioSnapshot();
+	}, [patchStudio, persistStudioSnapshot]);
 
 	const adjustArrangementZoom = useCallback((delta: number) => {
 		const shell = timelineShellRef.current;
@@ -569,11 +696,12 @@ export default function Studio() {
 
 			const rect = drag.lane.getBoundingClientRect();
 			if (!rect.width) return;
-			const nextCycle = clamp(Math.round(((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle * 4) / 4, 0, studioRef.current.songEndCycle);
+			const cycleStep = getSourceCycleStep(studioRef.current.draft);
+			const nextCycle = clamp(Math.round(((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle / cycleStep) * cycleStep, 0, studioRef.current.songEndCycle);
 			const details = getSourceBlockDetails(studioRef.current.draft, studioRef.current.songEndCycle).find((block) => block.id === drag.trackId);
 			if (!details) return;
-			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, details.timing.endCycle - 0.25) : details.timing.startCycle;
-			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, details.timing.startCycle + 0.25) : details.timing.endCycle;
+			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, details.timing.endCycle - cycleStep) : details.timing.startCycle;
+			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, details.timing.startCycle + cycleStep) : details.timing.endCycle;
 			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.min(studioRef.current.songEndCycle, endCycle));
 		},
 		[setTrackRange],
@@ -621,8 +749,10 @@ export default function Studio() {
 		async (command: StudioCommand): Promise<DispatchResult> => {
 			if (command.type === 'writeSource') {
 				cancelPendingTrackCommit();
-				const result = await commitSource(command.source);
-				return result.ok ? { ok: true } : { ok: false, error: result.error };
+				const result = await commitSource(command.source, { expectedRevision: command.expectedRevision });
+				if (result.ok) return { ok: true };
+				if (result.conflict) return { ok: false, error: new Error(`Source changed before this edit could be committed (expected revision ${result.conflict.expectedRevision}, current revision ${result.conflict.actualRevision}).`) };
+				return { ok: false, error: result.error };
 			}
 
 			const adapter = adapterRef.current;
@@ -631,16 +761,27 @@ export default function Studio() {
 			if (command.type === 'play') {
 				cancelPendingTrackCommit();
 				const current = studioRef.current;
+				const expectedRevision = current.revision;
 				const draftHasNotBeenEvaluated = current.diagnostics.length === 0;
 				if ((current.draft !== current.lastValid && draftHasNotBeenEvaluated) || current.activeRevision === null) {
-					const committed = await commitSource(current.draft);
-					if (!committed.ok) return { ok: false, error: committed.error };
+					const committed = await commitSource(current.draft, { expectedRevision });
+					if (!committed.ok) {
+						// If another actor won the race and left a valid active source,
+						// play that newer source. Never overwrite it with the stale draft.
+						const latest = studioRef.current;
+						if (!committed.conflict || latest.draft !== latest.lastValid || latest.activeRevision === null) return { ok: false, error: committed.error ?? new Error('The source changed before playback could start.') };
+					}
 				}
 
-				const result = await adapter.play(current.songEndCycle);
+				// A commit can expand the project boundary when the new source adds an
+				// explicit arrange/seqPLoop span. Read the ref after that async commit
+				// instead of passing the stale pre-commit snapshot to the scheduler.
+				const result = await adapter.play(studioRef.current.songEndCycle);
 				if (result.ok) {
+					const remainingDiagnostics = studioRef.current.diagnostics.filter((diagnostic) => diagnostic.phase !== 'audio');
 					patchStudio({
-						phase: 'ready',
+						phase: remainingDiagnostics.length ? 'error' : 'ready',
+						diagnostics: remainingDiagnostics,
 						runtime: {
 							...studioRef.current.runtime,
 							transport: 'playing',
@@ -652,7 +793,7 @@ export default function Studio() {
 					patchStudio({
 						phase: 'error',
 						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
-						runtime: { ...studioRef.current.runtime, audioState: 'error', transport: 'stopped' },
+						runtime: { ...studioRef.current.runtime, audioState: isAudioLockedError(result.error) ? 'locked' : 'error', transport: 'stopped' },
 					});
 					return { ok: false, error: result.error };
 				}
@@ -662,15 +803,17 @@ export default function Studio() {
 			if (command.type === 'pause') {
 				const result = await adapter.pause();
 				if (result.ok) {
+					const remainingDiagnostics = studioRef.current.diagnostics.filter((diagnostic) => diagnostic.phase !== 'audio');
 					patchStudio({
-						phase: studioRef.current.diagnostics.length ? 'error' : 'ready',
+						phase: remainingDiagnostics.length ? 'error' : 'ready',
+						diagnostics: remainingDiagnostics,
 						runtime: { ...studioRef.current.runtime, transport: 'paused' },
 					});
 				} else {
 					patchStudio({
 						phase: 'error',
 						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
-						runtime: { ...studioRef.current.runtime, audioState: 'error' },
+						runtime: { ...studioRef.current.runtime, audioState: isAudioLockedError(result.error) ? 'locked' : 'error' },
 					});
 					return { ok: false, error: result.error };
 				}
@@ -692,17 +835,19 @@ export default function Studio() {
 				return { ok: true };
 			}
 
-			const result = await adapter.stop();
-			if (result.ok) {
-				patchStudio({
-					phase: studioRef.current.diagnostics.length ? 'error' : 'ready',
-					runtime: { ...studioRef.current.runtime, transport: 'stopped', currentCycle: 0 },
+				const result = await adapter.stop();
+				if (result.ok) {
+					const remainingDiagnostics = studioRef.current.diagnostics.filter((diagnostic) => diagnostic.phase !== 'audio');
+					patchStudio({
+						phase: remainingDiagnostics.length ? 'error' : 'ready',
+						diagnostics: remainingDiagnostics,
+						runtime: { ...studioRef.current.runtime, transport: 'stopped', currentCycle: 0 },
 				});
 			} else {
 				patchStudio({
 					phase: 'error',
 						diagnostics: [getErrorDiagnostic(studioRef.current.revision, result.error, 'audio', studioRef.current.draft)],
-					runtime: { ...studioRef.current.runtime, audioState: 'error', transport: 'stopped' },
+						runtime: { ...studioRef.current.runtime, audioState: isAudioLockedError(result.error) ? 'locked' : 'error', transport: 'stopped' },
 				});
 				return { ok: false, error: result.error };
 			}
@@ -747,27 +892,12 @@ export default function Studio() {
 			runtime: current.runtime,
 			phase: current.phase,
 			persistenceState: current.persistenceState,
-			webmcp: { available: webmcpAvailableRef.current || Boolean(getNativeModelContext()) },
+			webmcp: { available: webmcpAvailableRef.current },
 		};
 	}, []);
 
-	const rememberMutation = useCallback((result: WebMcpMutationResult): WebMcpMutationResult => {
-		if (result.transactionId) {
-			sourceTransactionsRef.current.set(result.transactionId, result);
-			while (sourceTransactionsRef.current.size > SOURCE_HISTORY_LIMIT) {
-				const first = sourceTransactionsRef.current.keys().next().value as string | undefined;
-				if (first === undefined) break;
-				sourceTransactionsRef.current.delete(first);
-			}
-		}
-		return result;
-	}, []);
-
-	const sourceMutationForWebMcp = useCallback(
+	const applySourceMutation = useCallback(
 		async (action: string, input: SourceMutationInput): Promise<WebMcpMutationResult> => {
-			const cached = sourceTransactionsRef.current.get(input.transactionId);
-			if (cached) return cached;
-
 			const current = studioRef.current;
 			if (input.baseRevision !== current.revision) {
 				const state = getWebMcpState();
@@ -788,19 +918,33 @@ export default function Studio() {
 			const beforeSource = current.draft;
 			let result: CommitSourceResult;
 			try {
-				result = await commitSource(input.source);
+				result = await commitSource(input.source, { expectedRevision: input.baseRevision });
 			} catch (error) {
 				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The source transaction could not be completed.', { code: 'SOURCE_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) }));
+				return makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The source transaction could not be completed.', { code: 'SOURCE_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) });
 			}
 
 			const state = getWebMcpState();
+			if (result.conflict) {
+				return {
+					ok: false,
+					action,
+					affectedEntityIds: sourceEntityIds(state),
+					message: `Revision conflict: expected ${formatRevision(result.conflict.expectedRevision)}, current is ${formatRevision(result.conflict.actualRevision)}.`,
+					state,
+					revision: state.source.revision,
+					activeRevision: state.source.activeRevision,
+					transactionId: input.transactionId,
+					error: { code: 'REVISION_CONFLICT', message: 'The source changed while this transaction was waiting to commit.' },
+					conflict: result.conflict,
+				};
+			}
 			if (result.ok) {
-				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, `Source accepted at ${formatRevision(state.source.revision)}.`));
+				return makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, `Source accepted at ${formatRevision(state.source.revision)}.`);
 			}
 
 			const diagnostic = result.error;
-			return rememberMutation(makeMutationResult(
+			return makeMutationResult(
 				state,
 				action,
 				input.transactionId,
@@ -809,37 +953,63 @@ export default function Studio() {
 				false,
 				`Source draft updated, but Strudel rejected it; ${formatRevision(state.source.activeRevision)} remains active.`,
 				{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the source.', details: diagnostic ? { diagnostic } : undefined },
-			));
+			);
 		},
-		[commitSource, getWebMcpState, rememberMutation],
+		[commitSource, getWebMcpState],
+	);
+
+	const sourceMutationForWebMcp = useCallback(
+		(action: string, input: SourceMutationInput): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			action,
+			input.transactionId,
+			() => applySourceMutation(action, input),
+			stableSerialize(input),
+		).catch((error) => {
+			if (!(error instanceof TransactionReuseError)) throw error;
+			const state = getWebMcpState();
+			return makeMutationResult(state, action, input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+		}),
+		[applySourceMutation, getWebMcpState],
 	);
 
 	const patchSourceForWebMcp = useCallback(
-		async (input: SourcePatchInput): Promise<WebMcpMutationResult> => {
-			const cached = sourceTransactionsRef.current.get(input.transactionId);
-			if (cached) return cached;
-			const current = studioRef.current;
-			if (input.baseRevision !== current.revision) {
-				return sourceMutationForWebMcp('patch_strudel_source', { source: current.draft, baseRevision: input.baseRevision, transactionId: input.transactionId });
-			}
-			const applied = applyTextEdits(current.draft, input.edits);
-			if (!applied.ok) {
+		(input: SourcePatchInput): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			'patch_strudel_source',
+			input.transactionId,
+			async () => {
+				const current = studioRef.current;
+				if (input.baseRevision !== current.revision) {
+					return applySourceMutation('patch_strudel_source', { source: current.draft, baseRevision: input.baseRevision, transactionId: input.transactionId });
+				}
+				const applied = applyTextEdits(current.draft, input.edits);
+				if (!applied.ok) {
+					const state = getWebMcpState();
+					return makeMutationResult(state, 'patch_strudel_source', input.transactionId, current.draft, current.revision, false, 'Patch rejected before validation; the source was not changed.', applied.error);
+				}
+				if (applied.source === current.draft) {
+					const state = getWebMcpState();
+					return makeMutationResult(state, 'patch_strudel_source', input.transactionId, current.draft, current.revision, true, 'No source changes were requested.');
+				}
+				return applySourceMutation('patch_strudel_source', { source: applied.source, baseRevision: input.baseRevision, transactionId: input.transactionId });
+				},
+				stableSerialize(input),
+			).catch((error) => {
+				if (!(error instanceof TransactionReuseError)) throw error;
 				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, 'patch_strudel_source', input.transactionId, current.draft, current.revision, false, 'Patch rejected before validation; the source was not changed.', applied.error));
-			}
-			if (applied.source === current.draft) {
-				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, 'patch_strudel_source', input.transactionId, current.draft, current.revision, true, 'No source changes were requested.'));
-			}
-			return sourceMutationForWebMcp('patch_strudel_source', { source: applied.source, baseRevision: input.baseRevision, transactionId: input.transactionId });
-		},
-		[getWebMcpState, rememberMutation, sourceMutationForWebMcp],
+				return makeMutationResult(state, 'patch_strudel_source', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+			}),
+		[applySourceMutation, getWebMcpState],
 	);
 
 	const validateSourceForWebMcp = useCallback(
 		async (source?: string): Promise<WebMcpValidationResult> => {
 			const candidate = source ?? studioRef.current.draft;
 			const revision = studioRef.current.revision;
+			const identityDiagnostics = getSourceIdentityDiagnostics(revision, candidate);
+			if (identityDiagnostics.length) {
+				const diagnostic = identityDiagnostics[0];
+				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: identityDiagnostics, message: diagnostic.message, revision, state: getWebMcpState(), error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
+			}
 			const adapter = adapterRef.current;
 			if (!adapter) {
 				const diagnostic = diagnosticFromError(revision, new Error('The Strudel runtime is not ready.'), candidate);
@@ -848,12 +1018,18 @@ export default function Studio() {
 
 			try {
 				const result = await adapter.validateSource(candidate, studioRef.current.lastValid);
-				if (result.ok) return { ok: true, action: 'validate_strudel_source', source: candidate, diagnostics: [], message: 'Strudel accepted the candidate source.', revision, state: getWebMcpState() };
-				const diagnostic = diagnosticFromError(revision, result.error, candidate);
-				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision, state: getWebMcpState(), error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
+				const state = getWebMcpState();
+				const resultRevision = state.source.revision;
+				const staleSuffix = resultRevision === revision
+					? ''
+					: ` (the studio advanced to ${formatRevision(resultRevision)} while validation was running)`;
+				if (result.ok) return { ok: true, action: 'validate_strudel_source', source: candidate, diagnostics: [], message: `Strudel accepted the candidate source.${staleSuffix}`, revision: resultRevision, state };
+				const diagnostic = diagnosticFromError(resultRevision, result.error, candidate);
+				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision: resultRevision, state, error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
 			} catch (error) {
-				const diagnostic = diagnosticFromError(revision, error, candidate);
-				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision, state: getWebMcpState(), error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
+				const state = getWebMcpState();
+				const diagnostic = diagnosticFromError(state.source.revision, error, candidate);
+				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision: state.source.revision, state, error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
 			}
 		},
 		[getWebMcpState],
@@ -867,19 +1043,20 @@ export default function Studio() {
 			const result = await dispatch(command);
 			const state = getWebMcpState();
 			if (result.ok) {
-				const message = input.action === 'seek' ? `Playhead moved to cycle ${formatCycle(state.runtime.currentCycle)}.` : `Playback ${input.action === 'resume' ? 'resumed' : `${input.action}ed`}.`;
+				const message = input.action === 'seek' ? `Playhead moved to cycle ${formatCycle(state.runtime.currentCycle)}.` : `Playback ${input.action === 'resume' ? 'resumed' : input.action === 'stop' ? 'stopped' : 'played'}.`;
 				return { ok: true, action: `control_playback:${input.action}`, affectedEntityIds: ['transport'], message, state, revision: state.source.revision, activeRevision: state.source.activeRevision };
 			}
 			const message = result.error instanceof Error ? result.error.message : String(result.error ?? 'Playback command failed.');
-			return { ok: false, action: `control_playback:${input.action}`, affectedEntityIds: ['transport'], message, state, revision: state.source.revision, activeRevision: state.source.activeRevision, error: { code: 'PLAYBACK_FAILED', message } };
+			return { ok: false, action: `control_playback:${input.action}`, affectedEntityIds: ['transport'], message, state, revision: state.source.revision, activeRevision: state.source.activeRevision, error: { code: isAudioLockedError(result.error) ? 'AUDIO_LOCKED' : 'PLAYBACK_FAILED', message } };
 		},
 		[dispatch, getWebMcpState],
 	);
 
 	const undoSourceForWebMcp = useCallback(
-		async (input: Omit<SourceMutationInput, 'source'>): Promise<WebMcpMutationResult> => {
-			const cached = sourceTransactionsRef.current.get(input.transactionId);
-			if (cached) return cached;
+		(input: Omit<SourceMutationInput, 'source'>): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			'undo_source_edit',
+			input.transactionId,
+			async () => {
 			const current = studioRef.current;
 			if (input.baseRevision !== current.revision) {
 				const state = getWebMcpState();
@@ -888,26 +1065,36 @@ export default function Studio() {
 			const entry = sourceHistoryRef.current.undo[sourceHistoryRef.current.undo.length - 1];
 			if (!entry) {
 				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to undo.', { code: 'NO_UNDO', message: 'The shared source history is already at its oldest revision.' }));
+				return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to undo.', { code: 'NO_UNDO', message: 'The shared source history is already at its oldest revision.' });
 			}
-			const result = await commitSource(entry.before, { recordHistory: false });
-			if (!result.ok) {
-				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Undo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Undo source was rejected.' }));
-			}
+				const result = await commitSource(entry.before, { recordHistory: false, expectedRevision: input.baseRevision });
+				if (!result.ok) {
+					const state = getWebMcpState();
+					if (result.conflict) {
+						return { ok: false, action: 'undo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(result.conflict.expectedRevision)}, current is ${formatRevision(result.conflict.actualRevision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed while this transaction was waiting to commit.' }, conflict: result.conflict };
+					}
+					return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Undo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Undo source was rejected.' });
+				}
 			sourceHistoryRef.current.undo.pop();
 			sourceHistoryRef.current.redo.push(entry);
 			if (sourceHistoryRef.current.redo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.redo.shift();
 			const state = getWebMcpState();
-			return rememberMutation(makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Undid source edit; now at ${formatRevision(state.source.revision)}.`));
-		},
-		[commitSource, getWebMcpState, rememberMutation],
+			return makeMutationResult(state, 'undo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Undid source edit; now at ${formatRevision(state.source.revision)}.`);
+			},
+			stableSerialize(input),
+			).catch((error) => {
+				if (!(error instanceof TransactionReuseError)) throw error;
+				const state = getWebMcpState();
+				return makeMutationResult(state, 'undo_source_edit', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+			}),
+		[commitSource, getWebMcpState],
 	);
 
 	const redoSourceForWebMcp = useCallback(
-		async (input: Omit<SourceMutationInput, 'source'>): Promise<WebMcpMutationResult> => {
-			const cached = sourceTransactionsRef.current.get(input.transactionId);
-			if (cached) return cached;
+		(input: Omit<SourceMutationInput, 'source'>): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			'redo_source_edit',
+			input.transactionId,
+			async () => {
 			const current = studioRef.current;
 			if (input.baseRevision !== current.revision) {
 				const state = getWebMcpState();
@@ -916,20 +1103,29 @@ export default function Studio() {
 			const entry = sourceHistoryRef.current.redo[sourceHistoryRef.current.redo.length - 1];
 			if (!entry) {
 				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to redo.', { code: 'NO_REDO', message: 'The shared source history is already at its newest revision.' }));
+				return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, current.revision, false, 'There is no source edit to redo.', { code: 'NO_REDO', message: 'The shared source history is already at its newest revision.' });
 			}
-			const result = await commitSource(entry.after, { recordHistory: false });
-			if (!result.ok) {
-				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Redo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Redo source was rejected.' }));
-			}
+				const result = await commitSource(entry.after, { recordHistory: false, expectedRevision: input.baseRevision });
+				if (!result.ok) {
+					const state = getWebMcpState();
+					if (result.conflict) {
+						return { ok: false, action: 'redo_source_edit', affectedEntityIds: sourceEntityIds(state), message: `Revision conflict: expected ${formatRevision(result.conflict.expectedRevision)}, current is ${formatRevision(result.conflict.actualRevision)}.`, state, revision: state.source.revision, activeRevision: state.source.activeRevision, transactionId: input.transactionId, error: { code: 'REVISION_CONFLICT', message: 'The source changed while this transaction was waiting to commit.' }, conflict: result.conflict };
+					}
+					return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, false, 'Redo could not be validated by Strudel.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Redo source was rejected.' });
+				}
 			sourceHistoryRef.current.redo.pop();
 			sourceHistoryRef.current.undo.push(entry);
 			if (sourceHistoryRef.current.undo.length > SOURCE_HISTORY_LIMIT) sourceHistoryRef.current.undo.shift();
 			const state = getWebMcpState();
-			return rememberMutation(makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Redid source edit; now at ${formatRevision(state.source.revision)}.`));
-		},
-		[commitSource, getWebMcpState, rememberMutation],
+			return makeMutationResult(state, 'redo_source_edit', input.transactionId, current.draft, input.baseRevision, true, `Redid source edit; now at ${formatRevision(state.source.revision)}.`);
+			},
+			stableSerialize(input),
+			).catch((error) => {
+				if (!(error instanceof TransactionReuseError)) throw error;
+				const state = getWebMcpState();
+				return makeMutationResult(state, 'redo_source_edit', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+			}),
+		[commitSource, getWebMcpState],
 	);
 
 	const webmcpController = useMemo<WebMcpController>(() => ({
@@ -945,7 +1141,12 @@ export default function Studio() {
 	useEffect(() => {
 		let disposed = false;
 		let registration: WebMcpRegistration | null = null;
-		void registerWebMcpTools(webmcpController).then((nextRegistration) => {
+		const waitController = new AbortController();
+		void waitForNativeModelContext({ signal: waitController.signal }).then((context) => {
+			if (!context || disposed) return null;
+			return registerWebMcpTools(webmcpController, context, { signal: waitController.signal });
+		}).then((nextRegistration) => {
+			if (!nextRegistration) return;
 			if (disposed) {
 				nextRegistration.dispose();
 				return;
@@ -953,11 +1154,18 @@ export default function Studio() {
 			registration = nextRegistration;
 			webmcpRegistrationRef.current = nextRegistration;
 			webmcpAvailableRef.current = nextRegistration.available;
+		}).catch(() => {
+			// Host integration is optional. A late or malformed host must not create
+			// an unhandled rejection that takes down the studio page.
+			if (!disposed) webmcpAvailableRef.current = false;
 		});
 		return () => {
 			disposed = true;
-			registration?.dispose();
-			webmcpRegistrationRef.current?.dispose();
+			waitController.abort();
+			// The local registration and the ref point at the same object once
+			// discovery completes. Dispose through one path so a host bridge with a
+			// non-idempotent teardown callback is never invoked twice.
+			(registration ?? webmcpRegistrationRef.current)?.dispose();
 			webmcpRegistrationRef.current = null;
 			webmcpAvailableRef.current = false;
 		};
@@ -968,7 +1176,8 @@ export default function Studio() {
 			const rect = ruler.getBoundingClientRect();
 			if (!rect.width) return;
 			const songEndCycle = studioRef.current.songEndCycle;
-			const cycle = clamp(Math.round(((clientX - rect.left) / rect.width) * songEndCycle * 4) / 4, 0, songEndCycle);
+			const cycleStep = getSourceCycleStep(studioRef.current.lastValid);
+			const cycle = clamp(Math.round(((clientX - rect.left) / rect.width) * songEndCycle / cycleStep) * cycleStep, 0, songEndCycle);
 			if (timelineSeekCycleRef.current === cycle) return;
 			timelineSeekCycleRef.current = cycle;
 			void dispatch({ type: 'seek', cycle });
@@ -1009,15 +1218,16 @@ export default function Studio() {
 	);
 
 	const handleTimelineSeekKeyDown = useCallback(
-		(event: ReactKeyboardEvent<HTMLButtonElement>) => {
-			const currentCycle = clamp(studioRef.current.runtime.currentCycle, 0, studioRef.current.songEndCycle);
-			let nextCycle: number | null = null;
-			switch (event.key) {
-				case 'ArrowLeft':
-					nextCycle = currentCycle - 0.25;
-					break;
-				case 'ArrowRight':
-					nextCycle = currentCycle + 0.25;
+			(event: ReactKeyboardEvent<HTMLButtonElement>) => {
+				const currentCycle = clamp(studioRef.current.runtime.currentCycle, 0, studioRef.current.songEndCycle);
+				const cycleStep = getSourceCycleStep(studioRef.current.lastValid);
+				let nextCycle: number | null = null;
+				switch (event.key) {
+					case 'ArrowLeft':
+						nextCycle = currentCycle - cycleStep;
+						break;
+					case 'ArrowRight':
+						nextCycle = currentCycle + cycleStep;
 					break;
 				case 'PageUp':
 					nextCycle = currentCycle - 1;
@@ -1054,8 +1264,9 @@ export default function Studio() {
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
-	const timelineCells = useMemo(() => getTimelineCells(studio.songEndCycle), [studio.songEndCycle]);
+	const timelineCells = useMemo(() => getTimelineCells(studio.songEndCycle, sourceGlobals.quarterNotesPerCycle), [sourceGlobals.quarterNotesPerCycle, studio.songEndCycle]);
 	const timelineCellWidth = getTimelineCellWidth(arrangementZoom);
+	const cycleStep = getSourceCycleStep(studio.lastValid);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
 
@@ -1074,15 +1285,15 @@ export default function Studio() {
 				<div className="topbar-session">
 					<div className="session-name-row">
 						<label className="sr-only" htmlFor="project-name">Project name</label>
-						<input id="project-name" className="project-name-input" value={studio.projectName ?? 'First light'} onChange={(event) => patchStudio({ projectName: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} aria-label="Project name" title="Rename project" />
+						<input id="project-name" className="project-name-input" value={studio.projectName ?? 'First light'} onChange={(event) => patchStudio({ projectName: event.target.value })} onBlur={() => { void persistStudioSnapshot(); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} aria-label="Project name" title="Rename project" />
 						<span className={`save-state ${isDirty || studio.persistenceState === 'loading' ? 'save-state-dirty' : ''}`} title={studio.persistenceState === 'unavailable' ? 'IndexedDB is unavailable; this session will not persist after reload.' : 'Project state is saved locally'}><span className="save-dot" aria-hidden="true" />{saveStateLabel}</span>
 					</div>
 					<div className="topbar-transport" aria-label="Transport controls">
 						<div className="topbar-source-actions" aria-label="Source actions">
-							<button className="transport-button source-action-button source-action-revert" type="button" onClick={() => { cancelPendingTrackCommit(); sourceHistoryRef.current.cursorSource = studioRef.current.lastValid; patchStudio({ draft: studioRef.current.lastValid, diagnostics: [], phase: 'ready' }); }} disabled={!isDirty || isBusy} aria-label="Revert source draft" title="Revert source draft">
+						<button className="transport-button source-action-button source-action-revert" type="button" onClick={() => { cancelPendingTrackCommit(); sourceHistoryRef.current.cursorSource = studioRef.current.lastValid; patchStudio({ draft: studioRef.current.lastValid, diagnostics: [], phase: 'ready' }); void persistStudioSnapshot(); }} disabled={!isDirty || isBusy} aria-label="Revert source draft" title="Revert source draft">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v4" /><path d="M5.2 11A7.5 7.5 0 1 0 7.4 5.6L5 7" /></svg>
 							</button>
-							<button className="transport-button source-action-button source-action-commit" type="button" onClick={() => void dispatch({ type: 'writeSource', source: studioRef.current.draft })} disabled={!isDirty || isBusy} aria-label="Commit source" title="Commit source">
+							<button className="transport-button source-action-button source-action-commit" type="button" onClick={() => void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studio.revision })} disabled={!isDirty || isBusy} aria-label="Commit source" title="Commit source">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>
 							</button>
 						</div>
@@ -1124,7 +1335,7 @@ export default function Studio() {
 								onKeyDown={(event) => {
 									if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
 										event.preventDefault();
-										void dispatch({ type: 'writeSource', source: studioRef.current.draft });
+										void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studioRef.current.revision });
 									}
 								}}
 								spellCheck={false}
@@ -1167,7 +1378,7 @@ export default function Studio() {
 								<div className="timeline-duration">
 									<label className="timeline-length-control">
 										<span className="sr-only">Arrangement length in cycles</span>
-										<input type="number" min="0.25" step="0.25" value={formatCycle(studio.songEndCycle)} onChange={(event) => setSongEndCycle(Number(event.target.value))} aria-label="Arrangement length in cycles" title="Set arrangement length in cycles" />
+										<input type="number" min={cycleStep} step={cycleStep} value={formatCycle(studio.songEndCycle)} onChange={(event) => setSongEndCycle(Number(event.target.value))} aria-label="Arrangement length in cycles" title="Set arrangement length in cycles" />
 										<span>cycles</span>
 									</label>
 									<span aria-hidden="true">·</span>
@@ -1193,7 +1404,7 @@ export default function Studio() {
 							const loopHandlePosition = clipEnd > clipStart
 								? clamp((timing.endCycle / studio.songEndCycle - clipStart) / (clipEnd - clipStart), 0.01, 1)
 								: 1;
-							const loopWidth = Math.max(1, (timing.endCycle - timing.startCycle) * 4 * timelineCellWidth);
+							const loopWidth = Math.max(1, (timing.endCycle - timing.startCycle) * Math.max(1, Math.round(sourceGlobals.quarterNotesPerCycle)) * timelineCellWidth);
 							const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
 							const displayLabel = displayTiming.repeating && displayTiming.displayEndCycle > timing.endCycle
 								? `${timingLabel} · LOOP TO ${formatCycle(displayTiming.displayEndCycle)}`
@@ -1227,9 +1438,9 @@ export default function Studio() {
 									<div className="lane-grid" style={{ '--track-color': trackColor } as CSSProperties}>
 										<div className="lane-grid-lines" aria-hidden="true">{timelineCells.map((cell) => <span className={cell.barStart ? 'beat-start' : ''} key={cell.label} />)}</div>
 										<div className={`pattern-region ${displayTiming.repeating ? 'pattern-region-looping' : ''}`} style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd, '--loop-handle-position': loopHandlePosition, '--loop-width': `${loopWidth}px` } as CSSProperties} title={`${block.name}: ${displayLabel}`}>
-											<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -0.25 : 0.25; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - 0.25), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
-											<span>{block.name.toUpperCase()}</span><small>{displayLabel}</small>
-											<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -0.25 : 0.25; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + 0.25, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
+										<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -cycleStep : cycleStep; setTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - cycleStep), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
+										<span>{block.name.toUpperCase()}</span><small>{displayLabel}</small>
+										<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => startTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -cycleStep : cycleStep; setTrackRange(block.id, timing.startCycle, clamp(timing.endCycle + delta, timing.startCycle + cycleStep, studio.songEndCycle)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
 										</div>
 										<span className={`lane-playhead ${studio.runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} style={{ '--playhead-position': clamp(studio.runtime.currentCycle / studio.songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
 									</div>

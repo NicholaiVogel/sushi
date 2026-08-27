@@ -14,6 +14,13 @@ describe('arrangement timeline cells', () => {
 		expect(getTimelineCells(2.25)).toHaveLength(9);
 	});
 
+	test('uses the source quarter-note count when grouping bars', () => {
+		const cells = getTimelineCells(2, 8);
+
+		expect(cells).toHaveLength(16);
+		expect(cells.slice(0, 10).map((cell) => cell.label)).toEqual(['1', '1.1', '1.2', '1.3', '1.4', '1.5', '1.6', '1.7', '2', '2.1']);
+	});
+
 	test('clamps arrangement zoom to usable quarter-note widths', () => {
 		expect(clampTimelineZoom(0)).toBe(0.25);
 		expect(clampTimelineZoom(1.12)).toBe(1);

@@ -4,6 +4,7 @@ import '../styles/global.css';
 
 const title = 'Sushi — source-first studio';
 const description = 'A source-first browser studio for composing with Strudel, shared by people and agents.';
+const webmcpOriginTrialToken = import.meta.env.PUBLIC_WEBMCP_ORIGIN_TRIAL_TOKEN?.trim();
 ---
 
 <!doctype html>
@@ -14,6 +15,7 @@ const description = 'A source-first browser studio for composing with Strudel, s
 		<meta name="description" content={description} />
 		<meta name="theme-color" content="#0a0c0d" />
 		<meta name="generator" content={Astro.generator} />
+		{webmcpOriginTrialToken && <meta http-equiv="origin-trial" content={webmcpOriginTrialToken} />}
 		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 		<title>{title}</title>
 	</head>

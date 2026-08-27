@@ -5,7 +5,15 @@ export interface ParsedSourceBlock extends SourceBlockSummary {
 	expressionRange?: SourceRange;
 	label?: string;
 	expression?: string;
+	/** The explicit marker identity, when the source supplied one. */
+	markerId?: string;
 	marker: boolean;
+}
+
+export interface DuplicateSourceTrackId {
+	id: string;
+	first: SourceRange;
+	duplicate: SourceRange;
 }
 
 interface MarkerMetadata {
@@ -52,7 +60,15 @@ function parseMarker(line: string): MarkerMetadata | undefined {
 	if (!match) return undefined;
 
 	try {
-		return JSON.parse(match[1]) as MarkerMetadata;
+		const value = JSON.parse(match[1]) as unknown;
+		if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+		const record = value as Record<string, unknown>;
+		const id = typeof record.id === 'string' && record.id.trim() ? record.id : undefined;
+		const name = typeof record.name === 'string' && record.name.trim() ? record.name : undefined;
+		const type = record.type === 'drum' || record.type === 'synth' || record.type === 'sample' || record.type === 'unknown'
+			? record.type
+			: undefined;
+		return { ...(id ? { id } : {}), ...(name ? { name } : {}), ...(type ? { type } : {}) };
 	} catch {
 		return undefined;
 	}
@@ -65,7 +81,9 @@ function isTrackLabel(label: string): boolean {
 }
 
 function firstSoundToken(expression: string): string | undefined {
-	const soundCall = expression.match(/(?:^|\.)s\s*\(\s*["'`]([^"'`]+)["'`]/);
+	// `.s(...)` is the common spelling, while `.sound(...)` is also part of
+	// Strudel's pattern API. Treat both as the same source lane signal.
+	const soundCall = expression.match(/(?:^|\.)(?:s|sound)\s*\(\s*["'`]([^"'`]+)["'`]/);
 	const directSound = expression.match(/^\s*\(\s*["'`]([^"'`]+)["'`]/);
 	const value = soundCall?.[1] ?? directSound?.[1];
 	if (!value) return undefined;
@@ -164,6 +182,23 @@ function blockCandidates(candidates: Candidate[], lines: SourceLine[]): BlockCan
 export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 	const lines = splitLines(source);
 	const candidates = blockCandidates(candidateLines(lines), lines);
+	// Reserve every authored marker identity before assigning projection IDs to
+	// ordinary blocks. A user may legally name a marker `trk_source_01`; without
+	// this reservation an unmanaged block could receive the same React/WebMCP
+	// identity depending on source order.
+	const reservedIds = new Set(
+		candidates
+			.map(({ candidate }) => candidate.marker?.id)
+			.filter((id): id is string => id !== undefined),
+	);
+	const generatedIds = new Set<string>();
+	const generatedId = (base: string): string => {
+		let id = base;
+		let suffix = 2;
+		while (reservedIds.has(id) || generatedIds.has(id)) id = `${base}-${suffix++}`;
+		generatedIds.add(id);
+		return id;
+	};
 	let ordinaryIndex = 0;
 
 	return candidates.map((blockCandidate, index) => {
@@ -174,16 +209,17 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 		const sourceRange = { start: sourceStart, end: blockEnd, line: candidate.line.index + 1 };
 
 		if (candidate.marker) {
-			const expressionLine = blockCandidate.expressionCandidate?.line
+				const expressionLine = blockCandidate.expressionCandidate?.line
 				?? lines.slice(candidate.line.index + 1, next?.line.index ?? lines.length)
 					.find((line) => line.body.trim() && !line.body.trim().startsWith('//'));
 			if (!expressionLine) {
 				return {
-					id: candidate.marker.id ?? `unmanaged-${index + 1}`,
+					id: candidate.marker.id ?? generatedId(`unmanaged-${index + 1}`),
 					name: candidate.marker.name ?? `Source block ${index + 1}`,
 					type: candidate.marker.type ?? 'unknown',
 					line: candidate.line.index + 1,
 					sourceRange,
+					...(candidate.marker.id ? { markerId: candidate.marker.id } : {}),
 					marker: true,
 				};
 			}
@@ -191,11 +227,12 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 			const expressionRange = { start: expressionLine.offset, end: blockEnd, line: expressionLine.index + 1 };
 			const expressionMatch = expressionLine.body.match(labelPattern);
 			return {
-				id: candidate.marker.id ?? `unmanaged-${index + 1}`,
+				id: candidate.marker.id ?? generatedId(`unmanaged-${index + 1}`),
 				name: candidate.marker.name ?? `Source block ${index + 1}`,
 				type: candidate.marker.type ?? 'unknown',
 				line: candidate.line.index + 1,
 				sourceRange,
+				...(candidate.marker.id ? { markerId: candidate.marker.id } : {}),
 				expressionRange,
 				...(expressionMatch && isTrackLabel(expressionMatch[2]) ? {
 					label: expressionMatch[2],
@@ -208,7 +245,7 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 		ordinaryIndex += 1;
 		const expression = expressionForLine(source, lines, candidate.line.index, blockEnd);
 		return {
-			id: `trk_source_${ordinaryIndex.toString().padStart(2, '0')}`,
+			id: generatedId(`trk_source_${ordinaryIndex.toString().padStart(2, '0')}`),
 			name: displayName(expression, ordinaryIndex),
 			type: sourceType(expression),
 			line: candidate.line.index + 1,
@@ -219,4 +256,24 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 			marker: false,
 		};
 	});
+}
+
+/**
+ * Return every repeated explicit marker identity. Generated identities for
+ * unannotated or metadata-only blocks are intentionally excluded: they are
+ * projection IDs, not authored track IDs.
+ */
+export function getDuplicateSourceTrackIds(source: string): DuplicateSourceTrackId[] {
+	const seen = new Map<string, ParsedSourceBlock>();
+	const duplicates: DuplicateSourceTrackId[] = [];
+	for (const block of getParsedSourceBlocks(source)) {
+		if (!block.markerId) continue;
+		const first = seen.get(block.markerId);
+		if (first) {
+			duplicates.push({ id: block.markerId, first: first.sourceRange, duplicate: block.sourceRange });
+		} else {
+			seen.set(block.markerId, block);
+		}
+	}
+	return duplicates;
 }

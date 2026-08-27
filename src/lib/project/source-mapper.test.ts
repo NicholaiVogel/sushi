@@ -67,6 +67,19 @@ describe('source mapper', () => {
 		expect(restored).toContain('$: note("<e2 e2 g2 b2>")');
 	});
 
+	test('preserves an authored label when toggling source modes', () => {
+		const source = `// @sushi-track {"id":"trk_custom","name":"Lead","type":"synth","schema":1}\nlead$: s("sawtooth")`;
+		const soloed = updateTrackMode(source, 'trk_custom', 'solo', true);
+		const unsoloed = updateTrackMode(soloed, 'trk_custom', 'solo', false);
+		const muted = updateTrackMode(source, 'trk_custom', 'mute', true);
+		const restored = updateTrackMode(muted, 'trk_custom', 'mute', false);
+
+		expect(soloed).toContain('Slead$: s("sawtooth")');
+		expect(unsoloed).toContain('lead$: s("sawtooth")');
+		expect(muted).toContain('_lead$: s("sawtooth")');
+		expect(restored).toContain('lead$: s("sawtooth")');
+	});
+
 	test('does not rewrite non-scalar chain expressions', () => {
 		const source = DEFAULT_SOURCE.replace('.gain(0.24)', '.gain(slider(0.24, 0, 1))');
 		expect(updateTrackGain(source, pulseId, 0.5)).toBe(source);
@@ -106,6 +119,29 @@ describe('source mapper', () => {
 		expect(() => new Function(updated.replace(/^\/\/.*\n/, ''))).not.toThrow();
 	});
 
+	test('keeps trailing comments outside generated source controls', () => {
+		const source = `// @sushi-track {"id":"trk_comment","name":"Pulse","type":"synth","schema":1}\n$: s("bd") // keep this note\n`;
+		const withGain = updateTrackGain(source, 'trk_comment', 0.5);
+		const withRange = updateTrackRange(withGain, 'trk_comment', 1, 3);
+
+		expect(withRange).toContain('seqPLoop([1, 3, s("bd").gain(0.5)]) // keep this note');
+		expect(() => new Function(withRange.replace(/^\/\/.*\n/, ''))).not.toThrow();
+	});
+
+	test('ignores non-finite mixer values instead of writing invalid JavaScript', () => {
+		const source = DEFAULT_SOURCE;
+		expect(updateTrackGain(source, 'trk_01J4PULSE', Number.NaN)).toBe(source);
+		expect(updateTrackPan(source, 'trk_01J4PULSE', Number.POSITIVE_INFINITY)).toBe(source);
+	});
+
+	test('respects a source meter subdivision when writing a short range', () => {
+		const source = `// @sushi-track {"id":"trk_subdivision","name":"Pulse","type":"synth","schema":1}\n$: s("bd")`;
+		const updated = updateTrackRange(source, 'trk_subdivision', 0, 0.125, 0.125);
+		const [track] = getSourceBlockDetails(updated);
+
+		expect(track.timing).toEqual({ mode: 'seqPLoop', startCycle: 0, endCycle: 0.125 });
+	});
+
 	test('projects arrange durations as a source timing span', () => {
 		const arrangeSource = DEFAULT_SOURCE.replace(
 			'note("<e2 e2 g2 b2>").s("sawtooth").gain(0.24)',
@@ -114,6 +150,21 @@ describe('source mapper', () => {
 		const [pulse] = getSourceBlockDetails(arrangeSource);
 
 		expect(pulse.timing).toEqual({ mode: 'arrange', startCycle: 0, endCycle: 5 });
+	});
+
+	test('accepts whitespace before source timing call parentheses', () => {
+		const seqLoop = getSourceBlockDetails(`// @sushi-track {"id":"trk_space_loop","name":"Loop","type":"synth","schema":1}\n$: seqPLoop ([0, 2, s("bd")])`)[0];
+		const arranged = getSourceBlockDetails(`// @sushi-track {"id":"trk_space_arrange","name":"Arrange","type":"synth","schema":1}\n$: arrange ([2, s("bd")], [3, s("sd")])`)[0];
+
+		expect(seqLoop.timing).toEqual({ mode: 'seqPLoop', startCycle: 0, endCycle: 2 });
+		expect(arranged.timing).toEqual({ mode: 'arrange', startCycle: 0, endCycle: 5 });
+	});
+
+	test('projects sound aliases as ordinary Strudel lanes', () => {
+		const [track] = getSourceBlockDetails(`$: sound("gm_synth_bass_1")`);
+
+		expect(track.name).toBe('GM Synth Bass 1');
+		expect(track.type).toBe('synth');
 	});
 
 	test('projects an ordinary seven-lane Strudel song without Sushi markers', () => {
@@ -142,6 +193,17 @@ describe('source mapper', () => {
 		expect(tracks.map((track) => track.line)).toEqual([2, 3, 4, 5, 6, 7, 8]);
 		expect(getSourceGlobals(REGULAR_STRUDEL_SONG)).toMatchObject({ bpm: 90, quarterNotesPerCycle: 4 });
 		expect(tracks.every((track) => track.timing.mode === 'full' && track.timing.startCycle === 0 && track.timing.endCycle === 4)).toBe(true);
+	});
+
+	test('keeps generated projection IDs away from authored marker IDs', () => {
+		const source = [
+			'$: s("bd")',
+			'// @sushi-track {"id":"trk_source_01","name":"Marked","type":"synth","schema":1}',
+			'$: s("sawtooth")',
+		].join('\n');
+		const tracks = getSourceBlockDetails(source);
+
+		expect(tracks.map((track) => track.id)).toEqual(['trk_source_01-2', 'trk_source_01']);
 	});
 
 	test('uses the project boundary for full-length tracks', () => {

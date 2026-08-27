@@ -156,6 +156,19 @@ export interface WebMcpRegistration {
 	dispose: () => void;
 }
 
+export interface WebMcpRegistrationOptions {
+	/** Abort an in-flight registration when the owning UI lifecycle ends. */
+	signal?: AbortSignal;
+}
+
+export interface WebMcpContextWaitOptions {
+	/** Maximum time to wait for a host-injected context. */
+	timeoutMs?: number;
+	/** Poll interval used when the host does not provide a readiness event. */
+	pollIntervalMs?: number;
+	signal?: AbortSignal;
+}
+
 /**
  * Resolve the browser-provided WebMCP surface without assuming a single host
  * placement. Chromium builds have exposed ModelContext on the document, while
@@ -164,23 +177,99 @@ export interface WebMcpRegistration {
  * testable without requiring a real browser implementation.
  */
 export function getNativeModelContext(context?: WebMCP.ModelContext): WebMCP.ModelContext | undefined {
-	if (context) return context;
-	const globalWithModelContext = globalThis as typeof globalThis & { modelContext?: WebMCP.ModelContext };
-	if (globalWithModelContext.modelContext) return globalWithModelContext.modelContext;
-	if (typeof document !== 'undefined' && document.modelContext) return document.modelContext;
+	// An explicitly supplied context is authoritative. Treat a malformed or
+	// not-yet-ready value as unavailable instead of silently switching to a
+	// different global surface that may belong to another host/document.
+	if (context !== undefined) return readModelContext(() => context);
+	const candidates: Array<() => unknown> = [];
+	if (typeof document !== 'undefined') candidates.push(() => document.modelContext);
 	if (typeof navigator !== 'undefined') {
 		const navigatorWithModelContext = navigator as Navigator & { modelContext?: WebMCP.ModelContext };
-		if (navigatorWithModelContext.modelContext) return navigatorWithModelContext.modelContext;
+		candidates.push(() => navigatorWithModelContext.modelContext);
 	}
 	if (typeof window !== 'undefined') {
 		const windowWithModelContext = window as Window & { modelContext?: WebMCP.ModelContext };
-		if (windowWithModelContext.modelContext) return windowWithModelContext.modelContext;
+		candidates.push(() => windowWithModelContext.modelContext);
+	}
+	const globalWithModelContext = globalThis as typeof globalThis & { modelContext?: WebMCP.ModelContext };
+	candidates.push(() => globalWithModelContext.modelContext);
+	for (const candidate of candidates) {
+		const modelContext = readModelContext(candidate);
+		if (modelContext) return modelContext;
 	}
 	return undefined;
 }
 
+function isUsableModelContext(context: unknown): context is WebMCP.ModelContext {
+	if (!context || (typeof context !== 'object' && typeof context !== 'function')) return false;
+	return typeof (context as { registerTool?: unknown }).registerTool === 'function';
+}
+
+function readModelContext(read: () => unknown): WebMCP.ModelContext | undefined {
+	try {
+		const context = read();
+		return isUsableModelContext(context) ? context : undefined;
+	} catch {
+		// A host can expose the property before its permissions are ready. Keep
+		// probing the remaining standard/legacy locations instead of failing the
+		// registration effect from a throwing getter.
+		return undefined;
+	}
+}
+
+/**
+ * Wait briefly for an embedded browser to finish installing its native
+ * `document.modelContext` surface. Some hosts inject that surface after the
+ * Astro document loads, so a single feature check during React hydration can
+ * otherwise miss a valid WebMCP implementation forever.
+ */
+export function waitForNativeModelContext({
+	timeoutMs = 10_000,
+	pollIntervalMs = 50,
+	signal,
+}: WebMcpContextWaitOptions = {}): Promise<WebMCP.ModelContext | undefined> {
+	const waitTimeoutMs = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 10_000;
+	const waitPollIntervalMs = Number.isFinite(pollIntervalMs) ? Math.max(10, pollIntervalMs) : 50;
+	if (signal?.aborted) return Promise.resolve(undefined);
+	const existing = getNativeModelContext();
+	if (isUsableModelContext(existing)) return Promise.resolve(existing);
+
+	return new Promise((resolve) => {
+		let settled = false;
+		let pollTimer: ReturnType<typeof setInterval> | undefined;
+		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+		const finish = (context?: WebMCP.ModelContext) => {
+			if (settled) return;
+			settled = true;
+			if (pollTimer !== undefined) clearInterval(pollTimer);
+			if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+			signal?.removeEventListener('abort', onAbort);
+			resolve(context);
+		};
+		const poll = () => {
+			const context = getNativeModelContext();
+			if (isUsableModelContext(context)) finish(context);
+		};
+		const onAbort = () => finish();
+
+		signal?.addEventListener('abort', onAbort, { once: true });
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+
+		pollTimer = setInterval(poll, waitPollIntervalMs);
+		timeoutTimer = setTimeout(() => {
+			const context = getNativeModelContext();
+			finish(isUsableModelContext(context) ? context : undefined);
+		}, waitTimeoutMs);
+	});
+}
+
 interface ToolOptions {
-	signal: AbortSignal;
+	/** Native Chrome currently omits callback options for direct executeTool calls. */
+	signal?: AbortSignal;
 }
 
 const MAX_SOURCE_LENGTH = 200_000;
@@ -274,8 +363,8 @@ function readPatchInput(value: unknown): { ok: true; input: SourcePatchInput } |
 	return { ok: true, input: { edits, baseRevision: revision.revision, transactionId: transaction.transactionId } };
 }
 
-function cancelled(options: ToolOptions): { ok: false; error: WebMcpError } | undefined {
-	return options.signal.aborted ? failed({ code: 'CANCELLED', message: 'The WebMCP tool call was cancelled.' }) : undefined;
+function cancelled(options?: ToolOptions): { ok: false; error: WebMcpError } | undefined {
+	return options?.signal?.aborted ? failed({ code: 'CANCELLED', message: 'The WebMCP tool call was cancelled.' }) : undefined;
 }
 
 /** Apply exact, non-overlapping UTF-16 offset edits from right to left. */
@@ -290,6 +379,10 @@ export function applyTextEdits(source: string, edits: SourceTextEdit[]): { ok: t
 			return failed({ code: 'INVALID_EDIT_RANGE', message: `Edit range ${edit.start}..${edit.end} is outside the current source.` });
 		}
 		if (edit.end > previousStart) return failed({ code: 'OVERLAPPING_EDITS', message: 'Text edits must not overlap.' });
+		// Two insertions at the same UTF-16 offset have no deterministic order
+		// unless the caller supplies one. Reject them instead of silently reversing
+		// text based on the input array's incidental ordering.
+		if (edit.start === previousStart && edit.end === edit.start) return failed({ code: 'OVERLAPPING_EDITS', message: 'Text edits must not overlap or share an insertion offset.' });
 		if (typeof edit.text !== 'string') return failed({ code: 'INVALID_EDIT_TEXT', message: 'Edit text must be a string.' });
 		previousStart = edit.start;
 	}
@@ -326,9 +419,16 @@ function schema(properties: Record<string, object>, required: string[] = []) {
 	return { type: 'object', properties, ...(required.length ? { required } : {}), additionalProperties: false };
 }
 
+// Source, diagnostics, and runtime snapshots can contain user-authored code or
+// content derived from it. Keep that provenance visible to an agent host while
+// retaining read-only hints where the tool does not mutate the studio.
+const READ_ONLY_SOURCE_ANNOTATIONS = { readOnlyHint: true, untrustedContentHint: true } as const;
+const MUTATING_SOURCE_ANNOTATIONS = { readOnlyHint: false, untrustedContentHint: true } as const;
+const READ_ONLY_REFERENCE_ANNOTATIONS = { readOnlyHint: true } as const;
+
 function createTool<T extends Record<string, unknown>>(
 	definition: Omit<WebMCP.ModelContextTool, 'execute'>,
-	execute: (input: T, options: ToolOptions) => WebMCP.MaybePromise<unknown>,
+	execute: (input: T, options?: ToolOptions) => WebMCP.MaybePromise<unknown>,
 ): WebMCP.ModelContextTool {
 	return {
 		...definition,
@@ -351,7 +451,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Open Sushi studio session',
 			description: 'Return the current Sushi project, source revision, tracks, diagnostics, and runtime state.',
 			inputSchema: EMPTY_SCHEMA,
-			annotations: { readOnlyHint: true },
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
 		}, (_input, options) => cancelled(options) ?? executeSafely(() => ({ ok: true, action: 'open_studio_session', state: controller.getState() }))),
 
 		createTool({
@@ -359,7 +459,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Inspect Strudel state',
 			description: 'Inspect parsed source blocks, recognized source controls, diagnostics, and the derived Strudel runtime.',
 			inputSchema: EMPTY_SCHEMA,
-			annotations: { readOnlyHint: true },
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
 		}, (_input, options) => cancelled(options) ?? executeSafely(() => ({ ok: true, action: 'inspect_strudel_state', state: controller.getState() }))),
 
 		createTool({
@@ -367,7 +467,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Read Strudel source',
 			description: 'Read the editable draft and last-valid Strudel source, including the current revision and diagnostics.',
 			inputSchema: schema({ which: { type: 'string', enum: ['draft', 'lastValid'] } }),
-			annotations: { readOnlyHint: true },
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
 		}, (input: { which?: unknown }, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -397,6 +497,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 				baseRevision: { type: 'integer', minimum: 0 },
 				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
 			}, ['source', 'baseRevision', 'transactionId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
 		}, (input: Record<string, unknown>, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -418,6 +519,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 				baseRevision: { type: 'integer', minimum: 0 },
 				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
 			}, ['edits', 'baseRevision', 'transactionId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
 		}, (input: Record<string, unknown>, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -431,7 +533,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Validate Strudel source',
 			description: 'Evaluate candidate Strudel source for diagnostics without changing the project draft or active revision.',
 			inputSchema: schema({ source: { type: 'string', maxLength: MAX_SOURCE_LENGTH } }),
-			annotations: { readOnlyHint: true },
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
 		}, (input: { source?: unknown }, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -445,7 +547,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Lookup Strudel reference',
 			description: 'Search Sushi’s versioned local Strudel reference for functions, sounds, templates, and starter patterns.',
 			inputSchema: schema({ query: { type: 'string' }, kind: { type: 'string', enum: ['function', 'sound', 'template', 'pattern'] }, limit: { type: 'integer', minimum: 1, maximum: 12 } }, ['query']),
-			annotations: { readOnlyHint: true },
+			annotations: READ_ONLY_REFERENCE_ANNOTATIONS,
 		}, (input: { query?: unknown; kind?: unknown; limit?: unknown }, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -467,6 +569,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Control playback',
 			description: 'Start, pause, resume, stop, or seek the Strudel runtime. Seeking uses musical cycle positions.',
 			inputSchema: schema({ action: { type: 'string', enum: ['play', 'pause', 'resume', 'stop', 'seek'] }, cycle: { type: 'number', minimum: 0 } }, ['action']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
 		}, (input: { action?: unknown; cycle?: unknown }, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -481,6 +584,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Undo source edit',
 			description: 'Undo the latest shared human or agent source edit when the supplied base revision is still current.',
 			inputSchema: schema({ baseRevision: { type: 'integer', minimum: 0 }, transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH } }, ['baseRevision', 'transactionId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
 		}, (input: Record<string, unknown>, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -494,6 +598,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			title: 'Redo source edit',
 			description: 'Redo the latest shared source edit when the supplied base revision is still current.',
 			inputSchema: schema({ baseRevision: { type: 'integer', minimum: 0 }, transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH } }, ['baseRevision', 'transactionId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
 		}, (input: Record<string, unknown>, options) => {
 			const stopped = cancelled(options);
 			if (stopped) return stopped;
@@ -504,23 +609,71 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 	];
 }
 
-export async function registerWebMcpTools(controller: WebMcpController, context?: WebMCP.ModelContext): Promise<WebMcpRegistration> {
+export async function registerWebMcpTools(
+	controller: WebMcpController,
+	context?: WebMCP.ModelContext,
+	options: WebMcpRegistrationOptions = {},
+): Promise<WebMcpRegistration> {
+	if (options.signal?.aborted) return { available: false, toolNames: [], dispose: () => undefined };
 	const modelContext = getNativeModelContext(context);
 	if (!modelContext) return { available: false, toolNames: [], dispose: () => undefined };
 
 	const abortController = new AbortController();
 	const tools = createWebMcpTools(controller);
+	const abortRegistration = () => abortController.abort();
+	const dispose = () => {
+		options.signal?.removeEventListener('abort', abortRegistration);
+		abortController.abort();
+	};
+	options.signal?.addEventListener('abort', abortRegistration, { once: true });
 	try {
 		for (const tool of tools) {
-			await modelContext.registerTool(tool, { signal: abortController.signal });
+			if (abortController.signal.aborted) {
+				dispose();
+				return { available: false, toolNames: [], error: 'WebMCP registration was cancelled.', dispose };
+			}
+			await awaitAbortableRegistration(modelContext.registerTool(tool, { signal: abortController.signal }), abortController.signal);
+		}
+		if (abortController.signal.aborted) {
+			dispose();
+			return { available: false, toolNames: [], error: 'WebMCP registration was cancelled.', dispose };
 		}
 		return {
 			available: true,
 			toolNames: tools.map((tool) => tool.name),
-			dispose: () => abortController.abort(),
+			dispose,
 		};
 	} catch (error) {
-		abortController.abort();
-		return { available: false, toolNames: [], error: messageFromError(error), dispose: () => undefined };
+		dispose();
+		return { available: false, toolNames: [], error: messageFromError(error), dispose };
 	}
+}
+
+/**
+ * A host should resolve `registerTool()` quickly, but an embedded bridge can
+ * disappear while registration is in flight. Race the host promise against
+ * our lifecycle signal so teardown never waits forever for a dead bridge.
+ */
+function awaitAbortableRegistration(operation: Promise<void>, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return Promise.resolve();
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => signal.removeEventListener('abort', onAbort);
+		const settle = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const onAbort = () => settle(resolve);
+		signal.addEventListener('abort', onAbort, { once: true });
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		Promise.resolve(operation).then(
+			() => settle(resolve),
+			(error) => settle(() => reject(error)),
+		);
+	});
 }

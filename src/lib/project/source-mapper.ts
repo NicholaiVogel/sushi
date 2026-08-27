@@ -67,7 +67,7 @@ export function secondsToCycles(seconds: number, globals: SourceGlobals): number
 
 export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAULT_TRACK_END_CYCLE): TrackTiming {
 	const trimmed = expression.trim();
-	if (trimmed.startsWith('seqPLoop(')) {
+	if (/^seqPLoop\s*\(/.test(trimmed)) {
 		const pairs = Array.from(trimmed.matchAll(new RegExp(`\\[\\s*(${numericLiteral})\\s*,\\s*(${numericLiteral})\\s*,`, 'g')))
 			.map((match) => ({ start: Number(match[1]), end: Number(match[2]) }))
 			.filter((pair) => Number.isFinite(pair.start) && Number.isFinite(pair.end) && pair.end > pair.start);
@@ -80,7 +80,7 @@ export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAU
 		}
 	}
 
-	if (trimmed.startsWith('arrange(')) {
+	if (/^arrange\s*\(/.test(trimmed)) {
 		const durations = Array.from(trimmed.matchAll(new RegExp(`\\[\\s*(${numericLiteral})\\s*,`, 'g')))
 			.map((match) => Number(match[1]))
 			.filter((duration) => Number.isFinite(duration) && duration > 0);
@@ -119,6 +119,17 @@ function modeFromLabel(label: string | undefined): { muted: boolean; soloed: boo
 		muted: Boolean(label?.startsWith('_')),
 		soloed: Boolean(label?.startsWith('S')),
 	};
+}
+
+/**
+ * Strip Strudel's source-mode prefix without discarding an authored label.
+ * Standard labels are `$`, `_$`, and `S$`, but regular Strudel files commonly
+ * use names such as `lead$`; toggling a mode must keep that base label intact.
+ */
+function baseTrackLabel(label: string | undefined): string {
+	const current = label?.endsWith('$') ? label : '$';
+	const withoutMode = current.startsWith('_') || current.startsWith('S') ? current.slice(1) : current;
+	return withoutMode || '$';
 }
 
 function numericMethodValue(expression: string, method: 'gain' | 'pan'): number | undefined {
@@ -184,8 +195,54 @@ function replaceExpressionBlock(
 }
 
 function formatNumber(value: number): string {
-	const rounded = Math.round(value * 100) / 100;
+	// Keep enough precision for musical subdivisions (for example a 1/8-cycle
+	// edit at 8 quarter-notes per cycle) while still avoiding floating-point
+	// noise in generated source. Two decimal places silently changed 0.125 to
+	// 0.13, which moved the edit off the source's actual grid.
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
 	return String(rounded);
+}
+
+/**
+ * Keep trailing source comments outside generated method chains. A comment at
+ * the end of a `$:` block is source content, not part of the executable
+ * expression; appending `.gain(...)` after it would either be ignored or turn
+ * the next line into invalid JavaScript.
+ */
+function splitTrailingComment(expression: string): { body: string; suffix: string } {
+	const lineComment = expression.match(/(\s*)(\/\/[^\r\n]*)(\r?\n?)$/);
+	if (lineComment) {
+		return {
+			body: expression.slice(0, expression.length - lineComment[0].length),
+			suffix: lineComment[0],
+		};
+	}
+	const blockComment = expression.match(/(\s*)(\/\*[\s\S]*?\*\/)(\s*)$/);
+	if (blockComment) {
+		return {
+			body: expression.slice(0, expression.length - blockComment[0].length),
+			suffix: blockComment[0],
+		};
+	}
+	return { body: expression, suffix: '' };
+}
+
+function appendExpressionCall(expression: string, call: string): string {
+	const { body: withoutComment, suffix } = splitTrailingComment(expression);
+	const trailingWhitespace = withoutComment.match(/\s*$/)?.[0] ?? '';
+	const expressionBody = trailingWhitespace ? withoutComment.slice(0, -trailingWhitespace.length) : withoutComment;
+	const semicolon = expressionBody.endsWith(';') ? ';' : '';
+	const body = semicolon ? expressionBody.slice(0, -1) : expressionBody;
+	return `${body}${call}${semicolon}${trailingWhitespace}${suffix}`;
+}
+
+function wrapExpressionInSeqPLoop(expression: string, start: number, end: number): string {
+	const { body: withoutComment, suffix } = splitTrailingComment(expression);
+	const trailingWhitespace = withoutComment.match(/\s*$/)?.[0] ?? '';
+	const expressionBody = trailingWhitespace ? withoutComment.slice(0, -trailingWhitespace.length) : withoutComment;
+	const semicolon = expressionBody.endsWith(';') ? ';' : '';
+	const body = semicolon ? expressionBody.slice(0, -1) : expressionBody;
+	return `seqPLoop([${formatNumber(start)}, ${formatNumber(end)}, ${body}])${semicolon}${trailingWhitespace}${suffix}`;
 }
 
 function replaceNumericMethod(expression: string, method: 'gain' | 'pan', value: number): string | undefined {
@@ -194,15 +251,11 @@ function replaceNumericMethod(expression: string, method: 'gain' | 'pan', value:
 		return expression.replace(methodPattern, `$1${formatNumber(value)}$3`);
 	}
 	if (hasMethod(expression, method)) return undefined;
-
-	const trailingWhitespace = expression.match(/\s*$/)?.[0] ?? '';
-	const expressionBody = trailingWhitespace ? expression.slice(0, -trailingWhitespace.length) : expression;
-	const semicolon = expressionBody.endsWith(';') ? ';' : '';
-	const body = semicolon ? expressionBody.slice(0, -1) : expressionBody;
-	return `${body}.${method}(${formatNumber(value)})${semicolon}${trailingWhitespace}`;
+	return appendExpressionCall(expression, `.${method}(${formatNumber(value)})`);
 }
 
 function updateNumericMethod(source: string, trackId: string, method: 'gain' | 'pan', value: number): string {
+	if (!Number.isFinite(value)) return source;
 	const normalized = Math.max(0, Math.min(1, value));
 	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
 		const updatedExpression = replaceNumericMethod(expression, method, normalized);
@@ -218,9 +271,10 @@ export function updateTrackPan(source: string, trackId: string, value: number): 
 	return updateNumericMethod(source, trackId, 'pan', value);
 }
 
-export function updateTrackRange(source: string, trackId: string, startCycle: number, endCycle: number): string {
+export function updateTrackRange(source: string, trackId: string, startCycle: number, endCycle: number, minimumCycleSpan = 0.25): string {
 	const start = Number.isFinite(startCycle) ? Math.max(0, startCycle) : 0;
-	const end = Number.isFinite(endCycle) ? Math.max(start + 0.25, endCycle) : start + 0.25;
+	const minimumSpan = Number.isFinite(minimumCycleSpan) && minimumCycleSpan > 0 ? minimumCycleSpan : 0.25;
+	const end = Number.isFinite(endCycle) ? Math.max(start + minimumSpan, endCycle) : start + minimumSpan;
 	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
 		const rangePattern = new RegExp(`(seqPLoop\\s*\\(\\s*|\\]\\s*,\\s*)\\[\\s*(${numericLiteral})(\\s*,\\s*)(${numericLiteral})`, 'g');
 		const ranges = Array.from(expression.matchAll(rangePattern));
@@ -237,13 +291,9 @@ export function updateTrackRange(source: string, trackId: string, startCycle: nu
 			};
 		}
 
-		const trailingWhitespace = expression.match(/\s*$/)?.[0] ?? '';
-		const expressionBody = trailingWhitespace ? expression.slice(0, -trailingWhitespace.length) : expression;
-		const semicolon = expressionBody.endsWith(';') ? ';' : '';
-		const body = semicolon ? expressionBody.slice(0, -1) : expressionBody;
 		return {
 			label,
-			expression: `seqPLoop([${formatNumber(start)}, ${formatNumber(end)}, ${body}])${semicolon}${trailingWhitespace}`,
+			expression: wrapExpressionInSeqPLoop(expression, start, end),
 		};
 	});
 }
@@ -256,9 +306,10 @@ export function updateTrackMode(
 ): string {
 	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
 		const modes = modeFromLabel(label);
+		const baseLabel = baseTrackLabel(label);
 		const nextLabel = mode === 'mute'
-			? active ? '_$' : modes.soloed ? 'S$' : '$'
-			: active ? 'S$' : modes.muted ? '_$' : '$';
+			? active ? `_${baseLabel}` : modes.soloed ? `S${baseLabel}` : baseLabel
+			: active ? `S${baseLabel}` : modes.muted ? `_${baseLabel}` : baseLabel;
 		return { label: nextLabel, expression };
 	});
 }

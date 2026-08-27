@@ -2,7 +2,7 @@ export type AudioState = 'locked' | 'initializing' | 'ready' | 'error';
 
 export type TransportState = 'stopped' | 'playing' | 'paused';
 
-import { getParsedSourceBlocks } from './source-parser';
+import { getDuplicateSourceTrackIds, getParsedSourceBlocks } from './source-parser';
 
 export interface SourceRange {
 	start: number;
@@ -42,6 +42,8 @@ export interface ProjectDocumentV1 {
 	timeline: {
 		quarterNotesPerCycle: { numerator: number; denominator: number };
 		songEndCycle?: number;
+		/** Set when the editable arrangement boundary was introduced. */
+		songEndCycleVersion?: 1;
 	};
 	assets: [];
 }
@@ -80,6 +82,7 @@ export function createInitialProject(): ProjectDocumentV1 {
 		timeline: {
 			quarterNotesPerCycle: { numerator: 4, denominator: 1 },
 			songEndCycle: DEFAULT_SONG_END_CYCLE,
+			songEndCycleVersion: 1,
 		},
 		assets: [],
 	};
@@ -87,6 +90,23 @@ export function createInitialProject(): ProjectDocumentV1 {
 
 export function getSourceBlocks(source: string): SourceBlockSummary[] {
 	return getParsedSourceBlocks(source).map(({ id, name, type, line }) => ({ id, name, type, line }));
+}
+
+/**
+ * Marker identities are authored data, not projection IDs. Rejecting repeated
+ * identities before Strudel evaluation keeps the source index deterministic
+ * and prevents React/timeline state from silently targeting the wrong lane.
+ */
+export function getSourceIdentityDiagnostics(revision: number, source: string): SourceDiagnostic[] {
+	return getDuplicateSourceTrackIds(source).map(({ id, first, duplicate }) => ({
+		revision,
+		phase: 'parse',
+		severity: 'error',
+		code: 'DUPLICATE_TRACK_ID',
+		message: `Track ID "${id}" is used by more than one Sushi marker (first declared on line ${first.line}).`,
+		range: duplicate,
+		context: source.split('\n')[duplicate.line - 1],
+	}));
 }
 
 type ErrorRecord = Record<string, unknown>;
@@ -138,6 +158,9 @@ export function diagnosticFromError(revision: number, error: unknown, source = '
 	const phase: SourceDiagnostic['phase'] = error instanceof SyntaxError || record?.name === 'SyntaxError' || lowerMessage.includes('syntax') || lowerMessage.includes('parse')
 		? 'parse'
 		: 'evaluate';
+	const code = record?.code === 'AUDIO_LOCKED'
+		? 'AUDIO_LOCKED'
+		: phase === 'parse' ? 'STR_PARSE_FAILED' : 'STR_EVALUATION_FAILED';
 	const location = errorLocation(error, message);
 	const range = source && location ? rangeFromLocation(source, location) : undefined;
 	const context = range ? source.split('\n')[range.line - 1] : undefined;
@@ -146,7 +169,7 @@ export function diagnosticFromError(revision: number, error: unknown, source = '
 		revision,
 		phase,
 		severity: 'error',
-		code: phase === 'parse' ? 'STR_PARSE_FAILED' : 'STR_EVALUATION_FAILED',
+		code,
 		message: message || 'Strudel could not evaluate this source.',
 		range,
 		context,

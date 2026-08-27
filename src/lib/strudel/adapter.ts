@@ -45,10 +45,18 @@ interface StrudelPattern {
 
 interface SourceAudioAsset {
 	name: string;
-	notes: string[];
+	notes: Array<string | number>;
 }
 
-const soundCallPattern = /(?:^|[.\s])s\s*\(\s*(['"`])([\s\S]*?)\1\s*\)/g;
+type PreloadValue = Record<string, any> & {
+	n?: unknown;
+	note?: string | number;
+	freq?: string | number;
+};
+
+const MAX_PRELOAD_HAPS = 4096;
+
+const soundCallPattern = /(?:^|[.\s])(?:s|sound)\s*\(\s*(['"`])([\s\S]*?)\1\s*\)/g;
 const directSoundPattern = /\(\s*(['"`])([\s\S]*?)\1\s*\)\s*\.note\s*\(/g;
 const sourceNotePattern = /\b[A-Ga-g](?:#|b)?(?:-?\d+)\b/g;
 
@@ -174,6 +182,34 @@ export type AdapterResult =
 	| { ok: true }
 	| { ok: false; error: unknown };
 
+/** Returned when playback was requested before the browser granted audio output. */
+export class AudioLockedError extends Error {
+	public readonly code = 'AUDIO_LOCKED';
+
+	public constructor() {
+		super('Audio is locked by the browser. Click Play in Sushi once to enable audio, then try again.');
+		this.name = 'AudioLockedError';
+	}
+}
+
+export function isAudioLockedError(error: unknown): error is AudioLockedError {
+	return error instanceof AudioLockedError || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'AUDIO_LOCKED');
+}
+
+function isAudioPolicyError(error: unknown): boolean {
+	if (isAudioLockedError(error)) return true;
+	if (typeof error !== 'object' || error === null) return false;
+	const record = error as { name?: unknown; message?: unknown };
+	const name = typeof record.name === 'string' ? record.name : '';
+	const message = typeof record.message === 'string' ? record.message.toLowerCase() : '';
+	return name === 'NotAllowedError'
+		|| name === 'SecurityError'
+		|| message.includes('not allowed')
+		|| message.includes('user gesture')
+		|| message.includes('autoplay')
+		|| message.includes('audio context');
+}
+
 /**
  * The only application layer that talks to Strudel.
  *
@@ -184,6 +220,7 @@ export type AdapterResult =
  * source because the REPL hushes before evaluating a new source document.
  */
 export class StrudelAdapter {
+	private destroyed = false;
 	private module: StrudelModule | undefined;
 	private repl: StrudelRepl | undefined;
 	private activePattern: StrudelPattern | undefined;
@@ -206,16 +243,19 @@ export class StrudelAdapter {
 	) {}
 
 	public async init(): Promise<void> {
+		if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
 		if (this.initPromise) {
 			return this.initPromise;
 		}
 
 		this.initPromise = (async () => {
+			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
 			if (typeof window === 'undefined') {
 				throw new Error('The Strudel audio runtime is only available in a browser.');
 			}
 
 			const module = await this.loadModule();
+			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
 			this.module = module;
 			this.repl = await module.initStrudel({
 				prebake: async () => {
@@ -251,14 +291,39 @@ export class StrudelAdapter {
 					}
 				},
 			});
+			if (this.destroyed) {
+				try {
+					this.repl.stop();
+					this.module?.hush?.();
+				} catch {
+					// The owner may have gone away while Strudel was initializing.
+				}
+				throw new Error('The Strudel runtime has been destroyed.');
+			}
 			this.setRuntime({ audioState: 'locked', transport: 'stopped' });
 		})();
 
 		try {
 			await this.initPromise;
 		} catch (error) {
+			const repl = this.repl;
+			const module = this.module;
+			this.repl = undefined;
+			this.module = undefined;
+			this.activePattern = undefined;
+			this.activeSource = '';
+			this.preloadPromise = undefined;
+			this.activeEvaluation = undefined;
+			this.stopCycleTimer();
+			try {
+				repl?.stop();
+				module?.hush?.();
+			} catch {
+				// Initialization cleanup is best-effort; the error below remains the
+				// source of truth for the caller.
+			}
 			this.initPromise = undefined;
-			this.setRuntime({ audioState: 'error' });
+			this.setRuntime({ audioState: 'error', transport: 'stopped', currentCycle: 0 });
 			throw error;
 		}
 	}
@@ -267,9 +332,13 @@ export class StrudelAdapter {
 		source: string,
 		options: { autoplay?: boolean; restoreSource?: string } = {},
 	): Promise<AdapterResult> {
-		const evaluation = this.evaluationQueue.then(() => this.evaluateSourceNow(source, options));
-		this.evaluationQueue = evaluation.then(() => undefined, () => undefined);
-		return evaluation;
+		return this.enqueueSerialized(async () => {
+			try {
+				return await this.evaluateSourceNow(source, options);
+			} catch (error) {
+				return { ok: false, error };
+			}
+		});
 	}
 
 	/**
@@ -278,9 +347,26 @@ export class StrudelAdapter {
 	 * validation request cannot leave a candidate pattern running.
 	 */
 	public async validateSource(source: string, restoreSource: string): Promise<AdapterResult> {
-		const validation = this.evaluationQueue.then(() => this.validateSourceNow(source, restoreSource));
-		this.evaluationQueue = validation.then(() => undefined, () => undefined);
-		return validation;
+		return this.enqueueSerialized(async () => {
+			try {
+				return await this.validateSourceNow(source, restoreSource);
+			} catch (error) {
+				return { ok: false, error };
+			}
+		});
+	}
+
+	/**
+	 * Serialize every operation that can touch the REPL, not only source
+	 * evaluation. A transport request arriving while a candidate is evaluating
+	 * must wait for that evaluation (and its restore path) to finish; otherwise
+	 * the scheduler can start the old pattern or seek into a pattern that is
+	 * about to be replaced.
+	 */
+	private enqueueSerialized<T>(operation: () => Promise<T>): Promise<T> {
+		const queued = this.evaluationQueue.then(operation);
+		this.evaluationQueue = queued.then(() => undefined, () => undefined);
+		return queued;
 	}
 
 	private async evaluateSourceNow(
@@ -288,21 +374,51 @@ export class StrudelAdapter {
 		options: { autoplay?: boolean; restoreSource?: string },
 	): Promise<AdapterResult> {
 		await this.init();
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
+		const repl = this.repl;
+		if (!repl) return { ok: false, error: new Error('Strudel did not return a browser REPL.') };
 		const wasPlaying = this.runtime.transport === 'playing';
 		const wasPaused = this.runtime.transport === 'paused';
 		const pausedCycle = this.runtime.currentCycle ?? 0;
 		const boundaryCycle = wasPlaying ? await this.waitForNextCycleBoundary() : pausedCycle;
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 		const result = await this.evaluateRaw(source, options.autoplay ?? false);
-		if (!result.ok && options.restoreSource && options.restoreSource !== source) {
-			await this.evaluateRaw(options.restoreSource, false);
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
+		// The caller normally supplies the accepted source explicitly, but keeping
+		// the adapter's last successful source as a fallback makes direct adapter
+		// use transactional too. A failed evaluation while playing must never leave
+		// the scheduler running an unknown or half-evaluated pattern.
+		const restoreSource = options.restoreSource ?? this.activeSource;
+		if (!result.ok && restoreSource && restoreSource !== source) {
+			const restored = await this.evaluateRaw(restoreSource, false);
+			if (!restored.ok) {
+				this.stopAfterRestoreFailure();
+				return {
+					ok: false,
+					error: new Error(`Strudel rejected the candidate and could not restore the accepted source: ${this.describeError(restored.error)}`),
+				};
+			}
 		}
+		if (!result.ok && (wasPlaying || wasPaused) && (!restoreSource || restoreSource === source)) {
+			this.stopAfterRestoreFailure();
+			return result;
+		}
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 		if (wasPlaying || wasPaused) {
-			this.setSchedulerCycle(wasPlaying ? boundaryCycle : pausedCycle);
-			if (wasPlaying) {
-				await this.repl?.start();
-				this.startCycleTimer();
-			} else {
-				this.setRuntime({ transport: 'paused', currentCycle: pausedCycle });
+			try {
+				this.setSchedulerCycle(wasPlaying ? boundaryCycle : pausedCycle);
+				if (wasPlaying) {
+					await repl.start();
+					this.startCycleTimer();
+				} else {
+					this.setRuntime({ transport: 'paused', currentCycle: pausedCycle });
+				}
+			} catch (error) {
+				this.stopAfterRestoreFailure();
+				return {
+					ok: false,
+					error: new Error(`Strudel restored the source but could not resume transport: ${this.describeError(error)}`),
+				};
 			}
 		}
 		return result;
@@ -310,12 +426,36 @@ export class StrudelAdapter {
 
 	private async validateSourceNow(source: string, restoreSource: string): Promise<AdapterResult> {
 		await this.init();
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 		const previousTransport = this.runtime.transport ?? 'stopped';
 		const previousCycle = this.runtime.currentCycle ?? 0;
 		const result = await this.evaluateRaw(source, false);
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 
-		if (restoreSource !== source) await this.evaluateRaw(restoreSource, false);
-		await this.restoreTransport(previousTransport, previousCycle);
+		if (!result.ok && restoreSource === source) {
+			this.stopAfterRestoreFailure();
+			return result;
+		}
+		if (restoreSource !== source) {
+			const restored = await this.evaluateRaw(restoreSource, false);
+			if (!restored.ok) {
+				this.stopAfterRestoreFailure();
+				return {
+					ok: false,
+					error: new Error(`Strudel could not restore the accepted source after validation: ${this.describeError(restored.error)}`),
+				};
+			}
+		}
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
+		try {
+			await this.restoreTransport(previousTransport, previousCycle);
+		} catch (error) {
+			this.stopAfterRestoreFailure();
+			return {
+				ok: false,
+				error: new Error(`Strudel restored the source but could not restore transport: ${this.describeError(error)}`),
+			};
+		}
 
 		return result;
 	}
@@ -329,6 +469,7 @@ export class StrudelAdapter {
 			}
 
 			const pattern = await this.repl.evaluate(source, autoplay);
+			if (this.destroyed) return { ok: false, error: this.destroyedError() };
 			if (currentEvaluation.error) {
 				return { ok: false, error: currentEvaluation.error };
 			}
@@ -348,8 +489,38 @@ export class StrudelAdapter {
 		}
 	}
 
+	private describeError(error: unknown): string {
+		return error instanceof Error ? error.message : String(error);
+	}
+
+	/**
+	 * A failed restore is different from a rejected candidate: the accepted
+	 * pattern is no longer guaranteed to be resident in the REPL. Stop and hush
+	 * immediately so the UI cannot claim that an unknown pattern is still live.
+	 */
+	private stopAfterRestoreFailure(): void {
+		this.stopCycleTimer();
+		try {
+			this.repl?.stop();
+		} catch {
+			// Keep cleanup best-effort; the runtime is already in a failed state.
+		}
+		try {
+			this.setSchedulerCycle(0);
+		} catch {
+			// A scheduler without seeking support is still safely stopped below.
+		}
+		try {
+			this.module?.hush?.();
+		} catch {
+			// Hushing is best-effort during a failed restore.
+		}
+		this.setRuntime({ transport: 'stopped', currentCycle: 0 });
+	}
+
 	private async restoreTransport(transport: TransportState, cycle: number): Promise<void> {
-		if (!this.repl) return;
+		const repl = this.repl;
+		if (!repl || this.destroyed) return;
 
 		try {
 			this.setSchedulerCycle(cycle);
@@ -359,13 +530,16 @@ export class StrudelAdapter {
 		}
 
 		if (transport === 'playing') {
-			await this.repl.start();
+			await repl.start();
+			if (this.destroyed) return;
 			this.startCycleTimer();
 		} else if (transport === 'paused') {
-			this.repl.pause();
+			if (this.destroyed) return;
+			repl.pause();
 			this.stopCycleTimer();
 		} else {
-			this.repl.stop();
+			if (this.destroyed) return;
+			repl.stop();
 			this.module?.hush?.();
 			this.stopCycleTimer();
 		}
@@ -374,29 +548,97 @@ export class StrudelAdapter {
 	}
 
 	public async play(songEndCycle?: number): Promise<AdapterResult> {
+		return this.enqueueSerialized(() => this.playNow(songEndCycle));
+	}
+
+	private async playNow(songEndCycle?: number): Promise<AdapterResult> {
+		let startAttempted = false;
 		try {
 			await this.init();
-			if (!this.repl) {
+			if (this.destroyed) throw this.destroyedError();
+			const repl = this.repl;
+			if (!repl) {
 				throw new Error('Strudel did not return a browser REPL.');
 			}
+			if (this.runtime.transport === 'playing') return { ok: true };
 
 			// The package registers this on first mousedown, but calling it from the
 			// Play click makes the user-gesture boundary explicit for this UI.
 			await this.module?.initAudio?.();
-			this.songEndCycle = Number.isFinite(songEndCycle) && songEndCycle !== undefined && songEndCycle > 0 ? songEndCycle : undefined;
+			if (this.destroyed) throw this.destroyedError();
+			await this.ensureAudioContextRunning();
+			if (this.destroyed) throw this.destroyedError();
+			// An omitted boundary means "resume the configured arrangement", not
+			// "forget the boundary". This matters for callers that use the adapter
+			// directly (the Studio always passes its current project boundary).
+			if (songEndCycle !== undefined) {
+				this.songEndCycle = Number.isFinite(songEndCycle) && songEndCycle > 0 ? songEndCycle : undefined;
+			}
+			if (this.songEndCycle !== undefined && this.readCurrentCycle() >= this.songEndCycle) {
+				this.setSchedulerCycle(0);
+				this.setRuntime({ currentCycle: 0 });
+			}
 			await this.preloadActivePattern();
-			await this.repl.start();
+			if (this.destroyed) throw this.destroyedError();
+			startAttempted = true;
+			await repl.start();
+			if (this.destroyed) {
+				try {
+					repl.stop();
+				} catch {
+					// The owner may have gone away while playback was starting.
+				}
+				throw this.destroyedError();
+			}
+			this.setRuntime({ audioState: 'ready', transport: 'playing', currentCycle: this.readCurrentCycle() });
 			this.startCycleTimer();
 			return { ok: true };
 		} catch (error) {
-			this.setRuntime({ audioState: 'error', transport: 'stopped' });
-			return { ok: false, error };
+			const normalizedError = isAudioPolicyError(error) && !isAudioLockedError(error) ? new AudioLockedError() : error;
+			if (startAttempted) this.stopAfterRestoreFailure();
+			else this.stopCycleTimer();
+			this.setRuntime({ audioState: isAudioLockedError(normalizedError) ? 'locked' : 'error', transport: 'stopped' });
+			return { ok: false, error: normalizedError };
 		}
+	}
+
+	private async ensureAudioContextRunning(): Promise<void> {
+		const context = this.module?.getAudioContext?.();
+		if (!context || context.state === 'running') return;
+
+		try {
+			// AudioContext.resume() can remain pending indefinitely when an agent
+			// invokes playback outside a user gesture. Bound that wait so WebMCP
+			// reports AUDIO_LOCKED instead of leaving the tool call hanging.
+			await Promise.race([
+				context.resume().catch(() => undefined),
+				new Promise<void>((resolve) => setTimeout(resolve, 300)),
+			]);
+		} catch {
+			// Browsers reject resume() when the call is outside a user gesture. The
+			// state check below turns that policy decision into a useful result.
+		}
+		// `state` can change while `resume()` is settling; avoid relying on the
+		// control-flow narrowing from the initial guard above.
+		if ((context.state as AudioContextState) !== 'running') throw new AudioLockedError();
 	}
 
 	/** Update the finite transport boundary without restarting the REPL. */
 	public setSongEndCycle(songEndCycle?: number): void {
-		this.songEndCycle = Number.isFinite(songEndCycle) && songEndCycle !== undefined && songEndCycle > 0 ? songEndCycle : undefined;
+		const nextEndCycle = Number.isFinite(songEndCycle) && songEndCycle !== undefined && songEndCycle > 0 ? songEndCycle : undefined;
+		this.songEndCycle = nextEndCycle;
+		if (nextEndCycle === undefined || this.runtime.transport === 'playing') return;
+
+		const currentCycle = this.readCurrentCycle();
+		if (currentCycle <= nextEndCycle) return;
+		const transport = this.runtime.transport;
+		try {
+			this.setSchedulerCycle(nextEndCycle);
+		} catch {
+			// A scheduler without a writable cursor can still be stopped at the
+			// boundary by the normal transport timer. Keep the visible state sane.
+		}
+		this.setRuntime({ transport, currentCycle: nextEndCycle });
 	}
 
 	/**
@@ -412,8 +654,7 @@ export class StrudelAdapter {
 		const pattern = this.activePattern;
 		const module = this.module;
 		const repl = this.repl;
-		const queryArc = pattern?.queryArc;
-		if (!module || !repl) return;
+		if (!module || !repl || !pattern?.queryArc) return;
 
 		this.preloadPromise = (async () => {
 			this.setRuntime({ audioState: 'initializing' });
@@ -422,33 +663,40 @@ export class StrudelAdapter {
 			const audioContext = module.getAudioContext?.();
 			let soundfontRuntime: SoundfontRuntime | undefined;
 			const pending = new Map<string, Promise<unknown>>();
-			const enqueueSound = async (soundName: string, data: Record<string, any> | undefined, notes: string[]) => {
+			const enqueueSound = async (soundName: string, data: Record<string, any> | undefined, notes: Array<string | number>, values: PreloadValue[] = []) => {
 				if (!data || typeof data !== 'object') return;
+				const variants: PreloadValue[] = values.length
+					? values
+					: (notes.length ? notes : ['c3']).map((note) => ({ note }));
 
 				if (data.type === 'sample' && data.samples && module.getSampleBuffer) {
-					// Array banks (including the tidal drum machines) do not use the
-					// note to select a file, so one request is enough. Note-keyed banks
-					// need each note that appears in the pasted source.
-					const sampleNotes = Array.isArray(data.samples) ? [notes[0] ?? 'c3'] : notes.length ? notes : ['c3'];
-					for (const note of sampleNotes) {
-						const value = { s: soundName, n: 0, note };
-						const key = `sample:${soundName}:${note}`;
+					// Array banks select a file with `n`; note-keyed banks select a
+					// note. Keep the values found in the actual pattern so `.bank()`
+					// and pattern-valued `n(...)` controls preload the same variant
+					// that the scheduler will request.
+					const sampleVariants = Array.isArray(data.samples)
+						? (values.length ? variants : [{ note: notes[0] ?? 'c3', n: 0 }])
+						: variants;
+					for (const variant of sampleVariants) {
+						const value = { ...variant, s: soundName, n: variant.n ?? 0, note: variant.note ?? 'c3' };
+						const key = `sample:${soundName}:${String(value.n)}:${String(value.note)}`;
 						if (!pending.has(key)) pending.set(key, module.getSampleBuffer(value, data.samples));
 					}
 					return;
 				}
 
 				if (data.type === 'soundfont' && Array.isArray(data.fonts) && data.fonts.length && audioContext) {
-					const fontIndex = module.getSoundIndex?.(0, data.fonts.length) ?? 0;
-					const font = data.fonts[fontIndex] ?? data.fonts[0];
-					if (!font) return;
-					for (const note of notes.length ? notes : ['c3']) {
-						const key = `soundfont:${font}:${String(note)}`;
+					for (const variant of variants) {
+						const fontIndex = module.getSoundIndex?.(variant.n ?? 0, data.fonts.length) ?? 0;
+						const font = data.fonts[fontIndex] ?? data.fonts[0];
+						if (!font) continue;
+						const noteKey = variant.freq ?? variant.note ?? 'c3';
+						const key = `soundfont:${font}:${String(noteKey)}`;
 						if (!pending.has(key)) {
 							soundfontRuntime ??= await loadSoundfontRuntime();
 							pending.set(
 								key,
-								soundfontRuntime.getFontBufferSource(font, { s: soundName, n: 0, note }, audioContext).then((source) => {
+								soundfontRuntime.getFontBufferSource(font, { ...variant, s: soundName, n: variant.n ?? 0, note: variant.note ?? 'c3' }, audioContext).then((source) => {
 									source.disconnect();
 								}),
 							);
@@ -458,14 +706,35 @@ export class StrudelAdapter {
 			};
 
 			const sourceAssets = collectSourceAudioAssets(this.activeSource);
-			if (sourceAssets.length) {
-				for (const asset of sourceAssets) await enqueueSound(asset.name, module.getSound?.(asset.name)?.data, asset.notes);
-			} else if (queryArc) {
-				const haps = queryArc(0, endCycle, { _cps: cps }).filter((hap) => hap.hasOnset?.() !== false);
-				for (const hap of haps) {
-					const value = hap.value;
-					if (!value || typeof value.s !== 'string') continue;
-					await enqueueSound(value.s, module.getSound?.(value.s)?.data, [String(value.note ?? value.freq ?? 'c3')]);
+			for (const asset of sourceAssets) await enqueueSound(asset.name, module.getSound?.(asset.name)?.data, asset.notes);
+
+			// Static extraction covers ordinary pasted source without querying a
+			// potentially expensive pattern. Query as a second pass as well: it
+			// discovers `.bank(...)`, dynamic `n(...)`/`note(...)`, and sounds whose
+			// names only exist after Strudel's mini-notation expansion.
+			if (pattern.queryArc) {
+				try {
+					// Keep the Pattern receiver intact. Strudel's queryArc implementation
+					// reads `this.query`; detaching the method makes ordinary pasted
+					// patterns fail their preload pass even though playback can still start.
+					const queried = pattern.queryArc(0, endCycle, { _cps: cps });
+					const haps = Array.isArray(queried) ? queried : [];
+					let inspected = 0;
+					for (const hap of haps) {
+						if (inspected >= MAX_PRELOAD_HAPS) break;
+						inspected += 1;
+						if (hap.hasOnset?.() === false) continue;
+						const value = hap.value;
+						if (!value || typeof value.s !== 'string') continue;
+						const bank = typeof value.bank === 'string' && value.bank.trim() ? value.bank.trim() : '';
+						const soundName = bank && !value.s.toLowerCase().startsWith(`${bank.toLowerCase()}_`)
+							? `${bank}_${value.s}`
+							: value.s;
+						await enqueueSound(soundName, module.getSound?.(soundName)?.data, [], [{ ...value, s: soundName }]);
+					}
+				} catch {
+					// Static extraction remains a useful fallback for fake or dynamic
+					// patterns whose query throws before playback begins.
 				}
 			}
 
@@ -480,50 +749,91 @@ export class StrudelAdapter {
 	}
 
 	public async pause(): Promise<AdapterResult> {
+		return this.enqueueSerialized(() => this.pauseNow());
+	}
+
+	private async pauseNow(): Promise<AdapterResult> {
+		let pauseAttempted = false;
 		try {
 			await this.init();
+			if (this.destroyed) throw this.destroyedError();
 			if (!this.repl) {
 				throw new Error('Strudel did not return a browser REPL.');
 			}
+			if (this.runtime.transport === 'stopped') return { ok: true };
+			if (this.runtime.transport === 'paused') return { ok: true };
 
 			const currentCycle = this.readCurrentCycle();
+			pauseAttempted = true;
 			this.repl.pause();
 			this.stopCycleTimer();
 			this.setRuntime({ transport: 'paused', currentCycle });
 			return { ok: true };
 		} catch (error) {
+			if (pauseAttempted) this.stopAfterRestoreFailure();
 			return { ok: false, error };
 		}
 	}
 
 	public async stop(): Promise<AdapterResult> {
+		return this.enqueueSerialized(() => this.stopNow());
+	}
+
+	private async stopNow(): Promise<AdapterResult> {
+		let stopAttempted = false;
 		try {
 			await this.init();
+			if (this.destroyed) throw this.destroyedError();
 			if (!this.repl) {
 				throw new Error('Strudel did not return a browser REPL.');
 			}
+			stopAttempted = true;
 			this.repl.stop();
+			// `repl.stop()` resets Cyclist in the current Strudel build, but that is
+			// not part of the public scheduler contract and lightweight hosts/fakes
+			// may leave the cursor where it was. Reset explicitly so Stop always
+			// satisfies Sushi's transport contract and the next Play starts at zero.
+			try {
+				this.setSchedulerCycle(0);
+			} catch {
+				// Some third-party schedulers are not seekable. They should still be
+				// considered stopped; their own stop implementation remains the
+				// fallback for resetting any internal cursor.
+			}
 			this.module?.hush?.();
 			this.stopCycleTimer();
 			this.setRuntime({ transport: 'stopped', currentCycle: 0 });
 			return { ok: true };
 		} catch (error) {
+			if (stopAttempted) this.stopAfterRestoreFailure();
 			return { ok: false, error };
 		}
 	}
 
 	public async seek(cycle: number): Promise<AdapterResult> {
+		return this.enqueueSerialized(() => this.seekNow(cycle));
+	}
+
+	private async seekNow(cycle: number): Promise<AdapterResult> {
+		let transportTouched = false;
 		try {
 			await this.init();
+			if (this.destroyed) throw this.destroyedError();
 			if (!this.repl) {
 				throw new Error('Strudel did not return a browser REPL.');
 			}
 
-			const targetCycle = Number.isFinite(cycle) ? Math.max(0, cycle) : 0;
+			const targetCycle = Number.isFinite(cycle)
+				? Math.max(0, this.songEndCycle === undefined ? cycle : Math.min(this.songEndCycle, cycle))
+				: 0;
 			const wasPlaying = this.runtime.transport === 'playing';
 			const wasPaused = this.runtime.transport === 'paused';
-			if (wasPlaying) this.repl.pause();
+			if (wasPlaying) {
+				transportTouched = true;
+				this.repl.pause();
+			}
 
+			transportTouched = true;
 			this.setSchedulerCycle(targetCycle);
 
 			this.setRuntime({
@@ -532,44 +842,46 @@ export class StrudelAdapter {
 			});
 			if (wasPlaying) {
 				await this.repl.start();
+				if (this.destroyed) throw this.destroyedError();
 				this.startCycleTimer();
 			}
 			return { ok: true };
 		} catch (error) {
+			if (transportTouched) this.stopAfterRestoreFailure();
 			return { ok: false, error };
 		}
 	}
 
-	private setSchedulerCycle(targetCycle: number): void {
-		if (!this.repl) throw new Error('Strudel did not return a browser REPL.');
-		const scheduler = this.repl.scheduler;
-		if (typeof scheduler.setCycle === 'function') {
-			scheduler.setCycle(targetCycle);
-		} else if (typeof scheduler.stop === 'function' && 'lastEnd' in scheduler) {
-			// Cyclist (the default @strudel/web scheduler) keeps its current
-			// cycle in lastEnd but does not expose setCycle publicly. Resetting
-			// that scheduler cursor preserves Strudel's own event scheduling and
-			// lets the next start begin at the requested cycle.
-			scheduler.stop();
-			scheduler.lastEnd = targetCycle;
-			scheduler.lastBegin = targetCycle;
-		} else {
-			throw new Error('This Strudel scheduler does not support cycle seeking.');
-		}
-	}
-
 	public destroy(): void {
+		this.destroyed = true;
 		this.stopCycleTimer();
+		const repl = this.repl;
+		const module = this.module;
+		this.repl = undefined;
+		this.module = undefined;
+		this.activePattern = undefined;
+		this.activeSource = '';
+		this.preloadPromise = undefined;
 		try {
-			this.repl?.stop();
-			this.module?.hush?.();
+			repl?.stop();
+			module?.hush?.();
 		} catch {
 			// Destruction should never turn a route change or HMR update into an
 			// uncaught browser error.
 		}
 	}
 
+	private destroyedError(): Error {
+		return new Error('The Strudel runtime has been destroyed.');
+	}
+
 	private readCurrentCycle(): number {
+		// Cyclist intentionally reports zero while paused or stopped even though
+		// its internal `lastEnd` cursor remains at the paused/boundary position.
+		// Runtime state is the authoritative playhead outside active playback;
+		// consulting scheduler.now() here would make Play after a pause or finite
+		// song end jump back to the wrong cursor.
+		if (this.runtime.transport !== 'playing') return this.runtime.currentCycle ?? 0;
 		const cycle = this.repl?.scheduler?.now?.();
 		return typeof cycle === 'number' && Number.isFinite(cycle) ? Math.max(0, cycle) : this.runtime.currentCycle ?? 0;
 	}
@@ -633,6 +945,18 @@ export class StrudelAdapter {
 		this.stopCycleTimer();
 		try {
 			this.repl?.stop();
+			if (songEndCycle !== undefined) {
+				try {
+					// Keep the scheduler cursor and the exposed runtime boundary in
+					// agreement. Play can then deterministically rewind to zero on the
+					// next request, even when a host scheduler's stop() leaves its cursor
+					// untouched.
+					this.setSchedulerCycle(songEndCycle);
+				} catch {
+					// The visible runtime still reports the finite boundary when a
+					// third-party scheduler does not support seeking.
+				}
+			}
 			this.module?.hush?.();
 		} finally {
 			this.setRuntime({ transport: 'stopped', currentCycle: songEndCycle ?? this.readCurrentCycle() });
@@ -640,6 +964,7 @@ export class StrudelAdapter {
 	}
 
 	private setRuntime(update: AdapterRuntimeUpdate): void {
+		if (this.destroyed) return;
 		this.runtime = { ...this.runtime, ...update };
 		this.onRuntimeUpdate?.(update);
 	}

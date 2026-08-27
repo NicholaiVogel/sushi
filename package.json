@@ -26,5 +26,8 @@
   },
   "allowScripts": {
     "esbuild": true
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.0"
   }
 }

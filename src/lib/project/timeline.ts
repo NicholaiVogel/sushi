@@ -22,14 +22,20 @@ export function getTimelineCellWidth(zoom: number): number {
 
 /**
  * Build quarter-note cells for the arrangement ruler. A cycle is one bar in
- * the current meter, so each cycle contributes four labelled beat cells.
+ * the current meter, so each cycle contributes the source-defined number of
+ * quarter-note cells. Strudel's `setcpm(bpm / qpc)` convention uses an integer
+ * quarter-note count for a cycle; malformed or fractional values are rounded
+ * to the nearest usable subdivision at the presentation boundary.
  */
-export function getTimelineCells(endCycle: number): TimelineCell[] {
+export function getTimelineCells(endCycle: number, quarterNotesPerCycle = 4): TimelineCell[] {
 	const safeEndCycle = Number.isFinite(endCycle) && endCycle > 0 ? endCycle : 1;
-	const cellCount = Math.max(4, Math.ceil(safeEndCycle * 4));
+	const safeQuarterNotes = Number.isFinite(quarterNotesPerCycle) && quarterNotesPerCycle > 0
+		? Math.max(1, Math.round(quarterNotesPerCycle))
+		: 4;
+	const cellCount = Math.max(safeQuarterNotes, Math.ceil(safeEndCycle * safeQuarterNotes));
 	return Array.from({ length: cellCount }, (_, index) => {
-		const bar = Math.floor(index / 4) + 1;
-		const beat = index % 4;
+		const bar = Math.floor(index / safeQuarterNotes) + 1;
+		const beat = index % safeQuarterNotes;
 		return {
 			label: beat === 0 ? String(bar) : `${bar}.${beat}`,
 			barStart: beat === 0,
