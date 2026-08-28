@@ -12,6 +12,8 @@ Sushi is a browser-based reimplementation of [Strudel](https://strudel.tidalcycl
 
 Compose in a source editor as you would in a live-coding environment, or use Sushi’s visual studio to organize tracks and patterns on a timeline like a traditional DAW. The source and arrangement share one musical workspace, so code, controls, and playback stay connected.
 
+Try it live at [sushidaw.com](https://sushidaw.com/).
+
 ## Highlights
 
 - Bring in existing Strudel source or write new patterns with Tidal Cycles mini-notation.
