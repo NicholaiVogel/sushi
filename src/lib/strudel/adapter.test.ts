@@ -1140,6 +1140,54 @@ describe('StrudelAdapter evaluation queue', () => {
 		}
 	});
 
+	test('does not treat a stale shared-worker cursor as an immediate song end', async () => {
+		let schedulerCycle = 30;
+		let pendingSchedulerCycle: number | undefined;
+		let started = false;
+		const updates: Array<{ transport?: string; currentCycle?: number }> = [];
+		const scheduler = {
+			cps: 1,
+			now: () => started ? schedulerCycle : 0,
+			setCycle: (cycle: number) => {
+				pendingSchedulerCycle = cycle;
+				setTimeout(() => {
+					schedulerCycle = pendingSchedulerCycle ?? schedulerCycle;
+				}, 80);
+			},
+			stop: () => { started = false; },
+			lastEnd: 0,
+			lastBegin: 0,
+		};
+		const fakeModule = {
+			initStrudel: async (options?: { onToggle?: (started: boolean) => void }) => ({
+				evaluate: async () => ({}),
+				start: async () => { started = true; options?.onToggle?.(true); },
+				stop: () => { started = false; options?.onToggle?.(false); },
+				pause: () => { started = false; options?.onToggle?.(false); },
+				scheduler,
+			}),
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter((update) => updates.push(update), async () => fakeModule);
+			expect(await adapter.evaluateSource('accepted')).toEqual({ ok: true });
+			expect(await adapter.play(30)).toEqual({ ok: true });
+			await new Promise((resolve) => setTimeout(resolve, 140));
+			expect(updates.some((update) => update.transport === 'playing' && update.currentCycle === 0)).toBe(true);
+			expect(await adapter.stop()).toEqual({ ok: true });
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
+
 	test('rewinds a paused scheduler cursor after a finite stop before replaying', async () => {
 		let currentCycle = 0;
 		let started = false;

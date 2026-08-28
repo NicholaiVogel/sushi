@@ -85,6 +85,13 @@ const MAX_PRELOAD_HAPS = 4096;
 const MAX_PRELOAD_VARIANTS = 24;
 const AUDIO_ASSET_TIMEOUT_MS = 8_000;
 const PIANO_SAMPLE_MAP_URL = 'https://raw.githubusercontent.com/felixroos/dough-samples/main/piano.json';
+// NeoCyclist applies setCycle() through a SharedWorker. The worker can deliver
+// the first tick after the UI's 50ms runtime timer, so its local cursor may
+// briefly report the previous finite boundary when a new transport starts.
+// Keep the requested start cycle authoritative until the worker acknowledges a
+// nearby cursor, avoiding an immediate false song-end stop.
+const SCHEDULER_START_GRACE_MS = 250;
+const SCHEDULER_START_TOLERANCE_CYCLES = 1;
 // Warming an entire arrangement before the first scheduler tick makes a large
 // pasted song feel frozen (and can make Cyclist miss its first deadlines). The
 // first couple of cycles cover the assets needed to get playback started; later
@@ -418,6 +425,7 @@ export class StrudelAdapter {
 	private activeEvaluation: { error: unknown } | undefined;
 	private cycleTimer: ReturnType<typeof setInterval> | undefined;
 	private songEndCycle: number | undefined;
+	private pendingSchedulerStart: { cycle: number; expiresAt: number } | undefined;
 	private runtime: AdapterRuntimeUpdate = {
 		audioState: 'initializing',
 		transport: 'stopped',
@@ -474,12 +482,19 @@ export class StrudelAdapter {
 					if (this.activeEvaluation) this.activeEvaluation.error = error;
 				},
 				onToggle: (started) => {
+					if (!started) this.pendingSchedulerStart = undefined;
 					this.setRuntime({
 						transport: started ? 'playing' : 'stopped',
 						audioState: started ? 'ready' : this.runtime.audioState,
 						currentCycle: started ? this.readCurrentCycle() : this.runtime.currentCycle,
 					});
 					if (started) {
+						// The object above is evaluated while the previous transport state
+						// is still visible, so take one more sample after marking the
+						// transport as playing. This lets a pending SharedWorker reset
+						// acknowledge itself immediately when the cursor is already near
+						// the requested start cycle.
+						this.setRuntime({ currentCycle: this.readCurrentCycle() });
 						this.startCycleTimer();
 					} else {
 						this.stopCycleTimer();
@@ -712,6 +727,7 @@ export class StrudelAdapter {
 	 * immediately so the UI cannot claim that an unknown pattern is still live.
 	 */
 	private stopAfterRestoreFailure(): void {
+		this.pendingSchedulerStart = undefined;
 		this.stopCycleTimer();
 		try {
 			this.repl?.stop();
@@ -743,6 +759,7 @@ export class StrudelAdapter {
 		}
 
 		if (transport === 'playing') {
+			this.armSchedulerStart(cycle);
 			await repl.start();
 			if (this.destroyed) return;
 			this.startCycleTimer();
@@ -787,12 +804,17 @@ export class StrudelAdapter {
 			if (songEndCycle !== undefined) {
 				this.songEndCycle = Number.isFinite(songEndCycle) && songEndCycle > 0 ? songEndCycle : undefined;
 			}
-			if (this.songEndCycle !== undefined && this.readCurrentCycle() >= this.songEndCycle) {
+			const currentCycle = this.readCurrentCycle();
+			const shouldRewindStoppedTransport = this.runtime.transport === 'stopped'
+				&& (currentCycle <= 0 || (this.songEndCycle !== undefined && currentCycle >= this.songEndCycle));
+			if (shouldRewindStoppedTransport) {
 				this.setSchedulerCycle(0);
 				this.setRuntime({ currentCycle: 0 });
 			}
+			const startCycle = shouldRewindStoppedTransport ? 0 : this.runtime.currentCycle ?? currentCycle;
 			await this.preloadActivePattern();
 			if (this.destroyed) throw this.destroyedError();
+			this.armSchedulerStart(startCycle);
 			startAttempted = true;
 			await repl.start();
 			if (this.destroyed) {
@@ -804,6 +826,7 @@ export class StrudelAdapter {
 				throw this.destroyedError();
 			}
 			this.setRuntime({ audioState: 'ready', transport: 'playing', currentCycle: this.readCurrentCycle() });
+			this.setRuntime({ currentCycle: this.readCurrentCycle() });
 			this.startCycleTimer();
 			return { ok: true };
 		} catch (error) {
@@ -1188,6 +1211,7 @@ export class StrudelAdapter {
 				transport: wasPlaying || wasPaused ? 'paused' : 'stopped',
 			});
 			if (wasPlaying) {
+				this.armSchedulerStart(targetCycle);
 				await this.repl.start();
 				if (this.destroyed) throw this.destroyedError();
 				this.startCycleTimer();
@@ -1201,6 +1225,7 @@ export class StrudelAdapter {
 
 	public destroy(): void {
 		this.destroyed = true;
+		this.pendingSchedulerStart = undefined;
 		this.stopCycleTimer();
 		const repl = this.repl;
 		const module = this.module;
@@ -1227,6 +1252,13 @@ export class StrudelAdapter {
 		return new Error('The Strudel runtime has been destroyed.');
 	}
 
+	private armSchedulerStart(cycle: number): void {
+		this.pendingSchedulerStart = {
+			cycle: Math.max(0, cycle),
+			expiresAt: Date.now() + SCHEDULER_START_GRACE_MS,
+		};
+	}
+
 	private readCurrentCycle(): number {
 		// Cyclist intentionally reports zero while paused or stopped even though
 		// its internal `lastEnd` cursor remains at the paused/boundary position.
@@ -1234,7 +1266,18 @@ export class StrudelAdapter {
 		// consulting scheduler.now() here would make Play after a pause or finite
 		// song end jump back to the wrong cursor.
 		if (this.runtime.transport !== 'playing') return this.runtime.currentCycle ?? 0;
+		const pendingStart = this.pendingSchedulerStart;
 		const cycle = this.repl?.scheduler?.now?.();
+		if (pendingStart) {
+			const isNearRequestedStart = typeof cycle === 'number'
+				&& Number.isFinite(cycle)
+				&& Math.abs(cycle - pendingStart.cycle) <= SCHEDULER_START_TOLERANCE_CYCLES;
+			if (isNearRequestedStart || Date.now() >= pendingStart.expiresAt) {
+				this.pendingSchedulerStart = undefined;
+			} else {
+				return pendingStart.cycle;
+			}
+		}
 		return typeof cycle === 'number' && Number.isFinite(cycle) ? Math.max(0, cycle) : this.runtime.currentCycle ?? 0;
 	}
 
