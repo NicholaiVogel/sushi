@@ -172,15 +172,15 @@ function registerSushiCompatibility(module: StrudelModule, sliderValues: Map<str
 	// identity methods, so the Sushi timeline can query the same events that the
 	// scheduler will play. The source lane id is added later by Strudel's REPL
 	// when it calls Pattern.p(), and therefore survives the final stacked pattern.
-	let nextScopeAnalyzerId = 1000;
+	let nextAnalyzerId = 1000;
 	const registerVisualizer = (name: string, visualizer: StrudelVisualizer) => {
 		if (typeof module.Pattern?.prototype[name] === 'function') return;
 		module.register?.(name, (pattern: unknown) => {
 			const candidate = pattern as StrudelPattern;
 			if (typeof candidate.withHaps !== 'function') return pattern;
-			const analyzerId = visualizer === 'scope' ? nextScopeAnalyzerId++ : undefined;
+			const analyzerId = visualizer === 'scope' || visualizer === 'spectrum' ? nextAnalyzerId++ : undefined;
 			const analyze = candidate.analyze;
-			const analyzed = visualizer === 'scope' && analyzerId !== undefined && typeof analyze === 'function'
+			const analyzed = analyzerId !== undefined && typeof analyze === 'function'
 				? analyze.call(candidate, analyzerId)
 				: candidate;
 			if (typeof analyzed.withHaps !== 'function') return analyzed;
@@ -201,6 +201,7 @@ function registerSushiCompatibility(module: StrudelModule, sliderValues: Map<str
 	};
 	registerVisualizer('_pianoroll', 'pianoroll');
 	registerVisualizer('_scope', 'scope');
+	registerVisualizer('_spectrum', 'spectrum');
 }
 
 function numericTime(value: unknown): number | undefined {
@@ -221,9 +222,14 @@ function visualizerPatternIds(source: string): Map<string, string> {
 	const ids = new Map<string, string>();
 	let anonymousIndex = 0;
 	for (const block of getSourceBlockDetails(source)) {
-		if (!block.label?.endsWith('$')) continue;
-		ids.set(block.id, `${block.label}${anonymousIndex}`);
-		anonymousIndex += 1;
+		const label = block.label;
+		if (!label) continue;
+		if (label.includes('$')) {
+			ids.set(block.id, `${label}${anonymousIndex}`);
+			anonymousIndex += 1;
+		} else {
+			ids.set(block.id, label);
+		}
 	}
 	return ids;
 }
@@ -1126,10 +1132,19 @@ export class StrudelAdapter {
 
 	/** Read the Strudel analyser attached to a scope lane when the Web Audio runtime provides it. */
 	public getVisualizerScopeData(trackId: string): ArrayLike<number> | undefined {
+		return this.getVisualizerAnalyzerData(trackId, 'time');
+	}
+
+	/** Read the Strudel analyser attached to a spectrum lane when available. */
+	public getVisualizerSpectrumData(trackId: string): ArrayLike<number> | undefined {
+		return this.getVisualizerAnalyzerData(trackId, 'frequency');
+	}
+
+	private getVisualizerAnalyzerData(trackId: string, type: 'time' | 'frequency'): ArrayLike<number> | undefined {
 		const analyzerId = this.visualizerAnalyzerIds.get(trackId);
 		if (analyzerId === undefined || !this.module?.getAnalyzerData) return undefined;
 		try {
-			const data = this.module.getAnalyzerData('time', analyzerId);
+			const data = this.module.getAnalyzerData(type, analyzerId);
 			return data;
 		} catch {
 			return undefined;

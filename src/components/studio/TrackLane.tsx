@@ -34,6 +34,7 @@ export interface TrackLaneProps {
 	runtime: RuntimeState;
 	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
 	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
+	getVisualizerSpectrumData: (trackId: string) => ArrayLike<number> | undefined;
 	selected: boolean;
 	renaming: boolean;
 	renamingValue: string;
@@ -74,6 +75,7 @@ export function TrackLane({
 	runtime,
 	getVisualizerHaps,
 	getVisualizerScopeData,
+	getVisualizerSpectrumData,
 	selected,
 	renaming,
 	renamingValue,
@@ -239,6 +241,7 @@ export function TrackLane({
 						windowEndCycle={timing.endCycle}
 						getVisualizerHaps={getVisualizerHaps}
 						getVisualizerScopeData={getVisualizerScopeData}
+						getVisualizerSpectrumData={getVisualizerSpectrumData}
 					/> : null}
 					<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => onStartTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - TIMELINE_SNAP_CYCLE), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
 					<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>

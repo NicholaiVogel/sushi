@@ -17,6 +17,7 @@ export interface VisualizerCanvasProps {
 		end: number,
 	) => VisualizerHap[];
 	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
+	getVisualizerSpectrumData: (trackId: string) => ArrayLike<number> | undefined;
 }
 
 type VisualizerFrameListener = (timestamp: number) => void;
@@ -224,6 +225,49 @@ function drawScope(
 	ctx.shadowBlur = 0;
 }
 
+function drawSpectrum(
+	ctx: CanvasRenderingContext2D,
+	width: number,
+	height: number,
+	data: ArrayLike<number> | undefined,
+	trackColor: string,
+): void {
+	const baseline = height - 1;
+	ctx.strokeStyle = 'rgba(220, 229, 223, 0.12)';
+	ctx.lineWidth = 1;
+	ctx.beginPath();
+	ctx.moveTo(0, baseline + 0.5);
+	ctx.lineTo(width, baseline + 0.5);
+	ctx.stroke();
+
+	if (!data || data.length < 2) return;
+
+	// `getFloatFrequencyData` returns dB values (normally -100..0). Draw a
+	// compact, logarithmically sampled bar graph so a narrow clip does not spend
+	// a frame painting hundreds of one-pixel bins.
+	const barCount = Math.min(96, Math.max(12, Math.floor(width / 3)));
+	const barWidth = width / barCount;
+	ctx.fillStyle = trackColor;
+	ctx.shadowColor = trackColor;
+	ctx.shadowBlur = 6;
+	for (let bar = 0; bar < barCount; bar += 1) {
+		const start = Math.floor((bar / barCount) ** 2 * data.length);
+		const end = Math.max(start + 1, Math.floor(((bar + 1) / barCount) ** 2 * data.length));
+		let peak = -100;
+		for (let index = start; index < Math.min(end, data.length); index += 1) {
+			const value = Number(data[index]);
+			if (Number.isFinite(value)) peak = Math.max(peak, value);
+		}
+		const normalized = Math.max(0, Math.min(1, (peak + 100) / 100));
+		if (normalized <= 0) continue;
+		ctx.globalAlpha = 0.2 + normalized * 0.72;
+		const barHeight = Math.max(1, normalized * (height - 4));
+		ctx.fillRect(bar * barWidth, height - barHeight, Math.max(1, barWidth - 1), barHeight);
+	}
+	ctx.globalAlpha = 1;
+	ctx.shadowBlur = 0;
+}
+
 function hasSignal(data: ArrayLike<number>): boolean {
 	for (let index = 0; index < data.length; index += 1) {
 		if (Math.abs(data[index] ?? 0) > 0.005) return true;
@@ -241,18 +285,19 @@ export function VisualizerCanvas({
 	windowEndCycle,
 	getVisualizerHaps,
 	getVisualizerScopeData,
+	getVisualizerSpectrumData,
 }: VisualizerCanvasProps) {
 	const canvasRef = useRef<HTMLCanvasElement>(null);
 	const runtimeRef = useRef(runtime);
-	const drawRef = useRef<((scopeData?: ArrayLike<number>) => void) | undefined>(undefined);
-	const scopeDataRef = useRef<ArrayLike<number> | undefined>(undefined);
+	const drawRef = useRef<((analyzerData?: ArrayLike<number>) => void) | undefined>(undefined);
+	const analyzerDataRef = useRef<ArrayLike<number> | undefined>(undefined);
 	runtimeRef.current = runtime;
 
 	useEffect(() => {
 		const canvas = canvasRef.current;
 		if (!canvas) return undefined;
 		let scopeSamples = new Float32Array(0);
-		scopeDataRef.current = undefined;
+		analyzerDataRef.current = undefined;
 		const windowStart = Math.max(0, windowStartCycle);
 		const windowEnd = Math.max(windowStart + 0.001, windowEndCycle);
 		// Haps are derived from the accepted Strudel pattern. They are static for
@@ -260,7 +305,7 @@ export function VisualizerCanvas({
 		// scheduler out of the visualizer's frame loop.
 		const haps = getVisualizerHaps(trackId, visualizer, windowStart, windowEnd);
 
-		const draw = (scopeData = scopeDataRef.current) => {
+		const draw = (analyzerData = analyzerDataRef.current) => {
 			const rect = canvas.getBoundingClientRect();
 			const width = Math.max(1, Math.floor(rect.width));
 			const height = Math.max(1, Math.floor(rect.height));
@@ -280,7 +325,8 @@ export function VisualizerCanvas({
 			ctx.fillStyle = 'rgba(8, 12, 12, 0.22)';
 			ctx.fillRect(0, 0, width, height);
 			if (visualizer === 'pianoroll') drawPianoRoll(ctx, width, height, windowStart, windowEnd, haps, trackColor);
-			else drawScope(ctx, width, height, windowStart, windowEnd, haps, trackColor, scopeSamples, scopeData);
+			else if (visualizer === 'scope') drawScope(ctx, width, height, windowStart, windowEnd, haps, trackColor, scopeSamples, analyzerData);
+			else drawSpectrum(ctx, width, height, analyzerData, trackColor);
 			ctx.globalAlpha = 1;
 		};
 
@@ -295,7 +341,7 @@ export function VisualizerCanvas({
 	}, [getVisualizerHaps, trackColor, trackId, visualizer, windowEndCycle, windowStartCycle]);
 
 	useEffect(() => {
-		if (visualizer !== 'scope') return undefined;
+		if (visualizer !== 'scope' && visualizer !== 'spectrum') return undefined;
 		if (runtime.transport !== 'playing') {
 			drawRef.current?.();
 			return undefined;
@@ -309,18 +355,20 @@ export function VisualizerCanvas({
 			// preserving a responsive waveform.
 			if (timestamp - lastScopeDraw < 33) return;
 			lastScopeDraw = timestamp;
-			const scopeData = getVisualizerScopeData(trackId);
-			scopeDataRef.current = scopeData;
-			drawRef.current?.(scopeData);
+			const analyzerData = visualizer === 'scope'
+				? getVisualizerScopeData(trackId)
+				: getVisualizerSpectrumData(trackId);
+			analyzerDataRef.current = analyzerData;
+			drawRef.current?.(analyzerData);
 		});
-	}, [getVisualizerScopeData, runtime.transport, trackId, visualizer]);
+	}, [getVisualizerScopeData, getVisualizerSpectrumData, runtime.transport, trackId, visualizer]);
 
 	return (
 		<canvas
 			ref={canvasRef}
 			className={`track-visualizer-canvas track-visualizer-${visualizer}`}
 			role="img"
-			aria-label={`${trackName} ${visualizer === 'pianoroll' ? 'piano roll' : 'scope'} visualizer`}
+			aria-label={`${trackName} ${visualizer === 'pianoroll' ? 'piano roll' : visualizer} visualizer`}
 		/>
 	);
 }

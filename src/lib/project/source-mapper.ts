@@ -35,7 +35,7 @@ export interface SourceGlobals {
 export type TrackTimingMode = 'full' | 'seqPLoop' | 'arrange';
 
 /** A Strudel editor visualizer requested by a source track. */
-export type TrackVisualizer = 'pianoroll' | 'scope';
+export type TrackVisualizer = 'pianoroll' | 'scope' | 'spectrum';
 
 /** A numeric Strudel `slider(...)` widget projected onto a source lane. */
 export interface SourceSlider {
@@ -254,7 +254,10 @@ function withoutCarriageReturn(line: string): { body: string; ending: string } {
 function modeFromLabel(label: string | undefined): { muted: boolean; soloed: boolean } {
 	return {
 		muted: Boolean(label?.startsWith('_')),
-		soloed: Boolean(label?.startsWith('S')),
+		// A leading `S` is a Strudel solo prefix only when it is followed by
+		// the conventional `$` label. Named lanes such as `Supersaw:` and
+		// `Strings:` are ordinary authored labels, not soloed tracks.
+		soloed: Boolean(label?.startsWith('S$')),
 	};
 }
 
@@ -264,8 +267,8 @@ function modeFromLabel(label: string | undefined): { muted: boolean; soloed: boo
  * use names such as `lead$`; toggling a mode must keep that base label intact.
  */
 function baseTrackLabel(label: string | undefined): string {
-	const current = label?.endsWith('$') ? label : '$';
-	const withoutMode = current.startsWith('_') || current.startsWith('S') ? current.slice(1) : current;
+	const current = label?.trim() || '$';
+	const withoutMode = current.startsWith('_') || current.startsWith('S$') ? current.slice(1) : current;
 	return withoutMode || '$';
 }
 
@@ -588,7 +591,9 @@ function sourceVisualizerValue(expression: string): TrackVisualizer | undefined 
 	const uncommentedExpression = withoutSourceComments(expression);
 	const pianorollIndex = uncommentedExpression.search(/\._pianoroll\s*\(/);
 	const scopeIndex = uncommentedExpression.search(/\._scope\s*\(/);
-	if (pianorollIndex < 0 && scopeIndex < 0) return undefined;
+	const spectrumIndex = uncommentedExpression.search(/\._spectrum\s*\(/);
+	if (pianorollIndex < 0 && scopeIndex < 0 && spectrumIndex < 0) return undefined;
+	if (spectrumIndex > pianorollIndex && spectrumIndex > scopeIndex) return 'spectrum';
 	return scopeIndex > pianorollIndex ? 'scope' : 'pianoroll';
 }
 

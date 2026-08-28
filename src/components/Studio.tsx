@@ -1399,7 +1399,6 @@ export default function Studio() {
 	useEffect(() => stopTimelineSeekDrag, [stopTimelineSeekDrag]);
 
 	const blocks = useMemo(() => getSourceBlocks(studio.lastValid), [studio.lastValid]);
-	const draftBlocks = useMemo(() => getSourceBlocks(studio.draft), [studio.draft]);
 	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft).map((block) => [block.id, block])), [studio.draft]);
 	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid).map((block) => [block.id, block])), [studio.lastValid]);
 	const contextMenuTrack = useMemo(() => blocks.find((block) => block.id === contextMenu?.trackId), [blocks, contextMenu?.trackId]);
@@ -1420,6 +1419,7 @@ export default function Studio() {
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
 	const getVisualizerHaps = useCallback((trackId: string, visualizer: StrudelVisualizer, begin: number, end: number): VisualizerHap[] => adapterRef.current?.getVisualizerHaps(trackId, visualizer, begin, end) ?? [], []);
 	const getVisualizerScopeData = useCallback((trackId: string): ArrayLike<number> | undefined => adapterRef.current?.getVisualizerScopeData(trackId), []);
+	const getVisualizerSpectrumData = useCallback((trackId: string): ArrayLike<number> | undefined => adapterRef.current?.getVisualizerSpectrumData(trackId), []);
 	const cycleStep = getSourceCycleStep(studio.lastValid);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
@@ -1530,7 +1530,6 @@ export default function Studio() {
 				<SourceEditor
 					draft={studio.draft}
 					draftLines={draftLines}
-					draftBlockCount={draftBlocks.length}
 					highlightedSource={highlightedSource}
 					diagnostics={studio.diagnostics}
 					sourceEditorRef={sourceEditorRef}
@@ -1583,6 +1582,7 @@ export default function Studio() {
 						runtime={studio.runtime}
 						getVisualizerHaps={getVisualizerHaps}
 						getVisualizerScopeData={getVisualizerScopeData}
+						getVisualizerSpectrumData={getVisualizerSpectrumData}
 						isBusy={isBusy}
 						selectedTrackId={selectedTrackId}
 						renamingTrackId={renamingTrackId}

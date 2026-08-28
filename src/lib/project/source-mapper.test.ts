@@ -99,6 +99,26 @@ _$: s("bd*4")._scope()`;
 		expect(scope.visualizer).toBe('scope');
 	});
 
+	test('projects named Strudel labels and spectrum visualizers', () => {
+		const source = `closehat: s("hh16")._spectrum()
+openhat: s("[~ hh]*4")._spectrum()`;
+		const [closehat, openhat] = getSourceBlockDetails(source);
+
+		expect(closehat).toMatchObject({ label: 'closehat', visualizer: 'spectrum', line: 1 });
+		expect(openhat).toMatchObject({ label: 'openhat', visualizer: 'spectrum', line: 2 });
+
+		const muted = updateTrackMode(source, closehat.id, 'mute', true);
+		expect(muted).toContain('_closehat: s("hh16")._spectrum()');
+	});
+
+	test('keeps named lanes beginning with S intact when toggling modes', () => {
+		const source = 'Supersaw: s("supersaw")';
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track).toMatchObject({ label: 'Supersaw', muted: false, soloed: false });
+		expect(updateTrackMode(source, track.id, 'mute', true)).toBe('_Supersaw: s("supersaw")');
+	});
+
 	test('projects and updates numeric Strudel sliders', () => {
 		const source = `// @sushi-track {"id":"trk_slider","name":"Filter","type":"synth","schema":1}
 $: s("sawtooth").lpf(slider(200, 200, 4000)).gain(slider(.5, 0, 1, .01))`;

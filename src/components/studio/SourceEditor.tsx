@@ -6,7 +6,6 @@ import { getDiagnosticLabel, getDiagnosticLocation, formatRevision } from './hel
 export interface SourceEditorProps {
 	draft: string;
 	draftLines: number[];
-	draftBlockCount: number;
 	highlightedSource: string;
 	diagnostics: SourceDiagnostic[];
 	sourceEditorRef: RefObject<HTMLTextAreaElement | null>;
@@ -21,7 +20,6 @@ export interface SourceEditorProps {
 export function SourceEditor({
 	draft,
 	draftLines,
-	draftBlockCount,
 	highlightedSource,
 	diagnostics,
 	sourceEditorRef,
@@ -94,11 +92,9 @@ export function SourceEditor({
 						spellCheck={false}
 						autoCapitalize="off"
 						wrap="off"
-						aria-describedby="source-help"
 					/>
 				</div>
 			</div>
-			<p className="editor-help" id="source-help">Tab indent <span aria-hidden="true">·</span> Shift+Tab outdent <span aria-hidden="true">·</span> Cmd/Ctrl + Enter to validate <span aria-hidden="true">·</span> {draftBlockCount} marked {draftBlockCount === 1 ? 'block' : 'blocks'}</p>
 			{diagnostics.length ? <SourceDiagnosticBanner diagnostic={diagnostics[0]} location="sidebar" /> : null}
 		</aside>
 	);

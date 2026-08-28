@@ -42,6 +42,10 @@ interface BlockCandidate {
 
 const markerLinePattern = /^\s*\/\/\s*@sushi-track\s+(\{.*\})\s*$/;
 const labelPattern = /^(\s*)([A-Za-z_$][\w$]*)(\s*):(\s*)(.*)$/;
+// Strudel supports both the conventional `$:`/`_$:` labels and named labels
+// such as `closehat:`. Keep ordinary JavaScript labels out of the projection
+// by requiring a recognizable pattern constructor on the label's first line.
+const patternLabelExpressionPattern = /^(?:s|sound|n|note|stack|cat|fastcat|slowcat|timecat|polymeter|silence)\s*\(|(?:^|\.)s(?:ound)?\s*\(|^\s*\(\s*["'`]/;
 
 function splitLines(source: string): SourceLine[] {
 	const lines = source.split('\n');
@@ -74,10 +78,12 @@ function parseMarker(line: string): MarkerMetadata | undefined {
 	}
 }
 
-function isTrackLabel(label: string): boolean {
+function isTrackLabel(label: string, expression = ''): boolean {
 	// Strudel's standard labeled patterns are $:, _$:, and S$:. Accept other
-	// dollar-suffixed labels too, while avoiding object/type-like `name:` lines.
-	return label.endsWith('$');
+	// dollar-suffixed labels too. Named Strudel patterns are also valid source
+	// lanes, but only when their first line starts with a pattern constructor;
+	// this avoids treating JavaScript labels such as `loop:` as tracks.
+	return label.endsWith('$') || patternLabelExpressionPattern.test(expression.trim());
 }
 
 function firstSoundToken(expression: string): string | undefined {
@@ -152,7 +158,7 @@ function candidateLines(lines: SourceLine[]): Candidate[] {
 		}
 
 		const label = line.body.match(labelPattern);
-		if (label && isTrackLabel(label[2])) {
+		if (label && isTrackLabel(label[2], label[5])) {
 			candidates.push({ line, label: { name: label[2], expression: label[5] } });
 		}
 	}
@@ -216,7 +222,7 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 
 			const expressionRange = { start: expressionLine.offset, end: blockEnd, line: expressionLine.index + 1 };
 			const expressionMatch = expressionLine.body.match(labelPattern);
-			if (!expressionMatch || !isTrackLabel(expressionMatch[2])) return undefined;
+			if (!expressionMatch || !isTrackLabel(expressionMatch[2], expressionMatch[5])) return undefined;
 			return {
 				id: candidate.marker.id ?? generatedId(`unmanaged-${index + 1}`),
 				name: candidate.marker.name ?? `Source block ${index + 1}`,

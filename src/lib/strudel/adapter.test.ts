@@ -33,7 +33,7 @@ describe('StrudelAdapter evaluation queue', () => {
 			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
 			await adapter.init();
 
-			expect(registrations).toEqual(['sliderWithID', '_pianoroll', '_scope']);
+			expect(registrations).toEqual(['sliderWithID', '_pianoroll', '_scope', '_spectrum']);
 			expect(typeof (globalThis as typeof globalThis & { sliderWithID?: unknown }).sliderWithID).toBe('function');
 			expect(typeof schedulerOptions?.setInterval).toBe('function');
 			expect(typeof schedulerOptions?.clearInterval).toBe('function');
@@ -124,9 +124,10 @@ describe('StrudelAdapter evaluation queue', () => {
 		const fakeModule = {
 			Pattern: { prototype: {} },
 			register: (name: string, func: (pattern: unknown) => unknown) => {
-				if (name === '_pianoroll' || name === '_scope') visualizerRegistrations.set(name, func);
+				if (name === '_pianoroll' || name === '_scope' || name === '_spectrum') visualizerRegistrations.set(name, func);
 				return (...args: unknown[]) => args[1];
 			},
+			getAnalyzerData: (type: 'time' | 'frequency') => [type === 'frequency' ? -12 : 0],
 			initStrudel: async () => ({
 				evaluate: async () => visualizerPattern,
 				start: async () => undefined,
@@ -151,6 +152,13 @@ describe('StrudelAdapter evaluation queue', () => {
 			const queryArc = (visualizerPattern as { queryArc?: (begin: number, end: number, controls: Record<string, unknown>) => unknown[] }).queryArc;
 			queryArc?.(0, 1, { neocyclist: 'neocyclist' });
 			expect(schedulerHaps).toEqual([fakeHap]);
+
+			visualizerPattern = visualizerRegistrations.get('_spectrum')?.(fakePattern);
+			expect(await adapter.evaluateSource(source.replace('_pianoroll', '_spectrum'))).toEqual({ ok: true });
+			expect(adapter.getVisualizerHaps('trk_source_01', 'spectrum', 0, 1)).toEqual([
+				{ begin: 0, end: 1, value: { note: 'c4', color: '#ff4d00' }, analyzerId: 1000 },
+			]);
+			expect(adapter.getVisualizerSpectrumData('trk_source_01')).toEqual([-12]);
 			adapter.destroy();
 		} finally {
 			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });

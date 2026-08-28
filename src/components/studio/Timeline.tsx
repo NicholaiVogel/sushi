@@ -37,6 +37,7 @@ export interface TimelineProps {
 	runtime: RuntimeState;
 	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
 	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
+	getVisualizerSpectrumData: (trackId: string) => ArrayLike<number> | undefined;
 	isBusy: boolean;
 	selectedTrackId: string | null;
 	renamingTrackId: string | null;
@@ -87,6 +88,7 @@ export function Timeline({
 	runtime,
 	getVisualizerHaps,
 	getVisualizerScopeData,
+	getVisualizerSpectrumData,
 	isBusy,
 	selectedTrackId,
 	renamingTrackId,
@@ -179,6 +181,7 @@ export function Timeline({
 					runtime={runtime}
 					getVisualizerHaps={getVisualizerHaps}
 					getVisualizerScopeData={getVisualizerScopeData}
+					getVisualizerSpectrumData={getVisualizerSpectrumData}
 					selected={selectedTrackId === block.id}
 					renaming={renamingTrackId === block.id}
 					renamingValue={renamingTrackValue}
