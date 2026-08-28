@@ -506,15 +506,16 @@ export class StrudelAdapter {
 			const module = await this.loadModule();
 			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
 			// The editor package owns the official widget methods and transpiler
-			// registrations. Load its lightweight widget module before the runtime's
-			// prebake so both packages decorate the same Pattern prototype. If an
-			// embedding host omits CodeMirror, the compatibility registrations below
-			// still keep reduced runtimes playable.
+			// registrations. Load the package entry (the same module imported by the
+			// React editor) before the runtime's prebake so production bundlers keep
+			// one shared widget registry. Importing widget.mjs directly creates a
+			// second BlockWidget/widgetElements module in production, which makes
+			// CodeMirror try to mount widgets whose DOM elements are undefined.
 			try {
-				await import('@strudel/codemirror/widget.mjs');
+				await import('@strudel/codemirror');
 			} catch {
 				// `registerSushiCompatibility` supplies a reduced fallback for hosts
-				// that cannot load the optional editor widget module.
+				// that cannot load the optional editor package.
 			}
 			// The unbundled web entry exports Pattern, while older embedding hosts
 			// may still provide the self-contained bundle. Give the compatibility
