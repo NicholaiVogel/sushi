@@ -16,6 +16,7 @@
         "react": "^19.2.8",
         "react-dom": "^19.2.8",
         "webmcp-types": "^0.1.5",
+        "worker-timers": "8.0.13",
       },
       "devDependencies": {
         "bun-types": "^1.4.0",
@@ -531,6 +532,8 @@
 
     "fast-string-width": ["fast-string-width@3.0.2", "", { "dependencies": { "fast-string-truncated-width": "^3.0.2" } }, "sha512-gX8LrtNEI5hq8DVUfRQMbr5lpaS4nMIWV+7XEbXk2b8kiQIizgnlr12B4dA3ZEx3308ze0O4Q1R+cHts8kyUJg=="],
 
+    "fast-unique-numbers": ["fast-unique-numbers@9.0.27", "", { "dependencies": { "@babel/runtime": "^7.29.2", "tslib": "^2.8.1" } }, "sha512-nDA9ADeINN8SA2u2wCtU+siWFTTDqQR37XvgPIDDmboWQeExz7X0mImxuaN+kJddliIqy2FpVRmnvRZ+j8i1/A=="],
+
     "fast-wrap-ansi": ["fast-wrap-ansi@0.2.2", "", { "dependencies": { "fast-string-width": "^3.0.2" } }, "sha512-7F2Fl+TjRSenLqlU3UjSH0iyqopqoZIu7eZVpEirP2g1GtWa2G/ecEmBdgz31+Mxr+ELclgg6sokpSFIQiZ02Q=="],
 
     "fdir": ["fdir@6.5.0", "", { "peerDependencies": { "picomatch": "^3 || ^4" }, "optionalPeers": ["picomatch"] }, "sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg=="],
@@ -798,6 +801,12 @@
     "webmcp-types": ["webmcp-types@0.1.5", "", {}, "sha512-QAfuzNJ+hiY2JLpPbD/6xZruLQlsqtWUDqQCRruqD0dbtZHDg6IUZ2K0zctlRokwuscGlr47i6hKv8mQPSQLhw=="],
 
     "webmidi": ["webmidi@3.1.16", "", { "dependencies": { "djipevents": "^2.0.7" }, "optionalDependencies": { "jzz": "^1.8.5" } }, "sha512-I6NnCfBUXNbV8q6EU+DPtr1u1EgjzDrFKHQQS2OgaHzcuQRFhRHgogfKpKSpxD0IgXhZHz8+k/OpGfZoWbvWAQ=="],
+
+    "worker-timers": ["worker-timers@8.0.13", "", { "dependencies": { "@babel/runtime": "^7.26.0", "tslib": "^2.8.1", "worker-timers-broker": "^7.1.9", "worker-timers-worker": "^8.0.10" } }, "sha512-ggT5TBkuZC+EySptNS61Z5nuwa/8klCyKBv0+Wa0HPLjp13nluIrdUXX9zdYGwJKwNuVPp1wPMUnFuSKw5Hxsg=="],
+
+    "worker-timers-broker": ["worker-timers-broker@7.1.9", "", { "dependencies": { "@babel/runtime": "^7.26.0", "fast-unique-numbers": "^9.0.15", "tslib": "^2.8.1", "worker-timers-worker": "^8.0.10" } }, "sha512-YPql2CMZwAqPlCHoxXWsERLJChb8r9YvjRiAR0KSQ8iyNbckmSXdw4UCttrMbntwQLWxz5msO0oiUX2VA3WyTQ=="],
+
+    "worker-timers-worker": ["worker-timers-worker@8.0.10", "", { "dependencies": { "@babel/runtime": "^7.26.0", "tslib": "^2.8.1" } }, "sha512-wmdEMhn70li//pFNDT3pcjQ8kcuZOIuD6vrt9RBCwdTcnwvnsAmdSKSHiZSGwhNYwTJd+dvuhb81G05TGpTHcg=="],
 
     "xxhash-wasm": ["xxhash-wasm@1.1.0", "", {}, "sha512-147y/6YNh+tlp6nd/2pWq38i9h6mz/EuQ6njIrmW8D1BS5nCqs0P6DG+m6zTGnNz5I+uhZ0SHxBs9BsPrwcKDA=="],
 

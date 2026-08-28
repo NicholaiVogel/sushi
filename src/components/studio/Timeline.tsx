@@ -3,7 +3,6 @@ import type { RuntimeState, SourceBlockSummary } from '../../lib/project/model';
 import { EXTENDED_SONG_END_CYCLE } from '../../lib/project/model';
 import { cyclesToSeconds, type SourceGlobals } from '../../lib/project/source-mapper';
 import {
-	clamp,
 	formatClock,
 	formatCycle,
 	getTrackColor,
@@ -36,9 +35,8 @@ export interface TimelineProps {
 	validTrackDetails: Map<string, TrackDetails>;
 	sourceGlobals: SourceGlobals;
 	runtime: RuntimeState;
-	getCurrentCycle: () => number;
 	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
-	getVisualizerScopeData: (trackId: string) => number[] | undefined;
+	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
 	isBusy: boolean;
 	selectedTrackId: string | null;
 	renamingTrackId: string | null;
@@ -87,7 +85,6 @@ export function Timeline({
 	validTrackDetails,
 	sourceGlobals,
 	runtime,
-	getCurrentCycle,
 	getVisualizerHaps,
 	getVisualizerScopeData,
 	isBusy,
@@ -163,7 +160,7 @@ export function Timeline({
 						</button>
 					</div>
 					<button className="timeline-seek-surface" type="button" onPointerDown={onStartTimelineSeekDrag} onKeyDown={onTimelineSeekKeyDown} disabled={isBusy} aria-label={`Seek playhead, cycle ${formatCycle(runtime.currentCycle)}, ${formatClock(cyclesToSeconds(runtime.currentCycle, sourceGlobals))}`} title="Click or drag to seek" />
-					<i className="timeline-playhead" style={{ '--playhead-position': clamp(runtime.currentCycle / songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
+					<i className="timeline-playhead" aria-hidden="true" />
 				</div>
 			</div>
 			{blocks.map((block, index) => {
@@ -180,7 +177,6 @@ export function Timeline({
 					timelineCells={timelineCells}
 					timelineCellCount={timelineCellCount}
 					runtime={runtime}
-					getCurrentCycle={getCurrentCycle}
 					getVisualizerHaps={getVisualizerHaps}
 					getVisualizerScopeData={getVisualizerScopeData}
 					selected={selectedTrackId === block.id}
@@ -206,7 +202,7 @@ export function Timeline({
 				/>;
 			})}
 			{blocks.length ? (
-				<div className="timeline-fill" style={timelineGridStyle} aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties}>{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'beat-start' : ''} key={index} />)}</div><span className="lane-playhead timeline-fill-playhead" style={{ '--playhead-position': clamp(runtime.currentCycle / songEndCycle, 0, 1) } as CSSProperties} /></div></div>
+				<div className="timeline-fill" style={timelineGridStyle} aria-hidden="true"><div className="timeline-fill-label" /><div className="lane-grid timeline-fill-grid"><div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties}>{timelineCells.map((cell, index) => <span className={cell.isBarStart ? 'beat-start' : ''} key={index} />)}</div><span className="lane-playhead timeline-fill-playhead" /></div></div>
 			) : (
 				<div className="timeline-empty-state" style={timelineGridStyle}>
 					<strong>NO TRACKS</strong>

@@ -1,6 +1,7 @@
 import { DEFAULT_SONG_END_CYCLE, type AudioState, type TransportState } from '../project/model';
 import { getSourceBlockDetails, type TrackVisualizer } from '../project/source-mapper';
 import soundfontDefinitions from '@strudel/soundfonts/gm.mjs';
+import { clearInterval as clearSchedulerInterval, setInterval as setSchedulerInterval } from 'worker-timers';
 
 interface StrudelModule {
 	initStrudel(options?: {
@@ -8,6 +9,9 @@ interface StrudelModule {
 		onToggle?: (started: boolean) => void;
 		prebake?: () => void | Promise<void>;
 		beforeStart?: () => void | Promise<void>;
+		sync?: boolean;
+		setInterval?: typeof setInterval;
+		clearInterval?: typeof clearInterval;
 	}): Promise<StrudelRepl>;
 	register?: (name: string, func: (...args: any[]) => unknown, patternify?: boolean) => unknown;
 	ref?: (accessor: () => unknown) => unknown;
@@ -80,6 +84,11 @@ type PreloadValue = Record<string, any> & {
 const MAX_PRELOAD_HAPS = 4096;
 const MAX_PRELOAD_VARIANTS = 24;
 const AUDIO_ASSET_TIMEOUT_MS = 8_000;
+// Warming an entire arrangement before the first scheduler tick makes a large
+// pasted song feel frozen (and can make Cyclist miss its first deadlines). The
+// first couple of cycles cover the assets needed to get playback started; later
+// events can continue loading through Strudel's normal lazy path.
+const PRELOAD_LOOKAHEAD_CYCLES = 2;
 
 const soundCallPattern = /(?:^|[.\s])(?:s|sound)\s*\(\s*(['"`])([\s\S]*?)\1\s*\)/g;
 const directSoundPattern = /\(\s*(['"`])([\s\S]*?)\1\s*\)\s*\.note\s*\(/g;
@@ -175,12 +184,19 @@ function registerSushiCompatibility(module: StrudelModule, sliderValues: Map<str
 				? analyze.call(candidate, analyzerId)
 				: candidate;
 			if (typeof analyzed.withHaps !== 'function') return analyzed;
-			return analyzed.withHaps((haps, state) => haps.map((hap) => hap.setContext?.({
-				...(hap.context ?? {}),
-				sushiVisualizer: visualizer,
-				sushiPatternId: typeof state.controls?.id === 'string' ? state.controls.id : undefined,
-				...(analyzerId === undefined ? {} : { sushiAnalyzerId: analyzerId }),
-			}) ?? hap));
+			return analyzed.withHaps((haps, state) => {
+				// Scheduler queries are the audio-critical path. The lane identity is
+				// only needed by Sushi's visualizer query, so leave those haps untouched
+				// when Cyclist/NeoCyclist asks for events to play. This avoids cloning and
+				// re-contextualizing every event on every scheduler tick.
+				if (state.controls?.cyclist || state.controls?.neocyclist) return haps;
+				return haps.map((hap) => hap.setContext?.({
+					...(hap.context ?? {}),
+					sushiVisualizer: visualizer,
+					sushiPatternId: typeof state.controls?.id === 'string' ? state.controls.id : undefined,
+					...(analyzerId === undefined ? {} : { sushiAnalyzerId: analyzerId }),
+				}) ?? hap);
+			});
 		});
 	};
 	registerVisualizer('_pianoroll', 'pianoroll');
@@ -388,6 +404,7 @@ export class StrudelAdapter {
 	private visualizerPatternIds = new Map<string, string>();
 	private visualizerAnalyzerIds = new Map<string, number>();
 	private preloadPromise: Promise<void> | undefined;
+	private audioInitPromise: Promise<void> | undefined;
 	private sampleBankPromise: Promise<void> | undefined;
 	private initPromise: Promise<void> | undefined;
 	private evaluationQueue: Promise<void> = Promise.resolve();
@@ -421,6 +438,16 @@ export class StrudelAdapter {
 			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
 			this.module = module;
 			this.repl = await module.initStrudel({
+				// Keep Cyclist's clock in a SharedWorker when the browser supports it.
+				// Pattern queries still happen on the main thread, but the transport
+				// clock and trigger deadlines no longer compete with React/canvas work.
+				sync: typeof SharedWorker !== 'undefined',
+				// Strudel.cc runs Cyclist from worker-timers. Window timers can be
+				// delayed by React layout, canvas work, or a busy audio callback, which
+				// makes Cyclist log "skip query: too late" and drops events. Keep the
+				// scheduler's heartbeat independent from the UI timer queue.
+				setInterval: setSchedulerInterval,
+				clearInterval: clearSchedulerInterval,
 				prebake: async () => {
 					registerSushiCompatibility(module, this.sliderValues);
 					// @strudel/web only registers oscillator synths by default. Strudel.cc
@@ -479,6 +506,7 @@ export class StrudelAdapter {
 			this.visualizerPatternIds.clear();
 			this.visualizerAnalyzerIds.clear();
 			this.preloadPromise = undefined;
+			this.audioInitPromise = undefined;
 			this.sampleBankPromise = undefined;
 			this.activeEvaluation = undefined;
 			this.stopCycleTimer();
@@ -741,7 +769,7 @@ export class StrudelAdapter {
 
 			// The package registers this on first mousedown, but calling it from the
 			// Play click makes the user-gesture boundary explicit for this UI.
-			await this.module?.initAudio?.();
+			await this.initializeAudio();
 			if (this.destroyed) throw this.destroyedError();
 			await this.ensureAudioContextRunning();
 			if (this.destroyed) throw this.destroyedError();
@@ -777,6 +805,24 @@ export class StrudelAdapter {
 			this.setRuntime({ audioState: isAudioLockedError(normalizedError) ? 'locked' : 'error', transport: 'stopped' });
 			return { ok: false, error: normalizedError };
 		}
+	}
+
+	/**
+	 * Loading the Strudel AudioWorklets is an expensive, one-time operation for
+	 * this adapter. Reusing the promise also prevents a first-click mousedown
+	 * listener and the Play handler from loading the same worklets concurrently.
+	 */
+	private async initializeAudio(): Promise<void> {
+		if (!this.audioInitPromise) {
+			this.audioInitPromise = Promise.resolve(this.module?.initAudio?.()).then(
+				() => undefined,
+				(error) => {
+					this.audioInitPromise = undefined;
+					throw error;
+				},
+			);
+		}
+		return this.audioInitPromise;
 	}
 
 	private async ensureAudioContextRunning(): Promise<void> {
@@ -856,8 +902,10 @@ export class StrudelAdapter {
 
 		this.preloadPromise = (async () => {
 			this.setRuntime({ audioState: 'initializing' });
-			if (this.sampleBankPromise) await this.sampleBankPromise;
-			const endCycle = this.songEndCycle ?? DEFAULT_SONG_END_CYCLE;
+			// Sample maps are optional remote resources. They are intentionally
+			// started during init and must not hold the audio scheduler behind a
+			// network/decode round trip here.
+			const endCycle = Math.min(this.songEndCycle ?? DEFAULT_SONG_END_CYCLE, PRELOAD_LOOKAHEAD_CYCLES);
 			const cps = typeof repl.scheduler.cps === 'number' && Number.isFinite(repl.scheduler.cps) ? repl.scheduler.cps : 0.5;
 			const audioContext = module.getAudioContext?.();
 			let soundfontRuntime: SoundfontRuntime | undefined;
@@ -1077,12 +1125,12 @@ export class StrudelAdapter {
 	}
 
 	/** Read the Strudel analyser attached to a scope lane when the Web Audio runtime provides it. */
-	public getVisualizerScopeData(trackId: string): number[] | undefined {
+	public getVisualizerScopeData(trackId: string): ArrayLike<number> | undefined {
 		const analyzerId = this.visualizerAnalyzerIds.get(trackId);
 		if (analyzerId === undefined || !this.module?.getAnalyzerData) return undefined;
 		try {
 			const data = this.module.getAnalyzerData('time', analyzerId);
-			return data ? Array.from(data) : undefined;
+			return data;
 		} catch {
 			return undefined;
 		}
@@ -1139,6 +1187,7 @@ export class StrudelAdapter {
 		this.visualizerPatternIds.clear();
 		this.visualizerAnalyzerIds.clear();
 		this.preloadPromise = undefined;
+		this.audioInitPromise = undefined;
 		this.sampleBankPromise = undefined;
 		try {
 			repl?.stop();

@@ -21,6 +21,12 @@ export interface SourceEditorEdit {
 
 export const SOURCE_EDITOR_INDENT = '  ';
 
+const SOURCE_EDITOR_DELIMITERS: Record<string, string> = {
+	'(': ')',
+	'[': ']',
+	'{': '}',
+};
+
 function clampOffset(source: string, value: number): number {
 	return Math.max(0, Math.min(source.length, Number.isFinite(value) ? value : 0));
 }
@@ -29,6 +35,44 @@ function normalizedSelection(source: string, selectionStart: number, selectionEn
 	const first = clampOffset(source, selectionStart);
 	const second = clampOffset(source, selectionEnd);
 	return { start: Math.min(first, second), end: Math.max(first, second) };
+}
+
+/**
+ * Insert a matching closing delimiter and leave the caret inside the pair.
+ * When text is selected, the pair wraps that selection just like an IDE.
+ */
+export function insertSourceDelimiterPair(
+	source: string,
+	delimiter: string,
+	selectionStart: number,
+	selectionEnd = selectionStart,
+): SourceEditorEdit | undefined {
+	const closing = SOURCE_EDITOR_DELIMITERS[delimiter];
+	if (!closing) return undefined;
+	const selection = normalizedSelection(source, selectionStart, selectionEnd);
+	const nextSource = `${source.slice(0, selection.start)}${delimiter}${source.slice(selection.start, selection.end)}${closing}${source.slice(selection.end)}`;
+	return {
+		source: nextSource,
+		selectionStart: selection.start + 1,
+		selectionEnd: selection.end + 1,
+	};
+}
+
+/**
+ * Consume a closing delimiter when it is already immediately after the
+ * caret. This prevents typing `)` or `]` after an auto-closed pair from
+ * producing a duplicate character.
+ */
+export function skipSourceClosingDelimiter(
+	source: string,
+	delimiter: string,
+	selectionStart: number,
+	selectionEnd = selectionStart,
+): SourceEditorEdit | undefined {
+	const selection = normalizedSelection(source, selectionStart, selectionEnd);
+	if (selection.start !== selection.end || source[selection.start] !== delimiter) return undefined;
+	const caret = selection.start + 1;
+	return { source, selectionStart: caret, selectionEnd: caret };
 }
 
 function lineStartAt(source: string, offset: number): number {

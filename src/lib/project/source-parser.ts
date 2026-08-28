@@ -201,7 +201,7 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 	};
 	let ordinaryIndex = 0;
 
-	return candidates.map((blockCandidate, index) => {
+	const blocks = candidates.map((blockCandidate, index): ParsedSourceBlock | undefined => {
 		const candidate = blockCandidate.candidate;
 		const next = candidates[index + 1]?.candidate;
 		const blockEnd = next?.line.offset ?? source.length;
@@ -212,20 +212,11 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 				const expressionLine = blockCandidate.expressionCandidate?.line
 				?? lines.slice(candidate.line.index + 1, next?.line.index ?? lines.length)
 					.find((line) => line.body.trim() && !line.body.trim().startsWith('//'));
-			if (!expressionLine) {
-				return {
-					id: candidate.marker.id ?? generatedId(`unmanaged-${index + 1}`),
-					name: candidate.marker.name ?? `Source block ${index + 1}`,
-					type: candidate.marker.type ?? 'unknown',
-					line: candidate.line.index + 1,
-					sourceRange,
-					...(candidate.marker.id ? { markerId: candidate.marker.id } : {}),
-					marker: true,
-				};
-			}
+			if (!expressionLine) return undefined;
 
 			const expressionRange = { start: expressionLine.offset, end: blockEnd, line: expressionLine.index + 1 };
 			const expressionMatch = expressionLine.body.match(labelPattern);
+			if (!expressionMatch || !isTrackLabel(expressionMatch[2])) return undefined;
 			return {
 				id: candidate.marker.id ?? generatedId(`unmanaged-${index + 1}`),
 				name: candidate.marker.name ?? `Source block ${index + 1}`,
@@ -234,10 +225,8 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 				sourceRange,
 				...(candidate.marker.id ? { markerId: candidate.marker.id } : {}),
 				expressionRange,
-				...(expressionMatch && isTrackLabel(expressionMatch[2]) ? {
-					label: expressionMatch[2],
-					expression: expressionForLine(source, lines, expressionLine.index, blockEnd),
-				} : {}),
+				label: expressionMatch[2],
+				expression: expressionForLine(source, lines, expressionLine.index, blockEnd),
 				marker: true,
 			};
 		}
@@ -256,12 +245,13 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 			marker: false,
 		};
 	});
+	return blocks.filter((block): block is ParsedSourceBlock => block !== undefined);
 }
 
 /**
  * Return every repeated explicit marker identity. Generated identities for
- * unannotated or metadata-only blocks are intentionally excluded: they are
- * projection IDs, not authored track IDs.
+ * unannotated blocks are intentionally excluded: they are projection IDs,
+ * not authored track IDs.
  */
 export function getDuplicateSourceTrackIds(source: string): DuplicateSourceTrackId[] {
 	const seen = new Map<string, ParsedSourceBlock>();

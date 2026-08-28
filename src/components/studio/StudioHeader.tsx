@@ -15,6 +15,8 @@ import { SettingsMenu } from './SettingsMenu';
 
 export interface StudioHeaderProps {
 	headerRef: RefObject<HTMLElement | null>;
+	transportClockRef: RefObject<HTMLSpanElement | null>;
+	transportCycleRef: RefObject<HTMLSpanElement | null>;
 	projectName: string;
 	persistenceState: PersistenceState;
 	saveStateLabel: string;
@@ -58,6 +60,8 @@ export interface StudioHeaderProps {
 
 export function StudioHeader({
 	headerRef,
+	transportClockRef,
+	transportCycleRef,
 	projectName,
 	persistenceState,
 	saveStateLabel,
@@ -178,8 +182,8 @@ export function StudioHeader({
 							</button>
 						</div>
 						<div className="transport-status" aria-label="Playback status">
-							<span className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>
-							<span className="transport-cycle" aria-live="polite">CYCLE {formatCycle(runtime.currentCycle)}</span>
+							<span ref={transportClockRef} className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>
+							<span ref={transportCycleRef} className="transport-cycle" aria-live="polite">CYCLE {formatCycle(runtime.currentCycle)}</span>
 							<span className="transport-divider" aria-hidden="true" />
 							<span className="transport-readout">{runtime.audioState === 'initializing' ? 'PREPARING' : runtime.transport.toUpperCase()}</span>
 						</div>

@@ -32,9 +32,8 @@ export interface TrackLaneProps {
 	timelineCells: TimelineCell[];
 	timelineCellCount: number;
 	runtime: RuntimeState;
-	getCurrentCycle: () => number;
 	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
-	getVisualizerScopeData: (trackId: string) => number[] | undefined;
+	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
 	selected: boolean;
 	renaming: boolean;
 	renamingValue: string;
@@ -73,7 +72,6 @@ export function TrackLane({
 	timelineCells,
 	timelineCellCount,
 	runtime,
-	getCurrentCycle,
 	getVisualizerHaps,
 	getVisualizerScopeData,
 	selected,
@@ -237,8 +235,8 @@ export function TrackLane({
 						visualizer={trackDetails.visualizer}
 						trackColor={trackColor}
 						runtime={runtime}
-						songEndCycle={songEndCycle}
-						getCurrentCycle={getCurrentCycle}
+						windowStartCycle={timing.startCycle}
+						windowEndCycle={timing.endCycle}
 						getVisualizerHaps={getVisualizerHaps}
 						getVisualizerScopeData={getVisualizerScopeData}
 					/> : null}
@@ -246,7 +244,7 @@ export function TrackLane({
 					<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
 					<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => onStartTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, timing.startCycle, Math.max(timing.startCycle + TIMELINE_SNAP_CYCLE, timing.endCycle + delta)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
 				</div>
-				<span className={`lane-playhead ${runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} style={{ '--playhead-position': clamp(runtime.currentCycle / songEndCycle, 0, 1) } as CSSProperties} aria-hidden="true" />
+				<span className={`lane-playhead ${runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} aria-hidden="true" />
 			</div>
 		</div>
 	);

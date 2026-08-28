@@ -4,19 +4,23 @@ import { isAudioLockedError, StrudelAdapter } from './adapter';
 describe('StrudelAdapter evaluation queue', () => {
 	test('registers editor-only Strudel compatibility helpers', async () => {
 		const registrations: string[] = [];
+		let schedulerOptions: { setInterval?: unknown; clearInterval?: unknown } | undefined;
 		const scheduler = { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
 		const fakeModule = {
 			register: (name: string) => {
 				registrations.push(name);
 				return (...args: unknown[]) => args[1];
 			},
-			initStrudel: async () => ({
-				evaluate: async () => ({}),
-				start: async () => undefined,
-				stop: () => undefined,
-				pause: () => undefined,
-				scheduler,
-			}),
+			initStrudel: async (options?: { setInterval?: unknown; clearInterval?: unknown }) => {
+				schedulerOptions = options;
+				return {
+					evaluate: async () => ({}),
+					start: async () => undefined,
+					stop: () => undefined,
+					pause: () => undefined,
+					scheduler,
+				};
+			},
 		};
 		const hadWindow = 'window' in globalThis;
 		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
@@ -31,6 +35,9 @@ describe('StrudelAdapter evaluation queue', () => {
 
 			expect(registrations).toEqual(['sliderWithID', '_pianoroll', '_scope']);
 			expect(typeof (globalThis as typeof globalThis & { sliderWithID?: unknown }).sliderWithID).toBe('function');
+			expect(typeof schedulerOptions?.setInterval).toBe('function');
+			expect(typeof schedulerOptions?.clearInterval).toBe('function');
+			expect(schedulerOptions?.setInterval).not.toBe(globalThis.setInterval);
 			adapter.destroy();
 		} finally {
 			if (hadSlider) {
@@ -93,6 +100,7 @@ describe('StrudelAdapter evaluation queue', () => {
 
 	test('keeps visualizer haps associated with their source lane', async () => {
 		const visualizerRegistrations = new Map<string, (pattern: unknown) => unknown>();
+		let schedulerHaps: unknown;
 		const fakeHap = {
 			whole: { begin: 0, end: 1 },
 			value: { note: 'c4', color: '#ff4d00' },
@@ -104,7 +112,11 @@ describe('StrudelAdapter evaluation queue', () => {
 		const fakePattern = {
 			withHaps(func: (haps: unknown[], state: { controls: Record<string, unknown> }) => unknown[]) {
 				return {
-					queryArc: (_begin: number, _end: number, controls: Record<string, unknown>) => func([fakeHap], { controls: { ...controls, id: '$0' } }),
+					queryArc: (_begin: number, _end: number, controls: Record<string, unknown>) => {
+						const haps = func([fakeHap], { controls: { ...controls, id: '$0' } });
+						if (controls.cyclist || controls.neocyclist) schedulerHaps = haps;
+						return haps;
+					},
 				};
 			},
 		};
@@ -134,8 +146,11 @@ describe('StrudelAdapter evaluation queue', () => {
 			const source = '$: note("c4")._pianoroll()';
 			expect(await adapter.evaluateSource(source)).toEqual({ ok: true });
 			expect(adapter.getVisualizerHaps('trk_source_01', 'pianoroll', 0, 1)).toEqual([
-				{ begin: 0, end: 1, value: { note: 'c4', color: '#ff4d00' } },
-			]);
+					{ begin: 0, end: 1, value: { note: 'c4', color: '#ff4d00' } },
+				]);
+			const queryArc = (visualizerPattern as { queryArc?: (begin: number, end: number, controls: Record<string, unknown>) => unknown[] }).queryArc;
+			queryArc?.(0, 1, { neocyclist: 'neocyclist' });
+			expect(schedulerHaps).toEqual([fakeHap]);
 			adapter.destroy();
 		} finally {
 			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });

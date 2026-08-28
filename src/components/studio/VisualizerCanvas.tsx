@@ -8,15 +8,46 @@ export interface VisualizerCanvasProps {
 	visualizer: StrudelVisualizer;
 	trackColor: string;
 	runtime: RuntimeState;
-	songEndCycle: number;
-	getCurrentCycle: () => number;
+	windowStartCycle: number;
+	windowEndCycle: number;
 	getVisualizerHaps: (
 		trackId: string,
 		visualizer: StrudelVisualizer,
 		begin: number,
 		end: number,
 	) => VisualizerHap[];
-	getVisualizerScopeData: (trackId: string) => number[] | undefined;
+	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
+}
+
+type VisualizerFrameListener = (timestamp: number) => void;
+
+// Strudel's Drawer owns one animation loop for the whole editor. Keep the
+// same shape here instead of giving every scope canvas its own rAF callback.
+// The listeners still draw independently, but the browser only has to schedule
+// one frame callback for a large arrangement.
+const visualizerFrameListeners = new Set<VisualizerFrameListener>();
+let visualizerFrameHandle: number | undefined;
+
+function runVisualizerFrames(timestamp: number): void {
+	visualizerFrameHandle = undefined;
+	for (const listener of visualizerFrameListeners) listener(timestamp);
+	if (visualizerFrameListeners.size && typeof window !== 'undefined') {
+		visualizerFrameHandle = window.requestAnimationFrame(runVisualizerFrames);
+	}
+}
+
+function subscribeToVisualizerFrames(listener: VisualizerFrameListener): () => void {
+	visualizerFrameListeners.add(listener);
+	if (visualizerFrameHandle === undefined && typeof window !== 'undefined') {
+		visualizerFrameHandle = window.requestAnimationFrame(runVisualizerFrames);
+	}
+	return () => {
+		visualizerFrameListeners.delete(listener);
+		if (!visualizerFrameListeners.size && visualizerFrameHandle !== undefined && typeof window !== 'undefined') {
+			window.cancelAnimationFrame(visualizerFrameHandle);
+			visualizerFrameHandle = undefined;
+		}
+	};
 }
 
 const DEFAULT_MIN_MIDI = 36;
@@ -91,10 +122,8 @@ function drawPianoRoll(
 	height: number,
 	windowStart: number,
 	windowEnd: number,
-	currentCycle: number,
 	haps: VisualizerHap[],
 	trackColor: string,
-	accentColor: string,
 ): void {
 	const range = Math.max(windowEnd - windowStart, 0.001);
 	const events = haps
@@ -122,31 +151,19 @@ function drawPianoRoll(
 		const eventWidth = Math.max(((end - begin) / range) * width, 2);
 		const y = height - ((event.midi - minMidi + 1) / midiRange) * height;
 		const noteHeight = Math.max(4, height / Math.min(midiRange, 64) - 1);
-		const active = currentCycle >= event.begin && currentCycle <= event.end;
-		ctx.globalAlpha = active ? 0.98 : 0.72;
+		ctx.globalAlpha = 0.82;
 		ctx.fillStyle = eventColor(event.value, trackColor);
 		drawRoundedRect(ctx, x, y - noteHeight, eventWidth, noteHeight, 2);
 		if (eventWidth > 24) {
 			const label = valueLabel(event.value);
 			if (label) {
-				ctx.globalAlpha = active ? 1 : 0.65;
+				ctx.globalAlpha = 0.72;
 				ctx.fillStyle = '#0b1010';
 				ctx.font = '8px ui-monospace, SFMono-Regular, Menlo, monospace';
 				ctx.textBaseline = 'middle';
 				ctx.fillText(label, x + 4, y - noteHeight / 2, Math.max(0, eventWidth - 8));
 			}
 		}
-	}
-
-	ctx.globalAlpha = 0.9;
-	ctx.strokeStyle = accentColor;
-	ctx.lineWidth = 1;
-	const playheadX = ((currentCycle - windowStart) / range) * width;
-	if (playheadX >= 0 && playheadX <= width) {
-		ctx.beginPath();
-		ctx.moveTo(playheadX + 0.5, 0);
-		ctx.lineTo(playheadX + 0.5, height);
-		ctx.stroke();
 	}
 }
 
@@ -156,11 +173,10 @@ function drawScope(
 	height: number,
 	windowStart: number,
 	windowEnd: number,
-	currentCycle: number,
 	haps: VisualizerHap[],
 	trackColor: string,
-	accentColor: string,
-	scopeData?: number[],
+	samples: Float32Array,
+	scopeData?: ArrayLike<number>,
 ): void {
 	const range = Math.max(windowEnd - windowStart, 0.001);
 	const center = height * 0.52;
@@ -172,8 +188,7 @@ function drawScope(
 	ctx.lineTo(width, center + 0.5);
 	ctx.stroke();
 
-	const samples = new Float32Array(Math.max(2, Math.floor(width)));
-	const liveData = scopeData && scopeData.length > 1 && scopeData.some((sample) => Math.abs(sample) > 0.005) ? scopeData : undefined;
+	const liveData = scopeData && scopeData.length > 1 && hasSignal(scopeData) ? scopeData : undefined;
 	for (let index = 0; index < samples.length; index += 1) {
 		if (liveData) {
 			samples[index] = liveData[index % liveData.length] ?? 0;
@@ -207,17 +222,13 @@ function drawScope(
 	}
 	ctx.stroke();
 	ctx.shadowBlur = 0;
+}
 
-	ctx.globalAlpha = 0.7;
-	ctx.strokeStyle = accentColor;
-	ctx.lineWidth = 1;
-	const playheadX = ((currentCycle - windowStart) / range) * width;
-	if (playheadX >= 0 && playheadX <= width) {
-		ctx.beginPath();
-		ctx.moveTo(playheadX + 0.5, 0);
-		ctx.lineTo(playheadX + 0.5, height);
-		ctx.stroke();
+function hasSignal(data: ArrayLike<number>): boolean {
+	for (let index = 0; index < data.length; index += 1) {
+		if (Math.abs(data[index] ?? 0) > 0.005) return true;
 	}
+	return false;
 }
 
 export function VisualizerCanvas({
@@ -226,69 +237,83 @@ export function VisualizerCanvas({
 	visualizer,
 	trackColor,
 	runtime,
-	songEndCycle,
-	getCurrentCycle,
+	windowStartCycle,
+	windowEndCycle,
 	getVisualizerHaps,
 	getVisualizerScopeData,
 }: VisualizerCanvasProps) {
 	const canvasRef = useRef<HTMLCanvasElement>(null);
 	const runtimeRef = useRef(runtime);
-	const drawRef = useRef<(() => void) | undefined>(undefined);
+	const drawRef = useRef<((scopeData?: ArrayLike<number>) => void) | undefined>(undefined);
+	const scopeDataRef = useRef<ArrayLike<number> | undefined>(undefined);
 	runtimeRef.current = runtime;
 
 	useEffect(() => {
 		const canvas = canvasRef.current;
 		if (!canvas) return undefined;
-		let animationFrame: number | undefined;
+		let scopeSamples = new Float32Array(0);
+		scopeDataRef.current = undefined;
+		const windowStart = Math.max(0, windowStartCycle);
+		const windowEnd = Math.max(windowStart + 0.001, windowEndCycle);
+		// Haps are derived from the accepted Strudel pattern. They are static for
+		// this clip, so querying them once per source/range change keeps the audio
+		// scheduler out of the visualizer's frame loop.
+		const haps = getVisualizerHaps(trackId, visualizer, windowStart, windowEnd);
 
-		const draw = () => {
+		const draw = (scopeData = scopeDataRef.current) => {
 			const rect = canvas.getBoundingClientRect();
 			const width = Math.max(1, Math.floor(rect.width));
 			const height = Math.max(1, Math.floor(rect.height));
 			const dpr = Math.min(window.devicePixelRatio || 1, 2);
 			const pixelWidth = Math.max(1, Math.floor(width * dpr));
 			const pixelHeight = Math.max(1, Math.floor(height * dpr));
+			const sampleCount = Math.max(2, Math.floor(width));
+			if (scopeSamples.length !== sampleCount) scopeSamples = new Float32Array(sampleCount);
 			if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
 				canvas.width = pixelWidth;
 				canvas.height = pixelHeight;
 			}
 			const ctx = canvas.getContext('2d');
 			if (!ctx) return;
-			const accentColor = getComputedStyle(canvas).getPropertyValue('--accent').trim() || '#fd4733';
 			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 			ctx.clearRect(0, 0, width, height);
 			ctx.fillStyle = 'rgba(8, 12, 12, 0.22)';
 			ctx.fillRect(0, 0, width, height);
-
-			const currentCycle = Math.max(0, getCurrentCycle());
-			const visibleCycles = Math.max(1, Math.min(4, songEndCycle));
-			const windowStart = currentCycle - visibleCycles * 0.5;
-			const windowEnd = windowStart + visibleCycles;
-			const haps = getVisualizerHaps(trackId, visualizer, windowStart, windowEnd);
-			if (visualizer === 'pianoroll') drawPianoRoll(ctx, width, height, windowStart, windowEnd, currentCycle, haps, trackColor, accentColor);
-			else drawScope(ctx, width, height, windowStart, windowEnd, currentCycle, haps, trackColor, accentColor, getVisualizerScopeData(trackId));
+			if (visualizer === 'pianoroll') drawPianoRoll(ctx, width, height, windowStart, windowEnd, haps, trackColor);
+			else drawScope(ctx, width, height, windowStart, windowEnd, haps, trackColor, scopeSamples, scopeData);
 			ctx.globalAlpha = 1;
 		};
 
 		drawRef.current = draw;
-		const render = () => {
-			draw();
-			if (runtimeRef.current.transport === 'playing') animationFrame = requestAnimationFrame(render);
-		};
-		render();
-
-		const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(draw) : undefined;
+		draw();
+		const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => draw()) : undefined;
 		observer?.observe(canvas);
 		return () => {
-			if (animationFrame !== undefined) cancelAnimationFrame(animationFrame);
 			observer?.disconnect();
 			if (drawRef.current === draw) drawRef.current = undefined;
 		};
-	}, [getCurrentCycle, getVisualizerHaps, getVisualizerScopeData, runtime.transport, songEndCycle, trackColor, trackId, visualizer]);
+	}, [getVisualizerHaps, trackColor, trackId, visualizer, windowEndCycle, windowStartCycle]);
 
 	useEffect(() => {
-		if (runtime.transport !== 'playing') drawRef.current?.();
-	}, [runtime.currentCycle, runtime.transport]);
+		if (visualizer !== 'scope') return undefined;
+		if (runtime.transport !== 'playing') {
+			drawRef.current?.();
+			return undefined;
+		}
+
+		let lastScopeDraw = -Infinity;
+		return subscribeToVisualizerFrames((timestamp) => {
+			if (runtimeRef.current.transport !== 'playing') return;
+			// Analyzer data is useful at audio-monitoring rates, not at every display
+			// refresh. Capping this work keeps a multi-scope arrangement cheap while
+			// preserving a responsive waveform.
+			if (timestamp - lastScopeDraw < 33) return;
+			lastScopeDraw = timestamp;
+			const scopeData = getVisualizerScopeData(trackId);
+			scopeDataRef.current = scopeData;
+			drawRef.current?.(scopeData);
+		});
+	}, [getVisualizerScopeData, runtime.transport, trackId, visualizer]);
 
 	return (
 		<canvas

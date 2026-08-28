@@ -55,6 +55,8 @@ import {
 	getKeyParts,
 	getSourceCycleStep,
 	getTrackTimingForTimeline,
+	formatClock,
+	formatCycle,
 	normalizeImportedSnapshot,
 	normalizeTrackRange,
 	projectFileName,
@@ -98,6 +100,10 @@ export default function Studio() {
 	const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
 	const sourceHighlightRef = useRef<HTMLPreElement | null>(null);
 	const editorGutterRef = useRef<HTMLDivElement | null>(null);
+	const studioShellRef = useRef<HTMLDivElement | null>(null);
+	const transportClockRef = useRef<HTMLSpanElement | null>(null);
+	const transportCycleRef = useRef<HTMLSpanElement | null>(null);
+	const liveSourceGlobalsRef = useRef<ReturnType<typeof getSourceGlobals> | null>(null);
 	const projectImportInputRef = useRef<HTMLInputElement | null>(null);
 	const timelineViewportRef = useRef<HTMLElement | null>(null);
 	const timelineShellRef = useRef<HTMLElement | null>(null);
@@ -195,13 +201,18 @@ export default function Studio() {
 		setStudio(next);
 	}, []);
 
-	const patchRuntime = useCallback(
-		(update: AdapterRuntimeUpdate) => {
-			const runtime = { ...studioRef.current.runtime, ...update };
-			patchStudio({ runtime });
-		},
-		[patchStudio],
-	);
+	const patchRuntime = useCallback((update: AdapterRuntimeUpdate) => {
+		const runtime = { ...studioRef.current.runtime, ...update };
+		const next = { ...studioRef.current, runtime };
+		studioRef.current = next;
+		// The adapter publishes its scheduler position every 50ms. Keeping that
+		// value in the ref lets seeking and transport commands stay current without
+		// re-rendering the entire editor while audio is playing. The lightweight
+		// playhead/readout loop below paints the live position directly.
+		const onlyCurrentCycle = Object.keys(update).every((key) => key === 'currentCycle');
+		if (onlyCurrentCycle && runtime.transport === 'playing') return;
+		setStudio(next);
+	}, []);
 
 	const refreshLocalProjects = useCallback(async () => {
 		setLocalProjectsLoading(true);
@@ -1396,6 +1407,7 @@ export default function Studio() {
 		? draftTrackDetails.get(contextMenu.trackId) ?? validTrackDetails.get(contextMenu.trackId)
 		: undefined;
 	const sourceGlobals = useMemo(() => getSourceGlobals(studio.lastValid), [studio.lastValid]);
+	liveSourceGlobalsRef.current = sourceGlobals;
 	const draftGlobals = useMemo(() => getSourceGlobals(studio.draft), [studio.draft]);
 	const draftBpm = clamp(Math.round(draftGlobals.bpm), 0, 300);
 	const draftKey = getKeyParts(draftGlobals.key);
@@ -1406,9 +1418,8 @@ export default function Studio() {
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
-	const getCurrentCycle = useCallback(() => adapterRef.current?.getCurrentCycle() ?? studioRef.current.runtime.currentCycle, []);
 	const getVisualizerHaps = useCallback((trackId: string, visualizer: StrudelVisualizer, begin: number, end: number): VisualizerHap[] => adapterRef.current?.getVisualizerHaps(trackId, visualizer, begin, end) ?? [], []);
-	const getVisualizerScopeData = useCallback((trackId: string): number[] | undefined => adapterRef.current?.getVisualizerScopeData(trackId), []);
+	const getVisualizerScopeData = useCallback((trackId: string): ArrayLike<number> | undefined => adapterRef.current?.getVisualizerScopeData(trackId), []);
 	const cycleStep = getSourceCycleStep(studio.lastValid);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
@@ -1435,6 +1446,30 @@ export default function Studio() {
 	} as CSSProperties;
 
 	useEffect(() => {
+		const shell = studioShellRef.current;
+		if (!shell) return undefined;
+		let animationFrame: number | undefined;
+		const updateLiveTransport = () => {
+			const state = studioRef.current;
+			const currentCycle = clamp(
+				adapterRef.current?.getCurrentCycle() ?? state.runtime.currentCycle,
+				0,
+				Math.max(0, state.songEndCycle),
+			);
+			const songEndCycle = Math.max(0.001, state.songEndCycle);
+			shell.style.setProperty('--playhead-position', String(clamp(currentCycle / songEndCycle, 0, 1)));
+			const globals = liveSourceGlobalsRef.current ?? getSourceGlobals(state.lastValid);
+			if (transportClockRef.current) transportClockRef.current.textContent = formatClock(cyclesToSeconds(currentCycle, globals));
+			if (transportCycleRef.current) transportCycleRef.current.textContent = `CYCLE ${formatCycle(currentCycle)}`;
+			if (state.runtime.transport === 'playing') animationFrame = window.requestAnimationFrame(updateLiveTransport);
+		};
+		updateLiveTransport();
+		return () => {
+			if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame);
+		};
+	}, [studio.runtime.currentCycle, studio.runtime.transport]);
+
+	useEffect(() => {
 		if (selectedTrackId && !blocks.some((block) => block.id === selectedTrackId)) setSelectedTrackId(null);
 		if (contextMenu && !blocks.some((block) => block.id === contextMenu.trackId)) setContextMenu(null);
 		if (renamingTrackId && !blocks.some((block) => block.id === renamingTrackId)) cancelTrackRename();
@@ -1445,9 +1480,11 @@ export default function Studio() {
 	}, [studio.draft, syncEditorScroll]);
 
 	return (
-		<div className="studio-shell">
+		<div className="studio-shell" ref={studioShellRef}>
 			<StudioHeader
 				headerRef={headerPopoverScopeRef}
+				transportClockRef={transportClockRef}
+				transportCycleRef={transportCycleRef}
 				projectName={studio.projectName ?? 'First light'}
 				persistenceState={studio.persistenceState}
 				saveStateLabel={saveStateLabel}
@@ -1544,7 +1581,6 @@ export default function Studio() {
 						validTrackDetails={validTrackDetails}
 						sourceGlobals={sourceGlobals}
 						runtime={studio.runtime}
-						getCurrentCycle={getCurrentCycle}
 						getVisualizerHaps={getVisualizerHaps}
 						getVisualizerScopeData={getVisualizerScopeData}
 						isBusy={isBusy}

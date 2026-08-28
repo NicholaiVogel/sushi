@@ -3,8 +3,10 @@ import {
 	dedentSourceSelection,
 	getSourceLineNumbers,
 	indentSourceSelection,
+	insertSourceDelimiterPair,
 	insertSourceNewline,
 	replaceSourceSelection,
+	skipSourceClosingDelimiter,
 } from './editor';
 
 describe('source editor line model', () => {
@@ -65,5 +67,35 @@ describe('source editor line model', () => {
 			selectionStart: 23,
 			selectionEnd: 23,
 		});
+	});
+
+	test('auto-closes source delimiters and leaves the caret inside', () => {
+		expect(insertSourceDelimiterPair('alpha', '(', 5)).toEqual({
+			source: 'alpha()',
+			selectionStart: 6,
+			selectionEnd: 6,
+		});
+		expect(insertSourceDelimiterPair('alpha', '[', 5)).toEqual({
+			source: 'alpha[]',
+			selectionStart: 6,
+			selectionEnd: 6,
+		});
+	});
+
+	test('wraps a selected source range with matching delimiters', () => {
+		expect(insertSourceDelimiterPair('alpha + omega', '(', 0, 5)).toEqual({
+			source: '(alpha) + omega',
+			selectionStart: 1,
+			selectionEnd: 6,
+		});
+	});
+
+	test('skips a closing delimiter already under the caret', () => {
+		expect(skipSourceClosingDelimiter('alpha()', ')', 6)).toEqual({
+			source: 'alpha()',
+			selectionStart: 7,
+			selectionEnd: 7,
+		});
+		expect(skipSourceClosingDelimiter('alpha()', ')', 5)).toBeUndefined();
 	});
 });

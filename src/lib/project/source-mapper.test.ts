@@ -303,6 +303,14 @@ $: s("sine") // ._scope()
 		expect(deletedBoth).toBe('setcpm(84 / 4)\nconst key = "E:minor"\n\n');
 	});
 
+	test('does not project an orphan marker after its source track expression is deleted', () => {
+		const withoutPulseExpression = TRACKED_SOURCE.replace('$: note("<e2 e2 g2 b2>").s("sawtooth").gain(0.24)\n', '');
+		const tracks = getSourceBlockDetails(withoutPulseExpression);
+
+		expect(tracks).toHaveLength(1);
+		expect(tracks[0]).toMatchObject({ id: 'trk_01JGLASS', name: 'Glass lead' });
+	});
+
 	test('projects source tempo, key, and cycle/second conversion', () => {
 		const globals = getSourceGlobals(TRACKED_SOURCE);
 

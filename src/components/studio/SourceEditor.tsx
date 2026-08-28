@@ -1,6 +1,6 @@
 import { useCallback, type ClipboardEvent, type KeyboardEvent, type RefObject } from 'react';
 import type { SourceDiagnostic } from '../../lib/project/model';
-import { dedentSourceSelection, indentSourceSelection, insertSourceNewline } from '../../lib/project/editor';
+import { dedentSourceSelection, indentSourceSelection, insertSourceDelimiterPair, insertSourceNewline, skipSourceClosingDelimiter } from '../../lib/project/editor';
 import { getDiagnosticLabel, getDiagnosticLocation, formatRevision } from './helpers';
 
 export interface SourceEditorProps {
@@ -55,6 +55,18 @@ export function SourceEditor({
 				? dedentSourceSelection(editor.value, editor.selectionStart, editor.selectionEnd)
 				: indentSourceSelection(editor.value, editor.selectionStart, editor.selectionEnd);
 			applyEdit(event, edit);
+			return;
+		}
+		if (event.key === '(' || event.key === '[' || event.key === '{') {
+			const editor = event.currentTarget;
+			const edit = insertSourceDelimiterPair(editor.value, event.key, editor.selectionStart, editor.selectionEnd);
+			if (edit) applyEdit(event, edit);
+			return;
+		}
+		if (event.key === ')' || event.key === ']' || event.key === '}') {
+			const editor = event.currentTarget;
+			const edit = skipSourceClosingDelimiter(editor.value, event.key, editor.selectionStart, editor.selectionEnd);
+			if (edit) applyEdit(event, edit);
 			return;
 		}
 		if (event.key === 'Enter') {
