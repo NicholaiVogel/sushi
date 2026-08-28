@@ -4,14 +4,14 @@ import { isAudioLockedError, StrudelAdapter } from './adapter';
 describe('StrudelAdapter evaluation queue', () => {
 	test('registers editor-only Strudel compatibility helpers', async () => {
 		const registrations: string[] = [];
-		let schedulerOptions: { setInterval?: unknown; clearInterval?: unknown } | undefined;
+		let schedulerOptions: { setInterval?: unknown; clearInterval?: unknown; sync?: unknown } | undefined;
 		const scheduler = { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
 		const fakeModule = {
 			register: (name: string) => {
 				registrations.push(name);
 				return (...args: unknown[]) => args[1];
 			},
-			initStrudel: async (options?: { setInterval?: unknown; clearInterval?: unknown }) => {
+			initStrudel: async (options?: { setInterval?: unknown; clearInterval?: unknown; sync?: unknown }) => {
 				schedulerOptions = options;
 				return {
 					evaluate: async () => ({}),
@@ -38,6 +38,7 @@ describe('StrudelAdapter evaluation queue', () => {
 			expect(typeof schedulerOptions?.setInterval).toBe('function');
 			expect(typeof schedulerOptions?.clearInterval).toBe('function');
 			expect(schedulerOptions?.setInterval).not.toBe(globalThis.setInterval);
+			expect(schedulerOptions?.sync).toBe(false);
 			adapter.destroy();
 		} finally {
 			if (hadSlider) {

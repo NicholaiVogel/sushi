@@ -453,10 +453,13 @@ export class StrudelAdapter {
 			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
 			this.module = module;
 			this.repl = await module.initStrudel({
-				// Keep Cyclist's clock in a SharedWorker when the browser supports it.
-				// Pattern queries still happen on the main thread, but the transport
-				// clock and trigger deadlines no longer compete with React/canvas work.
-				sync: typeof SharedWorker !== 'undefined',
+				// Sushi owns one transport per studio. Keep Cyclist local instead of
+				// using NeoCyclist's SharedWorker clock: a worker can outlive a page
+				// reload (or another open tab) and retain a stale finite cursor. That
+				// makes playback appear to start while the adapter immediately thinks
+				// the song has ended and hushes every audio node. The scheduler still
+				// uses worker-timers below, so UI work does not drive its heartbeat.
+				sync: false,
 				// Strudel.cc runs Cyclist from worker-timers. Window timers can be
 				// delayed by React layout, canvas work, or a busy audio callback, which
 				// makes Cyclist log "skip query: too late" and drops events. Keep the
