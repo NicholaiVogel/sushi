@@ -2,8 +2,11 @@
 import Studio from '../components/Studio';
 import '../styles/global.css';
 
-const title = 'Sushi — source-first studio';
-const description = 'A source-first browser studio for composing with Strudel, shared by people and agents.';
+const title = 'Sushi — Tidal Cycles workspace';
+const description = 'Sushi is a browser-based workspace for importing, writing, and arranging music with Tidal Cycles syntax.';
+const siteUrl = 'https://sushidaw.com';
+const canonicalUrl = `${siteUrl}/`;
+const socialImage = `${siteUrl}/og-image.png`;
 const webmcpOriginTrialToken = import.meta.env.PUBLIC_WEBMCP_ORIGIN_TRIAL_TOKEN?.trim();
 ---
 
@@ -15,6 +18,22 @@ const webmcpOriginTrialToken = import.meta.env.PUBLIC_WEBMCP_ORIGIN_TRIAL_TOKEN?
 		<meta name="description" content={description} />
 		<meta name="theme-color" content="#0a0c0d" />
 		<meta name="generator" content={Astro.generator} />
+		<link rel="canonical" href={canonicalUrl} />
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Sushi" />
+		<meta property="og:url" content={canonicalUrl} />
+		<meta property="og:title" content={title} />
+		<meta property="og:description" content={description} />
+		<meta property="og:image" content={socialImage} />
+		<meta property="og:image:alt" content="Sushi logo" />
+		<meta property="og:image:type" content="image/png" />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="twitter:title" content={title} />
+		<meta name="twitter:description" content={description} />
+		<meta name="twitter:image" content={socialImage} />
+		<meta name="twitter:image:alt" content="Sushi logo" />
 		{webmcpOriginTrialToken && <meta http-equiv="origin-trial" content={webmcpOriginTrialToken} />}
 		<link rel="icon" href="/logos/brand-mark-color.png" type="image/png" />
 		<link rel="apple-touch-icon" href="/logos/brand-mark-color.png" />
