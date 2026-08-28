@@ -650,11 +650,74 @@ describe('StrudelAdapter evaluation queue', () => {
 			expect(await adapter.evaluateSource('accepted')).toEqual({ ok: true });
 			expect(await adapter.play(4)).toEqual({ ok: true });
 			expect(calls).toEqual([
-				'github:tidalcycles/dirt-samples',
-				'https://strudel.b-cdn.net/tidal-drum-machines.json',
-				'aliases',
-			]);
+			'github:tidalcycles/dirt-samples',
+			'https://raw.githubusercontent.com/felixroos/dough-samples/main/piano.json',
+			'https://strudel.b-cdn.net/tidal-drum-machines.json',
+			'aliases',
+		]);
 			expect(starts).toBe(1);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) {
+				Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			} else {
+				Reflect.deleteProperty(globalThis, 'window');
+			}
+		}
+	});
+
+	test('loads the piano sample bank before preloading a piano track', async () => {
+		const pianoSampleMapUrl = 'https://raw.githubusercontent.com/felixroos/dough-samples/main/piano.json';
+		const sampleMaps: string[] = [];
+		const preloadedSamples: string[] = [];
+		let pianoRegistered = false;
+		let beforeStart: (() => void | Promise<void>) | undefined;
+		const scheduler = { cps: 0.5, now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 };
+		const pattern = {
+			queryArc: () => [{ value: { s: 'piano', note: 'c4' }, hasOnset: () => true }],
+		};
+		const fakeModule = {
+			initStrudel: async (options?: { prebake?: () => void | Promise<void>; beforeStart?: () => void | Promise<void> }) => {
+				await options?.prebake?.();
+				beforeStart = options?.beforeStart;
+				return {
+					evaluate: async () => pattern,
+					start: async () => { await beforeStart?.(); },
+					stop: () => undefined,
+					pause: () => undefined,
+					scheduler,
+				};
+			},
+			samples: async (path: string) => {
+				sampleMaps.push(path);
+				if (path === pianoSampleMapUrl) pianoRegistered = true;
+			},
+			getSound: (name: string) => pianoRegistered && name === 'piano'
+				? { data: { type: 'sample', samples: { C4: ['https://example.test/C4.mp3'] } } }
+				: undefined,
+			getSampleBuffer: async (value: Record<string, any>) => {
+				preloadedSamples.push(`${String(value.s)}:${String(value.note)}`);
+				return {};
+			},
+			registerSound: () => undefined,
+			getAudioContext: () => ({ state: 'running' }) as unknown as AudioContext,
+			getADSRValues: () => [0, 0, 1, 0],
+			getParamADSR: () => undefined,
+			getSoundIndex: () => 0,
+			getPitchEnvelope: () => undefined,
+			onceEnded: () => undefined,
+			releaseAudioNode: () => undefined,
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			expect(await adapter.evaluateSource('$: note("c4").sound("piano")')).toEqual({ ok: true });
+			expect(await adapter.play(4)).toEqual({ ok: true });
+			expect(sampleMaps).toContain(pianoSampleMapUrl);
+			expect(preloadedSamples).toEqual(['piano:c4']);
 			adapter.destroy();
 		} finally {
 			if (hadWindow) {

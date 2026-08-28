@@ -84,6 +84,7 @@ type PreloadValue = Record<string, any> & {
 const MAX_PRELOAD_HAPS = 4096;
 const MAX_PRELOAD_VARIANTS = 24;
 const AUDIO_ASSET_TIMEOUT_MS = 8_000;
+const PIANO_SAMPLE_MAP_URL = 'https://raw.githubusercontent.com/felixroos/dough-samples/main/piano.json';
 // Warming an entire arrangement before the first scheduler tick makes a large
 // pasted song feel frozen (and can make Cyclist miss its first deadlines). The
 // first couple of cycles cover the assets needed to get playback started; later
@@ -457,14 +458,15 @@ export class StrudelAdapter {
 				prebake: async () => {
 					registerSushiCompatibility(module, this.sliderValues);
 					// @strudel/web only registers oscillator synths by default. Strudel.cc
-					// adds its GM soundfonts and the two sample collections below before
+					// adds its GM soundfonts and the sample collections below before
 					// evaluating user code, so ordinary Strudel snippets resolve the same
 					// sounds in Sushi instead of silently dropping unsupported layers.
 					await registerSoundfontsOnModule(module);
 					// Fetching the optional sample maps during init made a CORS/CDN or
 					// decoder failure look like a source-evaluation failure and prevented
 					// Firefox from reaching the first user-gesture Play. Start the work in
-					// the background; beforeStart waits for this bounded, best-effort task.
+					// the background; the first playback waits only when its source needs
+					// one of those banks, and always treats the work as best-effort.
 					this.sampleBankPromise = this.preloadSampleBanks(module);
 				},
 				beforeStart: () => this.preloadActivePattern(),
@@ -859,6 +861,10 @@ export class StrudelAdapter {
 				'the Dirt sample map',
 			),
 			settleAudioAsset(
+				() => module.samples?.(PIANO_SAMPLE_MAP_URL, undefined, { prebake: true, tag: 'piano' }),
+				'the piano sample map',
+			),
+			settleAudioAsset(
 				() => module.samples?.(
 					'https://strudel.b-cdn.net/tidal-drum-machines.json',
 					'https://strudel.b-cdn.net/tidal-drum-machines/machines/',
@@ -908,9 +914,14 @@ export class StrudelAdapter {
 
 		this.preloadPromise = (async () => {
 			this.setRuntime({ audioState: 'initializing' });
-			// Sample maps are optional remote resources. They are intentionally
-			// started during init and must not hold the audio scheduler behind a
-			// network/decode round trip here.
+			// Sample maps are optional remote resources. They start during init so
+			// synth-only songs do not wait on a network round trip, but a song that
+			// references an as-yet-unregistered sound must wait for registration
+			// before its first scheduler query.
+			const sourceAssets = collectSourceAudioAssets(this.activeSource);
+			if (sourceAssets.some((asset) => !module.getSound?.(asset.name)) && this.sampleBankPromise) {
+				await this.sampleBankPromise;
+			}
 			const endCycle = Math.min(this.songEndCycle ?? DEFAULT_SONG_END_CYCLE, PRELOAD_LOOKAHEAD_CYCLES);
 			const cps = typeof repl.scheduler.cps === 'number' && Number.isFinite(repl.scheduler.cps) ? repl.scheduler.cps : 0.5;
 			const audioContext = module.getAudioContext?.();
@@ -973,7 +984,6 @@ export class StrudelAdapter {
 				}
 			};
 
-			const sourceAssets = collectSourceAudioAssets(this.activeSource);
 			for (const asset of sourceAssets) await enqueueSound(asset.name, module.getSound?.(asset.name)?.data, asset.notes);
 
 			// Static extraction covers ordinary pasted source without querying a

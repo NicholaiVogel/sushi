@@ -1,4 +1,4 @@
-import type { CSSProperties, KeyboardEvent, MouseEvent, PointerEvent } from 'react';
+import { useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent } from 'react';
 import type { RuntimeState, SourceBlockSummary } from '../../lib/project/model';
 import { cyclesToSeconds, type SourceGlobals } from '../../lib/project/source-mapper';
 import {
@@ -56,11 +56,6 @@ export interface TrackLaneProps {
 	onSetTrackRange: (trackId: string, startCycle: number, endCycle: number) => void;
 }
 
-function formatSliderDisplayValue(value: number): string {
-	if (Math.abs(value) >= 100) return Math.round(value).toString();
-	return Number(value.toFixed(3)).toString();
-}
-
 export function TrackLane({
 	block,
 	index,
@@ -96,11 +91,15 @@ export function TrackLane({
 	onStartTimingDrag,
 	onSetTrackRange,
 }: TrackLaneProps) {
+	const [fxExpanded, setFxExpanded] = useState(false);
 	const gain = trackDetails?.gain ?? 1;
 	const pan = trackDetails?.pan ?? 0.5;
 	const sliders = trackDetails?.sliders ?? [];
 	const effects = trackDetails?.effects ?? [];
-	const trackLaneHeight = 82 + sliders.length * 27 + (trackDetails?.expression ? 27 + effects.length * 27 : 0);
+	const fxPanelHeight = trackDetails?.expression
+		? 27 + (fxExpanded ? (sliders.length + effects.length + 1) * 27 : 0)
+		: 0;
+	const trackLaneHeight = 82 + fxPanelHeight;
 	const clipStart = clamp(timing.startCycle / songEndCycle, 0, 1);
 	const clipEnd = clamp(timing.endCycle / songEndCycle, clipStart + 0.01, 1);
 	const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
@@ -178,38 +177,18 @@ export function TrackLane({
 						<output className="track-pan-value" aria-label={`${block.name} pan value`}>{Math.round(clamp(pan, 0, 1) * 100)}</output>
 					</div>
 				</div>
-				{sliders.length ? (
-					<div className="track-slider-controls" role="group" aria-label={`${block.name} source controls`}>
-						{sliders.map((slider) => {
-							const step = slider.step ?? (slider.max - slider.min) / 1000;
-							return (
-								<label className="track-slider" key={slider.id}>
-									<span className="track-slider-label">{slider.label}</span>
-									<input
-										className="track-slider-control"
-										type="range"
-										min={slider.min}
-										max={slider.max}
-										step={step}
-										value={slider.value}
-										onChange={(event) => onSetSlider(block.id, slider.id, Number(event.target.value))}
-										aria-label={`${block.name} ${slider.label.toLowerCase()}`}
-										title={`${slider.label}: ${slider.min}–${slider.max}`}
-									/>
-									<output>{formatSliderDisplayValue(slider.value)}</output>
-								</label>
-							);
-						})}
-					</div>
-				) : null}
 				{trackDetails?.expression ? (
 					<TrackFxControls
 						trackId={block.id}
 						trackName={block.name}
+						sliders={sliders}
 						effects={effects}
+						expanded={fxExpanded}
+						onSetSlider={onSetSlider}
 						onSetEffect={onSetEffect}
 						onAddEffect={onAddEffect}
 						onRemoveEffect={onRemoveEffect}
+						onToggleExpanded={() => setFxExpanded((current) => !current)}
 					/>
 				) : null}
 			</div>

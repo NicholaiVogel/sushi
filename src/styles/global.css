@@ -1347,53 +1347,7 @@ a { color: inherit; }
 
 .track-mode-button:disabled { cursor: not-allowed; opacity: 0.34; }
 
-.track-mix-controls { display: flex; align-items: center; gap: 10px; min-width: 0; margin-top: auto; }
-
-.track-slider-controls {
-	display: grid;
-	gap: 3px;
-	min-width: 0;
-	margin-top: 1px;
-	font-family: var(--mono);
-	font-size: 8px;
-}
-
-.track-slider {
-	display: grid;
-	grid-template-columns: minmax(32px, max-content) minmax(0, 1fr) max-content;
-	align-items: center;
-	gap: 6px;
-	min-width: 0;
-	color: var(--ink-muted);
-	letter-spacing: 0.04em;
-	text-transform: uppercase;
-}
-
-.track-slider-label {
-	min-width: 32px;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-
-.track-slider-control {
-	display: block;
-	width: 100%;
-	height: 14px;
-	margin: 0;
-	accent-color: var(--track-color);
-	cursor: ew-resize;
-}
-
-.track-slider-control:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-.track-slider output {
-	min-width: 38px;
-	color: var(--ink-soft);
-	font-size: 8px;
-	font-variant-numeric: tabular-nums;
-	text-align: right;
-}
+.track-mix-controls { display: flex; align-items: center; gap: 10px; min-width: 0; margin-top: 0; }
 
 .track-fx-controls {
 	display: grid;
@@ -1403,6 +1357,36 @@ a { color: inherit; }
 	font-family: var(--mono);
 	font-size: 8px;
 }
+
+.track-fx-toggle {
+	display: grid;
+	grid-template-columns: max-content minmax(0, 1fr) max-content;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	height: 22px;
+	padding: 0 5px;
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	background: #1a2021;
+	color: var(--ink-muted);
+	font-family: var(--mono);
+	font-size: 8px;
+	letter-spacing: 0.06em;
+	text-align: left;
+	text-transform: uppercase;
+}
+
+.track-fx-toggle:hover,
+.track-fx-toggle:focus-visible { border-color: var(--ink-muted); background: #202627; color: var(--ink); outline: 0; }
+.track-fx-toggle:focus-visible { box-shadow: 0 0 0 1px var(--accent); }
+.track-fx-toggle-label { color: var(--ink-soft); font-weight: 500; }
+.track-fx-toggle-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.track-fx-toggle svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; transition: transform 140ms ease; }
+.track-fx-controls-expanded .track-fx-toggle svg { transform: rotate(180deg); }
+
+.track-fx-panel { display: grid; gap: 3px; min-width: 0; }
+.track-fx-panel[hidden] { display: none; }
 
 .track-fx-row {
 	display: grid;
@@ -1421,6 +1405,9 @@ a { color: inherit; }
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+
+.track-fx-mode-placeholder,
+.track-fx-remove-placeholder { display: block; width: 100%; height: 18px; visibility: hidden; }
 
 .track-fx-mode,
 .track-fx-add select {
