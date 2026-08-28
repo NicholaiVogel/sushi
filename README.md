@@ -1,62 +1,61 @@
-# sushi
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./public/logos/brand-wordmark-white.png">
+    <source media="(prefers-color-scheme: light)" srcset="./public/logos/brand-wordmark-dark.png">
+    <img alt="Sushi" src="./public/logos/brand-wordmark-dark.png" width="420">
+  </picture>
+</p>
 
-Browser-based DAW for composing music with an agent, powered by Strudel.
+# Sushi
 
-A human and an agent share the same client-side studio. Both can create, edit, arrange, and hear the music.
+Sushi is a browser-based reimplementation of [Strudel](https://strudel.tidalcycles.org/) for importing, writing, and arranging music with [Tidal Cycles](https://tidalcycles.org/) syntax.
 
-## Architecture
+Compose in a source editor as you would in a live-coding environment, or use Sushi’s visual studio to organize tracks and patterns on a timeline like a traditional DAW. The source and arrangement share one musical workspace, so code, controls, and playback stay connected.
 
-- Astro shell with a React studio island
-- Strudel via `@strudel/web`
-- Feature-detected WebMCP adapter for agent-facing source and transport tools
-- IndexedDB for local projects and audio assets
-- Cloudflare Pages for static deployment
+## Highlights
 
-Strudel source is canonical. `$:` blocks become tracks, recognized method chains become controls, and `arrange(...)` / `seqPLoop(...)` provide timeline ranges. The UI and agent operate on the same source.
+- Bring in existing Strudel source or write new patterns with Tidal Cycles mini-notation.
+- Arrange pattern-based tracks and sections on a visual timeline.
+- Shape tempo, key, gain, pan, effects, and playback from the studio.
+- Save, reopen, import, and export portable `.sushi.json` projects.
+- Hear compositions through Strudel and Web Audio.
+- Use optional WebMCP integration to let compatible agents inspect the studio, edit source, control playback, and assist with composition.
 
-See [SPEC.md](./SPEC.md) for the canonical product and architecture specification.
+## Example
 
-## Current vertical slice
+```js
+setcpm(120 / 4)
 
-The current vertical slice is a source-first DAW workstation at `/`:
+$: s("bd ~ sd ~")
+  .gain(0.8)
 
-- The Astro shell mounts `Studio` as a `client:load` React island.
-- A BandLab-minimal arrangement surface pairs a numbered bar ruler, compact track-control strips, source clips, and a Zed-inspired, line-numbered Strudel source sidebar.
-- New sessions start with only the canonical `setcpm(150 / 4)` and `const key = "E:minor"` header; the first track is added explicitly.
-- The top transport includes a 0–300 BPM control centered at 150 and a musical-key dropdown. Both rewrite the canonical source header and evaluate through Strudel immediately.
-- The Sushi settings menu includes three curated, loadable garden presets alongside save, import/export, and locally saved projects. Loading one replaces the editor through the validated source pipeline, names the session after the preset, and leaves the previous source available through Undo.
-- **Add track** appends a valid synth block to the source and commits it through the same Strudel evaluation path as an editor change.
-- Track gain and pan controls rewrite numeric `.gain(...)` and `.pan(...)` calls in the marked Strudel expression and evaluate the updated source immediately.
-- Numeric Strudel `slider(...)` widgets (for example `.lpf(slider(200, 200, 4000))`) become labeled lane controls; moving one keeps its declared bounds and writes the new value back to source.
-- Supported Strudel FX (`detune`, `lpenv`, `octave`, and `room`) are exposed per track with manual controls, source/random modes where applicable, and an add/remove FX menu.
-- Strudel `._pianoroll()` and `._scope()` hooks are projected into per-lane, animated visualizers. Piano rolls use queried note events, while scopes use the lane's Web Audio analyser when available and a musical event fallback before playback.
-- Mute and solo use Strudel's source labels (`_$:` and `S$:`), so their state is visible and editable in the source editor. Unsupported chain values remain source-visible and are not presented as editable scalar controls.
-- Tracks can be selected and removed with Backspace/Delete or a context menu, renamed through the inline pencil editor, and moved or resized on quarter-cycle timeline boundaries. Each action writes and evaluates the corresponding Strudel source.
-- The track pan control exposes a full 0–100 left-to-right range, with the current value shown beside the L/R slider.
-- Project name, draft source, last-valid source, and revisions autosave to IndexedDB and restore before the initial Strudel evaluation.
-- Tempo, key, track ranges, and derived seconds are projected from committed Strudel source. Dragging a clip edge writes a `seqPLoop(...)` range back into that track's source block.
-- The header BPM, quarter-notes-per-cycle, and key fields are source-backed controls: each edit rewrites the canonical declaration and re-enters the same validated Strudel commit path.
-- Undo and redo buttons share the bounded source history with WebMCP transactions. The settings menu exposes explicit local save, project export/import, template loading, and saved-project reopening. Project files use a versioned `.sushi.json` envelope, validate it before evaluation, and preserve project asset metadata.
-- `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns play, pause, resume, stop, seek, cycle progress, and song-end handling.
-- When the browser exposes a usable `document.modelContext`, the studio waits briefly for late host injection before registering the Slice 3 WebMCP tools for state inspection, source read/write/patch, validation, local reference lookup, playback, and revision-aware undo/redo. Transactions are idempotent, stale revisions return structured conflicts, and agent edits share the human source history.
-- Tempo, key, track ranges, and derived seconds are projected from committed Strudel source. Dragging a clip moves it; dragging either edge resizes it. Both gestures write quarter-cycle-snapped `seqPLoop(...)` ranges back into the track's source block.
-- The timeline starts with a 30-bar capacity; new tracks default to a 4-bar range. Dragging or lengthening a track beyond the current boundary adds the next 30-bar page (60, 90, 120, then 137), and the **Extend** control advances by the same page. Zoom runs from a one-bar close view to every available bar and starts at its midpoint.
-- `StrudelAdapter` is the only module that imports `@strudel/web`; it evaluates the accepted source and owns play, pause, resume, stop, seek, cycle progress, and song-end handling.
-- When the browser exposes a usable `document.modelContext`, the studio waits briefly for late host injection before registering the Slice 3 WebMCP tools for state inspection, source read/write/patch, tempo/key controls, track deletion/renaming/range edits, validation, local reference lookup, playback, and revision-aware undo/redo. Transactions are idempotent, stale revisions return structured conflicts, and agent edits share the human source history.
-- Source edits stay in a draft until **Commit source** evaluates them through Strudel.
-- Failed evaluations remain visible as diagnostics while the last-valid source and active revision stay playable.
-- The page footer lists the main keyboard and context-menu commands for source validation, track deletion, and clip movement.
-- Audio waits for an explicit Play gesture to satisfy browser autoplay policy.
+$: note("<c3 eb3 g3 bb3>")
+  .s("sawtooth")
+  .lpf(900)
+```
 
-The source fixture and project state live in `src/lib/project/model.ts`. The visual execution contract for this slice is recorded in [DESIGN-BRIEF.md](./DESIGN-BRIEF.md).
+## Agent-assisted composition
 
-WebMCP is an optional browser enhancement. The client feature-detects the canonical `document.modelContext` surface (with legacy host fallbacks), waits for a usable `registerTool` method when an embedded browser installs it after hydration, and leaves the normal browser studio unchanged when it is not available. Registration is tied to the React lifecycle so teardown aborts both late discovery and partially completed registrations. Source-bearing tools declare WebMCP read-only and untrusted-content hints so hosts can apply their normal safety policy. Astro dev/preview and Cloudflare Pages responses send `Origin-Agent-Cluster: ?1` and the default `tools` Permissions Policy. The bounded transaction cache deduplicates concurrent/retried calls within a session; persisted source revisions make accepted edits safe to replay after reload, while the cache itself is intentionally not a cross-browser transaction ledger. For production Chrome origin-trial access, provide the trial token as `PUBLIC_WEBMCP_ORIGIN_TRIAL_TOKEN` at build time. Local Chrome testing can use `chrome://flags/#enable-webmcp-testing` without a token.
+Sushi uses [WebMCP](https://webmachinelearning.github.io/webmcp) to connect compatible agents to the studio. Agents can read and modify source, inspect musical state, and control playback, making it possible to collaborate on patterns and arrangements through natural-language assistance.
 
-## Commands
+## Run locally
 
 ```sh
 bun install
 bun run dev
-bun run build
-bun run preview
 ```
+
+Build the application with:
+
+```sh
+bun run build
+```
+
+## Built with gratitude
+
+Sushi builds on the work of:
+
+- [Strudel](https://codeberg.org/uzu/strudel) and [`@strudel/web`](https://www.npmjs.com/package/@strudel/web) for the pattern language, musical runtime, scheduling, synthesis, and browser audio.
+- [Tidal Cycles](https://tidalcycles.org/) for the pattern language tradition and mini-notation that make expressive live-coded music possible.
+- [Astro](https://astro.build/) and [React](https://react.dev/) for the application shell and interactive studio.
+- [WebMCP](https://webmachinelearning.github.io/webmcp) for the browser interface that connects web applications with AI agents.
