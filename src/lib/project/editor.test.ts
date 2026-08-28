@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { getSourceLineNumbers, replaceSourceSelection } from './editor';
+import {
+	dedentSourceSelection,
+	getSourceLineNumbers,
+	indentSourceSelection,
+	insertSourceNewline,
+	replaceSourceSelection,
+} from './editor';
 
 describe('source editor line model', () => {
 	test('keeps gutter entries aligned with logical source lines', () => {
@@ -19,5 +25,45 @@ describe('source editor line model', () => {
 
 	test('normalizes reversed or out-of-range selections', () => {
 		expect(replaceSourceSelection('abcdef', 'X', 99, 2)).toEqual({ source: 'abX', caret: 3 });
+	});
+
+	test('indents the caret line with a soft tab', () => {
+		expect(indentSourceSelection('alpha\nomega', 7)).toEqual({
+			source: 'alpha\n  omega',
+			selectionStart: 9,
+			selectionEnd: 9,
+		});
+	});
+
+	test('indents every line touched by a selection', () => {
+		expect(indentSourceSelection('one\ntwo\nthree', 1, 9)).toEqual({
+			source: '  one\n  two\n  three',
+			selectionStart: 3,
+			selectionEnd: 15,
+		});
+	});
+
+	test('dedents selected lines and preserves the adjusted selection', () => {
+		expect(dedentSourceSelection('  one\n\ttwo\nthree', 1, 11)).toEqual({
+			source: 'one\ntwo\nthree',
+			selectionStart: 0,
+			selectionEnd: 8,
+		});
+	});
+
+	test('dedents a partial leading space instead of leaving it stranded', () => {
+		expect(dedentSourceSelection(' one', 2)).toEqual({
+			source: 'one',
+			selectionStart: 1,
+			selectionEnd: 1,
+		});
+	});
+
+	test('carries indentation onto a new line and nests after an opener', () => {
+		expect(insertSourceNewline('  register(() => {', 18)).toEqual({
+			source: '  register(() => {\n    ',
+			selectionStart: 23,
+			selectionEnd: 23,
+		});
 	});
 });

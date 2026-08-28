@@ -6,16 +6,21 @@ import {
 	getSourceBlockDetails,
 	getSourceGlobals,
 	getTrackDisplayTiming,
+	addTrackEffect,
+	removeTrackEffect,
 	secondsToCycles,
 	updateSourceKey,
 	updateSourceQuarterNotesPerCycle,
 	updateSourceTempo,
 	updateSourceBpm,
+	updateTrackColor,
 	updateTrackGain,
 	updateTrackMode,
 	updateTrackName,
 	updateTrackPan,
 	updateTrackRange,
+	updateTrackSlider,
+	updateTrackEffect,
 } from './source-mapper';
 
 const pulseId = 'trk_01J4PULSE';
@@ -66,6 +71,151 @@ describe('source mapper', () => {
 
 		expect(withPan).toContain('$: note("<e2 e2 g2 b2>").s("sawtooth").gain(0.5).pan(0.25)');
 		expect(withPan).toContain('$: note("<e4 b3 g4 a4>").s("triangle").gain(0.16)');
+	});
+
+	test('projects source colors and updates or appends color calls', () => {
+		const source = TRACKED_SOURCE.replace('.gain(0.24)', '.gain(0.24).color("#ff4d00")');
+		const [pulse, glass] = getSourceBlockDetails(source);
+
+		expect(pulse).toMatchObject({ color: '#ff4d00', colorEditable: true });
+		expect(glass.color).toBeUndefined();
+		expect(glass.colorEditable).toBe(true);
+
+		const updated = updateTrackColor(source, pulseId, '#8fe1ff');
+		const appended = updateTrackColor(updated, 'trk_01JGLASS', '#c7a6ff');
+
+		expect(appended).toContain('.gain(0.24).color("#8fe1ff")');
+		expect(appended).toContain('.s("triangle").gain(0.16).color("#c7a6ff")');
+	});
+
+	test('projects Strudel visualizer hooks from source chains', () => {
+		const source = `// @sushi-track {"id":"trk_roll","name":"Roll","type":"synth","schema":1}
+$: n("c4 e4 g4").s("sine")._pianoroll()
+// @sushi-track {"id":"trk_scope","name":"Scope","type":"drum","schema":1}
+_$: s("bd*4")._scope()`;
+		const [roll, scope] = getSourceBlockDetails(source);
+
+		expect(roll.visualizer).toBe('pianoroll');
+		expect(scope.visualizer).toBe('scope');
+	});
+
+	test('projects and updates numeric Strudel sliders', () => {
+		const source = `// @sushi-track {"id":"trk_slider","name":"Filter","type":"synth","schema":1}
+$: s("sawtooth").lpf(slider(200, 200, 4000)).gain(slider(.5, 0, 1, .01))`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.sliders).toEqual([
+			{ id: 'slider-0', label: 'LPF', value: 200, min: 200, max: 4000 },
+			{ id: 'slider-1', label: 'GAIN', value: 0.5, min: 0, max: 1, step: 0.01 },
+		]);
+
+		const updated = updateTrackSlider(source, 'trk_slider', 'slider-0', 2200);
+		const clamped = updateTrackSlider(updated, 'trk_slider', 'slider-1', 2);
+		expect(clamped).toContain('.lpf(slider(2200, 200, 4000)).gain(slider(1, 0, 1, .01))');
+
+		const spaced = source.replace('slider(200, 200, 4000)', 'slider( 200 , 200, 4000)');
+		expect(updateTrackSlider(spaced, 'trk_slider', 'slider-0', 2200)).toContain('slider( 2200 , 200, 4000)');
+	});
+
+	test('projects and updates supported Strudel FX controls', () => {
+		const source = `// @sushi-track {"id":"trk_fx","name":"FX layer","type":"synth","schema":1}
+$: s("supersaw").detune(rand).lpenv(1).octave(0).room(1.7)`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.effects).toEqual([
+			{
+				id: 'effect-detune-0',
+				method: 'detune',
+				label: 'DETUNE',
+				kind: 'random',
+				expression: 'rand',
+				min: 0,
+				max: 24,
+				step: 0.1,
+				defaultValue: 0,
+				supportsRandom: true,
+			},
+			{
+				id: 'effect-lpenv-0',
+				method: 'lpenv',
+				label: 'LP ENV',
+				kind: 'numeric',
+				expression: '1',
+				value: 1,
+				min: -8,
+				max: 8,
+				step: 0.1,
+				defaultValue: 1,
+				supportsRandom: false,
+			},
+			{
+				id: 'effect-octave-0',
+				method: 'octave',
+				label: 'OCTAVE',
+				kind: 'numeric',
+				expression: '0',
+				value: 0,
+				min: -4,
+				max: 4,
+				step: 1,
+				defaultValue: 0,
+				supportsRandom: false,
+			},
+			{
+				id: 'effect-room-0',
+				method: 'room',
+				label: 'ROOM',
+				kind: 'numeric',
+				expression: '1.7',
+				value: 1.7,
+				min: 0,
+				max: 1.7,
+				step: 0.01,
+				defaultValue: 0.5,
+				supportsRandom: false,
+			},
+		]);
+
+		const manual = updateTrackEffect(source, 'trk_fx', 'effect-detune-0', 4.2);
+		const random = updateTrackEffect(manual, 'trk_fx', 'effect-detune-0', 'rand');
+		const room = updateTrackEffect(random, 'trk_fx', 'effect-room-0', 0.25);
+		expect(room).toContain('.detune(rand).lpenv(1).octave(0).room(0.25)');
+
+		const duplicate = addTrackEffect(room, 'trk_fx', 'room');
+		expect(duplicate).toBe(room);
+		const withoutRoom = removeTrackEffect(room, 'trk_fx', 'effect-room-0');
+		expect(withoutRoom).toContain('$: s("supersaw").detune(rand).lpenv(1).octave(0)');
+
+		const addedRoom = addTrackEffect(withoutRoom, 'trk_fx', 'room');
+		expect(addedRoom).toContain('.room(0.5)');
+	});
+
+	test('ignores sliders inside source comments', () => {
+		const source = `// @sushi-track {"id":"trk_plain","name":"Plain","type":"synth","schema":1}
+$: s("sine") // slider(200, 0, 1)
+  /* slider(300, 0, 1) */`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.sliders).toEqual([]);
+	});
+
+	test('ignores visualizer names inside source comments', () => {
+		const source = `// @sushi-track {"id":"trk_plain","name":"Plain","type":"synth","schema":1}
+$: s("sine") // ._scope()
+  // ._pianoroll()`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.visualizer).toBeUndefined();
+	});
+
+	test('does not rewrite dynamic or unsafe source colors', () => {
+		const dynamic = TRACKED_SOURCE.replace('.gain(0.24)', '.gain(0.24).color(rand)');
+		const [pulse] = getSourceBlockDetails(dynamic);
+
+		expect(pulse.color).toBeUndefined();
+		expect(pulse.colorEditable).toBe(false);
+		expect(updateTrackColor(dynamic, pulseId, '#ff4d00')).toBe(dynamic);
+		expect(updateTrackColor(TRACKED_SOURCE, pulseId, 'var(--danger)')).toBe(TRACKED_SOURCE);
 	});
 
 	test('projects and updates controls across a multiline chain', () => {

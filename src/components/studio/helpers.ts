@@ -24,7 +24,7 @@ import type { StudioState, TrackDetails } from './types';
 
 export const SONG_LENGTH_PRESETS = [4, 8, 16, 30, 60, 120] as const;
 export const TIMELINE_ZOOM_BUTTON_STEP = 10;
-export const TRACK_COLORS = ['#d9ff68', '#8fe1ff', '#f0a3c7', '#c7a6ff'];
+export const DEFAULT_TRACK_COLOR = '#dce5df';
 export const SOURCE_HISTORY_LIMIT = 100;
 export const EDITOR_WIDTH_MIN = 280;
 export const EDITOR_WIDTH_MAX = 560;
@@ -121,8 +121,8 @@ export function getDiagnosticLocation(diagnostic: SourceDiagnostic): string {
 	return `LINE ${diagnostic.range.line}${column} · REV ${formatRevision(diagnostic.revision)}`;
 }
 
-export function getTrackColor(index: number): string {
-	return TRACK_COLORS[index % TRACK_COLORS.length];
+export function getTrackColor(sourceColor?: string): string {
+	return sourceColor ?? DEFAULT_TRACK_COLOR;
 }
 
 export function getTrackLabel(type: string): string {

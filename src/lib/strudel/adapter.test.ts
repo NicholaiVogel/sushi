@@ -46,6 +46,103 @@ describe('StrudelAdapter evaluation queue', () => {
 		}
 	});
 
+	test('keeps slider patterns live when their source value changes', async () => {
+		const registered = new Map<string, (...args: unknown[]) => unknown>();
+		const fakeModule = {
+			ref: (accessor: () => unknown) => ({ read: accessor }),
+			register: (name: string, func: (...args: unknown[]) => unknown) => {
+				registered.set(name, func);
+				return (...args: unknown[]) => func(...args);
+			},
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		const hadSlider = 'sliderWithID' in globalThis;
+		const originalSlider = (globalThis as typeof globalThis & { sliderWithID?: unknown }).sliderWithID;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		Reflect.deleteProperty(globalThis, 'sliderWithID');
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			await adapter.init();
+			const slider = (globalThis as typeof globalThis & { sliderWithID: (...args: unknown[]) => unknown }).sliderWithID;
+			const first = slider({ __pure: 'slider_10' }, { __pure: 200 }, { __pure: 200 }, { __pure: 4000 }) as { read: () => unknown };
+			const second = slider({ __pure: 'slider_10' }, { __pure: 2200 }, { __pure: 200 }, { __pure: 4000 }) as { read: () => unknown };
+
+			expect(registered.has('sliderWithID')).toBe(true);
+			expect(first.read()).toBe(2200);
+			expect(second.read()).toBe(2200);
+			adapter.destroy();
+		} finally {
+			if (hadSlider) {
+				Object.defineProperty(globalThis, 'sliderWithID', { configurable: true, value: originalSlider });
+			} else {
+				Reflect.deleteProperty(globalThis, 'sliderWithID');
+			}
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
+	test('keeps visualizer haps associated with their source lane', async () => {
+		const visualizerRegistrations = new Map<string, (pattern: unknown) => unknown>();
+		const fakeHap = {
+			whole: { begin: 0, end: 1 },
+			value: { note: 'c4', color: '#ff4d00' },
+			context: {},
+			setContext(context: Record<string, unknown>) {
+				return { ...fakeHap, context };
+			},
+		};
+		const fakePattern = {
+			withHaps(func: (haps: unknown[], state: { controls: Record<string, unknown> }) => unknown[]) {
+				return {
+					queryArc: (_begin: number, _end: number, controls: Record<string, unknown>) => func([fakeHap], { controls: { ...controls, id: '$0' } }),
+				};
+			},
+		};
+		let visualizerPattern: unknown;
+		const fakeModule = {
+			Pattern: { prototype: {} },
+			register: (name: string, func: (pattern: unknown) => unknown) => {
+				if (name === '_pianoroll' || name === '_scope') visualizerRegistrations.set(name, func);
+				return (...args: unknown[]) => args[1];
+			},
+			initStrudel: async () => ({
+				evaluate: async () => visualizerPattern,
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			await adapter.init();
+			visualizerPattern = visualizerRegistrations.get('_pianoroll')?.(fakePattern);
+			const source = '$: note("c4")._pianoroll()';
+			expect(await adapter.evaluateSource(source)).toEqual({ ok: true });
+			expect(adapter.getVisualizerHaps('trk_source_01', 'pianoroll', 0, 1)).toEqual([
+				{ begin: 0, end: 1, value: { note: 'c4', color: '#ff4d00' } },
+			]);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
 	test('serializes evaluations so callback errors stay with their request', async () => {
 		const started: string[] = [];
 		let releaseFirst: (() => void) | undefined;

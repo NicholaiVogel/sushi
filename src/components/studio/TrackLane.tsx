@@ -10,6 +10,10 @@ import {
 	TRACK_NAME_MAX_LENGTH,
 } from './helpers';
 import type { TrackDetails } from './types';
+import { VisualizerCanvas } from './VisualizerCanvas';
+import { TrackFxControls } from './TrackFxControls';
+import type { SourceEffectMethod } from '../../lib/project/source-mapper';
+import type { StrudelVisualizer, VisualizerHap } from '../../lib/strudel/adapter';
 
 export interface TimelineCell {
 	isBarStart: boolean;
@@ -28,6 +32,9 @@ export interface TrackLaneProps {
 	timelineCells: TimelineCell[];
 	timelineCellCount: number;
 	runtime: RuntimeState;
+	getCurrentCycle: () => number;
+	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
+	getVisualizerScopeData: (trackId: string) => number[] | undefined;
 	selected: boolean;
 	renaming: boolean;
 	renamingValue: string;
@@ -41,8 +48,17 @@ export interface TrackLaneProps {
 	onToggleMode: (trackId: string, mode: 'mute' | 'solo', active: boolean) => void;
 	onSetGain: (trackId: string, value: number) => void;
 	onSetPan: (trackId: string, value: number) => void;
+	onSetSlider: (trackId: string, sliderId: string, value: number) => void;
+	onSetEffect: (trackId: string, effectId: string, value: number | 'rand') => void;
+	onAddEffect: (trackId: string, method: SourceEffectMethod) => void;
+	onRemoveEffect: (trackId: string, effectId: string) => void;
 	onStartTimingDrag: (event: PointerEvent<HTMLElement>, trackId: string, edge: 'start' | 'end' | 'move') => void;
 	onSetTrackRange: (trackId: string, startCycle: number, endCycle: number) => void;
+}
+
+function formatSliderDisplayValue(value: number): string {
+	if (Math.abs(value) >= 100) return Math.round(value).toString();
+	return Number(value.toFixed(3)).toString();
 }
 
 export function TrackLane({
@@ -57,6 +73,9 @@ export function TrackLane({
 	timelineCells,
 	timelineCellCount,
 	runtime,
+	getCurrentCycle,
+	getVisualizerHaps,
+	getVisualizerScopeData,
 	selected,
 	renaming,
 	renamingValue,
@@ -70,11 +89,18 @@ export function TrackLane({
 	onToggleMode,
 	onSetGain,
 	onSetPan,
+	onSetSlider,
+	onSetEffect,
+	onAddEffect,
+	onRemoveEffect,
 	onStartTimingDrag,
 	onSetTrackRange,
 }: TrackLaneProps) {
 	const gain = trackDetails?.gain ?? 1;
 	const pan = trackDetails?.pan ?? 0.5;
+	const sliders = trackDetails?.sliders ?? [];
+	const effects = trackDetails?.effects ?? [];
+	const trackLaneHeight = 82 + sliders.length * 27 + (trackDetails?.expression ? 27 + effects.length * 27 : 0);
 	const clipStart = clamp(timing.startCycle / songEndCycle, 0, 1);
 	const clipEnd = clamp(timing.endCycle / songEndCycle, clipStart + 0.01, 1);
 	const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
@@ -82,7 +108,7 @@ export function TrackLane({
 	return (
 		<div
 			className={`track-lane ${selected ? 'track-lane-selected' : ''}`}
-			style={timelineGridStyle}
+			style={{ ...timelineGridStyle, '--track-lane-height': `${trackLaneHeight}px` } as CSSProperties}
 			key={block.id}
 			tabIndex={0}
 			onClick={() => onSelect(block.id)}
@@ -152,6 +178,40 @@ export function TrackLane({
 						<output className="track-pan-value" aria-label={`${block.name} pan value`}>{Math.round(clamp(pan, 0, 1) * 100)}</output>
 					</div>
 				</div>
+				{sliders.length ? (
+					<div className="track-slider-controls" role="group" aria-label={`${block.name} source controls`}>
+						{sliders.map((slider) => {
+							const step = slider.step ?? (slider.max - slider.min) / 1000;
+							return (
+								<label className="track-slider" key={slider.id}>
+									<span className="track-slider-label">{slider.label}</span>
+									<input
+										className="track-slider-control"
+										type="range"
+										min={slider.min}
+										max={slider.max}
+										step={step}
+										value={slider.value}
+										onChange={(event) => onSetSlider(block.id, slider.id, Number(event.target.value))}
+										aria-label={`${block.name} ${slider.label.toLowerCase()}`}
+										title={`${slider.label}: ${slider.min}–${slider.max}`}
+									/>
+									<output>{formatSliderDisplayValue(slider.value)}</output>
+								</label>
+							);
+						})}
+					</div>
+				) : null}
+				{trackDetails?.expression ? (
+					<TrackFxControls
+						trackId={block.id}
+						trackName={block.name}
+						effects={effects}
+						onSetEffect={onSetEffect}
+						onAddEffect={onAddEffect}
+						onRemoveEffect={onRemoveEffect}
+					/>
+				) : null}
 			</div>
 			<div className="lane-grid" style={{ ...timelineGridStyle, '--track-color': trackColor } as CSSProperties}>
 				<div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-hidden="true">{timelineCells.map((cell, cellIndex) => <span className={cell.isBarStart ? 'beat-start' : ''} key={cellIndex} />)}</div>
@@ -171,6 +231,17 @@ export function TrackLane({
 					aria-label={`Move ${block.name} clip, currently ${timingLabel}`}
 					title={`${block.name}: drag to move in quarter-cycle steps`}
 				>
+					{trackDetails?.visualizer ? <VisualizerCanvas
+						trackId={block.id}
+						trackName={block.name}
+						visualizer={trackDetails.visualizer}
+						trackColor={trackColor}
+						runtime={runtime}
+						songEndCycle={songEndCycle}
+						getCurrentCycle={getCurrentCycle}
+						getVisualizerHaps={getVisualizerHaps}
+						getVisualizerScopeData={getVisualizerScopeData}
+					/> : null}
 					<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => onStartTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - TIMELINE_SNAP_CYCLE), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
 					<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
 					<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => onStartTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, timing.startCycle, Math.max(timing.startCycle + TIMELINE_SNAP_CYCLE, timing.endCycle + delta)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />

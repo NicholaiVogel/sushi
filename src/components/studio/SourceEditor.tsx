@@ -1,5 +1,6 @@
-import type { ClipboardEvent, RefObject } from 'react';
+import { useCallback, type ClipboardEvent, type KeyboardEvent, type RefObject } from 'react';
 import type { SourceDiagnostic } from '../../lib/project/model';
+import { dedentSourceSelection, indentSourceSelection, insertSourceNewline } from '../../lib/project/editor';
 import { getDiagnosticLabel, getDiagnosticLocation, formatRevision } from './helpers';
 
 export interface SourceEditorProps {
@@ -31,6 +32,37 @@ export function SourceEditor({
 	onScroll,
 	onValidate,
 }: SourceEditorProps) {
+	const applyEdit = useCallback((event: KeyboardEvent<HTMLTextAreaElement>, edit: { source: string; selectionStart: number; selectionEnd: number }) => {
+		event.preventDefault();
+		const editor = event.currentTarget;
+		onChange(edit.source);
+		requestAnimationFrame(() => {
+			if (sourceEditorRef.current !== editor) return;
+			editor.setSelectionRange(edit.selectionStart, edit.selectionEnd, editor.selectionDirection);
+		});
+	}, [onChange, sourceEditorRef]);
+
+	const handleEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+		if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+			event.preventDefault();
+			onValidate();
+			return;
+		}
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		if (event.key === 'Tab') {
+			const editor = event.currentTarget;
+			const edit = event.shiftKey
+				? dedentSourceSelection(editor.value, editor.selectionStart, editor.selectionEnd)
+				: indentSourceSelection(editor.value, editor.selectionStart, editor.selectionEnd);
+			applyEdit(event, edit);
+			return;
+		}
+		if (event.key === 'Enter') {
+			const editor = event.currentTarget;
+			applyEdit(event, insertSourceNewline(editor.value, editor.selectionStart, editor.selectionEnd));
+		}
+	};
+
 	return (
 		<aside className="source-sidebar" aria-label="Strudel source editor">
 			<div className="source-editor-shell">
@@ -46,12 +78,7 @@ export function SourceEditor({
 						onPaste={onPaste}
 						onChange={(event) => onChange(event.target.value)}
 						onScroll={onScroll}
-						onKeyDown={(event) => {
-							if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-								event.preventDefault();
-								onValidate();
-							}
-						}}
+						onKeyDown={handleEditorKeyDown}
 						spellCheck={false}
 						autoCapitalize="off"
 						wrap="off"
@@ -59,7 +86,7 @@ export function SourceEditor({
 					/>
 				</div>
 			</div>
-			<p className="editor-help" id="source-help">Cmd/Ctrl + Enter to validate <span aria-hidden="true">·</span> {draftBlockCount} marked {draftBlockCount === 1 ? 'block' : 'blocks'}</p>
+			<p className="editor-help" id="source-help">Tab indent <span aria-hidden="true">·</span> Shift+Tab outdent <span aria-hidden="true">·</span> Cmd/Ctrl + Enter to validate <span aria-hidden="true">·</span> {draftBlockCount} marked {draftBlockCount === 1 ? 'block' : 'blocks'}</p>
 			{diagnostics.length ? <SourceDiagnosticBanner diagnostic={diagnostics[0]} location="sidebar" /> : null}
 		</aside>
 	);

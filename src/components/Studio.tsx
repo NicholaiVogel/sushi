@@ -12,16 +12,22 @@ import {
 import {
 	getSourceBlockDetails,
 	getSourceGlobals,
+	addTrackEffect,
 	cyclesToSeconds,
+	removeTrackEffect,
+	type SourceEffectMethod,
 	updateSourceKey,
 	updateSourceQuarterNotesPerCycle,
 	deleteTrack as deleteSourceTrack,
 	updateSourceBpm,
 	updateTrackGain,
+	updateTrackColor,
 	updateTrackMode,
 	updateTrackName as updateSourceTrackName,
 	updateTrackPan,
 	updateTrackRange as updateSourceTrackRange,
+	updateTrackEffect,
+	updateTrackSlider,
 } from '../lib/project/source-mapper';
 import { getSourceLineNumbers, replaceSourceSelection } from '../lib/project/editor';
 import type { EditorPreset } from '../lib/project/presets';
@@ -30,8 +36,8 @@ import {
 	getTimelineZoomForVisibleCycles,
 } from '../lib/project/timeline';
 import { highlightStrudel } from '../lib/project/syntax-highlight';
-import { loadProjectSnapshot, parseProjectExport, saveProjectSnapshot, serializeProjectSnapshot, type StoredProjectSnapshot } from '../lib/project/storage';
-import { isAudioLockedError, StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate } from '../lib/strudel/adapter';
+import { listStoredProjects, loadProjectSnapshot, parseProjectExport, saveProjectSnapshot, serializeProjectSnapshot, type StoredProjectSnapshot, type StoredProjectSummary } from '../lib/project/storage';
+import { isAudioLockedError, StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate, type StrudelVisualizer, type VisualizerHap } from '../lib/strudel/adapter';
 import type { WebMcpMutationResult, WebMcpRegistration } from '../lib/webmcp/tools';
 import { TransactionCache } from '../lib/webmcp/transaction-cache';
 import { StudioHeader } from './studio/StudioHeader';
@@ -81,6 +87,9 @@ export default function Studio() {
 	const [renamingTrackValue, setRenamingTrackValue] = useState('');
 	const [timelineZoom, setTimelineZoom] = useState(0);
 	const [openHeaderPopover, setOpenHeaderPopover] = useState<HeaderPopover | null>(null);
+	const [localProjects, setLocalProjects] = useState<StoredProjectSummary[]>([]);
+	const [localProjectsLoading, setLocalProjectsLoading] = useState(false);
+	const [localProjectsError, setLocalProjectsError] = useState<string | null>(null);
 	const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
@@ -94,6 +103,7 @@ export default function Studio() {
 	const timelineShellRef = useRef<HTMLElement | null>(null);
 	const timelineZoomAnchorRef = useRef<number | null>(null);
 	const editorResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+	const editorScrollFrameRef = useRef<number | null>(null);
 	const pendingTrackSourceRef = useRef<{ source: string; baseRevision: number } | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const sourceCommitQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -113,14 +123,34 @@ export default function Studio() {
 	const webmcpRegistrationRef = useRef<WebMcpRegistration | null>(null);
 	const webmcpAvailableRef = useRef(false);
 
-	const syncEditorScroll = useCallback(() => {
+	const applyEditorScroll = useCallback(() => {
 		const editor = sourceEditorRef.current;
 		if (!editor) return;
+		const { scrollLeft, scrollTop } = editor;
 		if (sourceHighlightRef.current) {
-			sourceHighlightRef.current.scrollTop = editor.scrollTop;
-			sourceHighlightRef.current.scrollLeft = editor.scrollLeft;
+			// Keep the highlight layer out of the browser's nested scrolling
+			// algorithm. Transforming the overflowing pre directly means the
+			// transparent textarea and its selection paint from the same origin,
+			// even when a browser reports scroll events before layout settles.
+			sourceHighlightRef.current.scrollTop = 0;
+			sourceHighlightRef.current.scrollLeft = 0;
+			sourceHighlightRef.current.style.transform = `translate(${-scrollLeft}px, ${-scrollTop}px)`;
 		}
-		if (editorGutterRef.current) editorGutterRef.current.scrollTop = editor.scrollTop;
+		if (editorGutterRef.current) editorGutterRef.current.scrollTop = scrollTop;
+	}, []);
+
+	const syncEditorScroll = useCallback(() => {
+		applyEditorScroll();
+		if (typeof window === 'undefined') return;
+		if (editorScrollFrameRef.current !== null) window.cancelAnimationFrame(editorScrollFrameRef.current);
+		editorScrollFrameRef.current = window.requestAnimationFrame(() => {
+			editorScrollFrameRef.current = null;
+			applyEditorScroll();
+		});
+	}, [applyEditorScroll]);
+
+	useEffect(() => () => {
+		if (editorScrollFrameRef.current !== null) window.cancelAnimationFrame(editorScrollFrameRef.current);
 	}, []);
 
 	const handleEditorResizePointerMove = useCallback((event: PointerEvent) => {
@@ -172,6 +202,21 @@ export default function Studio() {
 		},
 		[patchStudio],
 	);
+
+	const refreshLocalProjects = useCallback(async () => {
+		setLocalProjectsLoading(true);
+		setLocalProjectsError(null);
+		try {
+			const projects = await listStoredProjects();
+			if (!mountedRef.current) return;
+			setLocalProjects(projects);
+		} catch (error) {
+			if (!mountedRef.current) return;
+			setLocalProjectsError(error instanceof Error ? error.message : String(error));
+		} finally {
+			if (mountedRef.current) setLocalProjectsLoading(false);
+		}
+	}, []);
 
 	const bumpSourceHistory = useCallback(() => {
 		setSourceHistoryVersion((version) => version + 1);
@@ -523,7 +568,6 @@ export default function Studio() {
 		const baseRevision = studioRef.current.revision;
 		const draft = studioRef.current.draft.trimEnd();
 		const currentSource = getSourceBlocks(draft).length || !/\bsilence\s*$/.test(draft) ? draft : draft.replace(/\s*silence\s*$/, '');
-		const nextTrackNumber = getSourceBlocks(currentSource).length + 1;
 		const existingIds = new Set(getSourceBlocks(currentSource).map((track) => track.id));
 		let trackId = '';
 		while (!trackId || existingIds.has(trackId)) {
@@ -532,7 +576,7 @@ export default function Studio() {
 				: `${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
 			trackId = `trk_${randomUuid}`;
 		}
-		const nextSource = `${currentSource}\n\n// @sushi-track {"id":"${trackId}","name":"Track ${nextTrackNumber}","type":"synth","schema":1}\n$: seqPLoop([0, 4, note("<c3 e3 g3 a3>").s("sine").gain(0.18)])\n`;
+		const nextSource = `${currentSource}\n\n// @sushi-track {"id":"${trackId}","name":"untitled","type":"synth","schema":1}\n$: seqPLoop([0, 4, note("<c3 e3 g3 a3>").s("sine").gain(0.18)])\n`;
 		await commitSource(nextSource, { expectedRevision: baseRevision });
 	}, [cancelPendingTrackCommit, commitSource]);
 
@@ -816,6 +860,31 @@ export default function Studio() {
 		[updateTrackSource],
 	);
 
+	const setTrackSlider = useCallback(
+		(trackId: string, sliderId: string, value: number) => updateTrackSource(trackId, (source) => updateTrackSlider(source, trackId, sliderId, value)),
+		[updateTrackSource],
+	);
+
+	const setTrackEffect = useCallback(
+		(trackId: string, effectId: string, value: number | 'rand') => updateTrackSource(trackId, (source) => updateTrackEffect(source, trackId, effectId, value)),
+		[updateTrackSource],
+	);
+
+	const addTrackEffectToSource = useCallback(
+		(trackId: string, method: SourceEffectMethod) => updateTrackSource(trackId, (source) => addTrackEffect(source, trackId, method)),
+		[updateTrackSource],
+	);
+
+	const removeTrackEffectFromSource = useCallback(
+		(trackId: string, effectId: string) => updateTrackSource(trackId, (source) => removeTrackEffect(source, trackId, effectId)),
+		[updateTrackSource],
+	);
+
+	const setTrackColor = useCallback(
+		(trackId: string, value: string) => updateTrackSource(trackId, (source) => updateTrackColor(source, trackId, value)),
+		[updateTrackSource],
+	);
+
 	const setQuarterNotesPerCycle = useCallback(
 		(value: number) => updateSourceDraft((source) => updateSourceQuarterNotesPerCycle(source, value)),
 		[updateSourceDraft],
@@ -863,48 +932,35 @@ export default function Studio() {
 		window.setTimeout(() => URL.revokeObjectURL(url), 0);
 	}, []);
 
-	const importProject = useCallback(async (event: ReactChangeEvent<HTMLInputElement>) => {
-		const file = event.currentTarget.files?.[0];
-		event.currentTarget.value = '';
-		if (!file) return;
+	const applyProjectSnapshot = useCallback(async (snapshot: StoredProjectSnapshot): Promise<boolean> => {
 		const generation = studioGenerationRef.current;
-		let parsed: ReturnType<typeof parseProjectExport>;
-		try {
-			parsed = parseProjectExport(await file.text());
-		} catch (error) {
-			parsed = { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
-		}
-		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
-		if (!parsed.ok) {
-			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, parsed.error, 'parse', studioRef.current.draft)] });
-			return;
-		}
-
-		const imported = normalizeImportedSnapshot(parsed.snapshot);
+		const imported = normalizeImportedSnapshot(snapshot);
 		const identityDiagnostics = getSourceIdentityDiagnostics(imported.project.source.revision, imported.project.source.lastValid);
 		if (identityDiagnostics.length) {
 			patchStudio({ phase: 'error', diagnostics: identityDiagnostics });
-			return;
+			return false;
 		}
+
 		const adapter = adapterRef.current;
 		if (!adapter) {
 			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, new Error('The Strudel runtime is not ready.'), 'audio', studioRef.current.draft)] });
-			return;
+			return false;
 		}
 
 		cancelPendingTrackCommit();
 		patchStudio({ phase: 'validating', diagnostics: [] });
 		const stopped = await adapter.stop();
-		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return false;
 		if (!stopped.ok) {
 			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, stopped.error, 'audio', studioRef.current.draft)] });
-			return;
+			return false;
 		}
+
 		const evaluated = await adapter.evaluateSource(imported.project.source.lastValid, { autoplay: false, restoreSource: studioRef.current.lastValid });
-		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return false;
 		if (!evaluated.ok) {
 			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(imported.project.source.revision, evaluated.error, 'evaluate', imported.project.source.lastValid)] });
-			return;
+			return false;
 		}
 
 		let draftDiagnostics: SourceDiagnostic[] = [];
@@ -921,7 +977,8 @@ export default function Studio() {
 				}
 			}
 		}
-		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return false;
+
 		adapter.setSongEndCycle(imported.project.timeline.songEndCycle);
 		sourceHistoryRef.current = { cursorSource: imported.project.source.draft, undo: [], redo: [] };
 		sourceTransactionsRef.current.clear();
@@ -938,8 +995,45 @@ export default function Studio() {
 			diagnostics: draftDiagnostics,
 			runtime: { ...studioRef.current.runtime, audioState: 'locked', transport: 'stopped', currentCycle: 0, activeRevision: imported.activeRevision },
 		});
+		setOpenHeaderPopover(null);
 		await persistStudioSnapshot(imported, generation);
-	}, [bumpSourceHistory, cancelPendingTrackCommit, patchStudio, persistStudioSnapshot]);
+		void refreshLocalProjects();
+		return true;
+	}, [bumpSourceHistory, cancelPendingTrackCommit, patchStudio, persistStudioSnapshot, refreshLocalProjects]);
+
+	const importProject = useCallback(async (event: ReactChangeEvent<HTMLInputElement>) => {
+		const file = event.currentTarget.files?.[0];
+		event.currentTarget.value = '';
+		if (!file) return;
+		const generation = studioGenerationRef.current;
+		let parsed: ReturnType<typeof parseProjectExport>;
+		try {
+			parsed = parseProjectExport(await file.text());
+		} catch (error) {
+			parsed = { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
+		}
+		if (!mountedRef.current || studioGenerationRef.current !== generation) return;
+		if (!parsed.ok) {
+			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, parsed.error, 'parse', studioRef.current.draft)] });
+			return;
+		}
+		await applyProjectSnapshot(parsed.snapshot);
+	}, [applyProjectSnapshot, patchStudio]);
+
+	const loadLocalProject = useCallback(async (projectId: string) => {
+		if (!projectId.trim()) return;
+		try {
+			const snapshot = await loadProjectSnapshot(projectId);
+			if (!mountedRef.current) return;
+			if (!snapshot) {
+				patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, new Error('The saved Sushi project could not be found.'), 'commit', studioRef.current.draft)] });
+				return;
+			}
+			await applyProjectSnapshot(snapshot);
+		} catch (error) {
+			if (mountedRef.current) patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(studioRef.current.revision, error, 'commit', studioRef.current.draft)] });
+		}
+	}, [applyProjectSnapshot, patchStudio]);
 
 	const loadEditorPreset = useCallback(async (preset: EditorPreset) => {
 		cancelPendingTrackCommit();
@@ -952,7 +1046,12 @@ export default function Studio() {
 		patchStudio({ projectName: preset.name, songEndCycle: presetEndCycle });
 		setOpenHeaderPopover(null);
 		await persistStudioSnapshot();
-	}, [cancelPendingTrackCommit, commitSource, patchStudio, persistStudioSnapshot]);
+		void refreshLocalProjects();
+	}, [cancelPendingTrackCommit, commitSource, patchStudio, persistStudioSnapshot, refreshLocalProjects]);
+
+	const saveProject = useCallback(() => {
+		void persistStudioSnapshot().then(() => refreshLocalProjects());
+	}, [persistStudioSnapshot, refreshLocalProjects]);
 
 	const toggleTrackMode = useCallback(
 		(trackId: string, mode: 'mute' | 'solo', active: boolean) => updateTrackSource(trackId, (source) => updateTrackMode(source, trackId, mode, active)),
@@ -998,8 +1097,8 @@ export default function Studio() {
 	const openTrackContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>, trackId: string) => {
 		event.preventDefault();
 		selectTrack(trackId);
-		const menuWidth = 190;
-		const menuHeight = 116;
+		const menuWidth = 260;
+		const menuHeight = 280;
 		const maxX = Math.max(8, window.innerWidth - menuWidth - 8);
 		const maxY = Math.max(8, window.innerHeight - menuHeight - 8);
 		setContextMenu({ trackId, x: Math.min(Math.max(8, event.clientX), maxX), y: Math.min(Math.max(8, event.clientY), maxY) });
@@ -1010,8 +1109,8 @@ export default function Studio() {
 			if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
 			event.preventDefault();
 			const rect = event.currentTarget.getBoundingClientRect();
-			const menuWidth = 190;
-			const menuHeight = 116;
+			const menuWidth = 260;
+			const menuHeight = 280;
 			const maxX = Math.max(8, window.innerWidth - menuWidth - 8);
 			const maxY = Math.max(8, window.innerHeight - menuHeight - 8);
 			selectTrack(trackId);
@@ -1067,6 +1166,11 @@ export default function Studio() {
 			document.removeEventListener('keydown', handleKeyDown);
 		};
 	}, [openHeaderPopover]);
+
+	useEffect(() => {
+		if (openHeaderPopover !== 'settings') return;
+		void refreshLocalProjects();
+	}, [openHeaderPopover, refreshLocalProjects]);
 
 	const dispatch = useCallback(
 		async (command: StudioCommand): Promise<DispatchResult> => {
@@ -1288,6 +1392,9 @@ export default function Studio() {
 	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft).map((block) => [block.id, block])), [studio.draft]);
 	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid).map((block) => [block.id, block])), [studio.lastValid]);
 	const contextMenuTrack = useMemo(() => blocks.find((block) => block.id === contextMenu?.trackId), [blocks, contextMenu?.trackId]);
+	const contextMenuTrackDetails = contextMenu?.trackId
+		? draftTrackDetails.get(contextMenu.trackId) ?? validTrackDetails.get(contextMenu.trackId)
+		: undefined;
 	const sourceGlobals = useMemo(() => getSourceGlobals(studio.lastValid), [studio.lastValid]);
 	const draftGlobals = useMemo(() => getSourceGlobals(studio.draft), [studio.draft]);
 	const draftBpm = clamp(Math.round(draftGlobals.bpm), 0, 300);
@@ -1299,6 +1406,9 @@ export default function Studio() {
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
+	const getCurrentCycle = useCallback(() => adapterRef.current?.getCurrentCycle() ?? studioRef.current.runtime.currentCycle, []);
+	const getVisualizerHaps = useCallback((trackId: string, visualizer: StrudelVisualizer, begin: number, end: number): VisualizerHap[] => adapterRef.current?.getVisualizerHaps(trackId, visualizer, begin, end) ?? [], []);
+	const getVisualizerScopeData = useCallback((trackId: string): number[] | undefined => adapterRef.current?.getVisualizerScopeData(trackId), []);
 	const cycleStep = getSourceCycleStep(studio.lastValid);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
 	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
@@ -1354,10 +1464,14 @@ export default function Studio() {
 				openPopover={openHeaderPopover}
 				canUndo={sourceHistoryRef.current.undo.length > 0}
 				canRedo={sourceHistoryRef.current.redo.length > 0}
+				localProjects={localProjects}
+				localProjectsLoading={localProjectsLoading}
+				localProjectsError={localProjectsError}
 				projectImportInputRef={projectImportInputRef}
 				onTogglePopover={(popover) => setOpenHeaderPopover((current) => current === popover ? null : popover)}
 				onProjectNameChange={(name) => patchStudio({ projectName: name })}
 				onPersistProject={() => { void persistStudioSnapshot(); }}
+				onSaveProject={saveProject}
 				onSetTempo={setTempo}
 				onSetQuarterNotesPerCycle={setQuarterNotesPerCycle}
 				onSetKey={setKey}
@@ -1371,6 +1485,8 @@ export default function Studio() {
 				onPause={() => { void dispatch({ type: 'pause' }); }}
 				onStop={() => { void dispatch({ type: 'stop' }); }}
 				onLoadPreset={(preset) => { void loadEditorPreset(preset); }}
+				onLoadLocalProject={(projectId) => { void loadLocalProject(projectId); }}
+				onRefreshLocalProjects={() => { void refreshLocalProjects(); }}
 			/>
 
 			<div className="studio-body" style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
@@ -1428,6 +1544,9 @@ export default function Studio() {
 						validTrackDetails={validTrackDetails}
 						sourceGlobals={sourceGlobals}
 						runtime={studio.runtime}
+						getCurrentCycle={getCurrentCycle}
+						getVisualizerHaps={getVisualizerHaps}
+						getVisualizerScopeData={getVisualizerScopeData}
 						isBusy={isBusy}
 						selectedTrackId={selectedTrackId}
 						renamingTrackId={renamingTrackId}
@@ -1449,6 +1568,10 @@ export default function Studio() {
 						onToggleTrackMode={toggleTrackMode}
 						onSetTrackGain={setTrackGain}
 						onSetTrackPan={setTrackPan}
+						onSetTrackSlider={setTrackSlider}
+						onSetTrackEffect={setTrackEffect}
+						onAddTrackEffect={addTrackEffectToSource}
+						onRemoveTrackEffect={removeTrackEffectFromSource}
 						onStartTimingDrag={startTimingDrag}
 						onSetTrackRange={setTrackRange}
 					/>
@@ -1462,8 +1585,10 @@ export default function Studio() {
 				trackNumber={blocks.findIndex((block) => block.id === contextMenuTrack.id) + 1}
 				position={{ x: contextMenu.x, y: contextMenu.y }}
 				menuRef={contextMenuRef}
+				trackDetails={contextMenuTrackDetails}
 				onRename={beginTrackRename}
 				onDelete={deleteSelectedTrack}
+				onSetColor={setTrackColor}
 			/> : null}
 		</div>
 	);

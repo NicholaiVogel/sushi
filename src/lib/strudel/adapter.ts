@@ -1,4 +1,5 @@
 import { DEFAULT_SONG_END_CYCLE, type AudioState, type TransportState } from '../project/model';
+import { getSourceBlockDetails, type TrackVisualizer } from '../project/source-mapper';
 import soundfontDefinitions from '@strudel/soundfonts/gm.mjs';
 
 interface StrudelModule {
@@ -9,12 +10,15 @@ interface StrudelModule {
 		beforeStart?: () => void | Promise<void>;
 	}): Promise<StrudelRepl>;
 	register?: (name: string, func: (...args: any[]) => unknown, patternify?: boolean) => unknown;
+	ref?: (accessor: () => unknown) => unknown;
 	Pattern?: { prototype: Record<string, unknown> };
 	initAudio?: (options?: Record<string, unknown>) => Promise<void>;
 	hush?: () => void;
 	aliasBank?: (path: string) => Promise<void>;
 	samples?: (sampleMap: string, baseUrl?: string, options?: Record<string, unknown>) => Promise<void>;
 	registerSound?: (name: string, trigger: (time: number, value: Record<string, any>, onended: () => void) => Promise<unknown>, data?: Record<string, unknown>) => void;
+	getAnalyserById?: (id: number, fftSize?: number, smoothingTimeConstant?: number) => unknown;
+	getAnalyzerData?: (type?: 'time' | 'frequency', id?: number) => ArrayLike<number>;
 	getAudioContext?: () => AudioContext;
 	getSound?: (name: string) => { data?: Record<string, any> } | undefined;
 	getSoundIndex?: (value: unknown, size: number) => number;
@@ -40,10 +44,26 @@ interface SoundfontRuntime {
 interface StrudelHap {
 	value?: Record<string, any>;
 	hasOnset?: () => boolean;
+	whole?: { begin?: unknown; end?: unknown };
+	endClipped?: unknown;
+	duration?: unknown;
+	context?: Record<string, unknown>;
+	setContext?: (context: Record<string, unknown>) => StrudelHap;
 }
 
 interface StrudelPattern {
 	queryArc?: (begin: number, end: number, controls?: Record<string, unknown>) => StrudelHap[];
+	withHaps?: (func: (haps: StrudelHap[], state: { controls?: Record<string, unknown> }) => StrudelHap[]) => StrudelPattern;
+	analyze?: (id?: number) => StrudelPattern;
+}
+
+export type StrudelVisualizer = TrackVisualizer;
+
+export interface VisualizerHap {
+	begin: number;
+	end: number;
+	value: Record<string, unknown>;
+	analyzerId?: number;
 }
 
 interface SourceAudioAsset {
@@ -104,31 +124,92 @@ function appendRuntimeSilence(source: string): string {
 }
 
 /**
- * The Strudel transpiler rewrites `slider(...)` to `sliderWithID(...)`. The
- * full Strudel editor supplies that helper, while Sushi intentionally does not
- * render inline widgets. Keep those sources playable by treating the widget
- * as its value and ignoring its editor-only bounds.
+ * The Strudel transpiler rewrites `slider(...)` to `sliderWithID(...)`. Sushi
+ * renders the corresponding controls in each source lane, but the evaluated
+ * pattern still needs a ref-backed helper so slider values can be read without
+ * rebuilding the pattern graph on every change.
  */
-function registerSushiCompatibility(module: StrudelModule): void {
+let activeSliderValues: Map<string, number> | undefined;
+
+function unpureSliderValue(value: unknown): unknown {
+	if (value && typeof value === 'object' && '__pure' in value) {
+		return (value as { __pure?: unknown }).__pure;
+	}
+	return value;
+}
+
+function registerSushiCompatibility(module: StrudelModule, sliderValues: Map<string, number>): void {
+	activeSliderValues = sliderValues;
 	const globalScope = globalThis as typeof globalThis & { sliderWithID?: unknown };
 	if (typeof globalScope.sliderWithID !== 'function') {
-		const valuePassthrough = (_id: unknown, value: unknown, _min: unknown, _max: unknown) => value;
-		const registered = module.register?.('sliderWithID', valuePassthrough, false);
+		const sliderWithID = (id: unknown, value: unknown) => {
+			const key = String(unpureSliderValue(id));
+			const initialValue = unpureSliderValue(value);
+			const initial = Number(initialValue);
+			if (Number.isFinite(initial)) activeSliderValues?.set(key, initial);
+			const accessor = () => activeSliderValues?.get(key) ?? initialValue;
+			return module.ref?.(accessor) ?? accessor();
+		};
+		const registered = module.register?.('sliderWithID', sliderWithID, false);
 		// `register` adds functions to Strudel's private scope. The web bundle
 		// copies that scope to `globalThis` during its built-in prebake, so
 		// registrations made by an embedding app must expose the returned wrapper
 		// themselves.
-		globalScope.sliderWithID = typeof registered === 'function' ? registered : valuePassthrough;
+		globalScope.sliderWithID = typeof registered === 'function' ? registered : sliderWithID;
 	}
 
 	// These drawing hooks are supplied by strudel.cc's editor packages, not by
-	// @strudel/web. Sushi has its own timeline and does not render those canvases,
-	// but keeping them as identity methods means a pasted Strudel song remains
-	// evaluable instead of failing before any of its audible layers are loaded.
-	for (const name of ['_pianoroll', '_scope']) {
-		if (typeof module.Pattern?.prototype[name] === 'function') continue;
-		module.register?.(name, (pattern: unknown) => pattern);
+	// @strudel/web. Keep the hooks in the pattern graph, rather than dropping
+	// identity methods, so the Sushi timeline can query the same events that the
+	// scheduler will play. The source lane id is added later by Strudel's REPL
+	// when it calls Pattern.p(), and therefore survives the final stacked pattern.
+	let nextScopeAnalyzerId = 1000;
+	const registerVisualizer = (name: string, visualizer: StrudelVisualizer) => {
+		if (typeof module.Pattern?.prototype[name] === 'function') return;
+		module.register?.(name, (pattern: unknown) => {
+			const candidate = pattern as StrudelPattern;
+			if (typeof candidate.withHaps !== 'function') return pattern;
+			const analyzerId = visualizer === 'scope' ? nextScopeAnalyzerId++ : undefined;
+			const analyze = candidate.analyze;
+			const analyzed = visualizer === 'scope' && analyzerId !== undefined && typeof analyze === 'function'
+				? analyze.call(candidate, analyzerId)
+				: candidate;
+			if (typeof analyzed.withHaps !== 'function') return analyzed;
+			return analyzed.withHaps((haps, state) => haps.map((hap) => hap.setContext?.({
+				...(hap.context ?? {}),
+				sushiVisualizer: visualizer,
+				sushiPatternId: typeof state.controls?.id === 'string' ? state.controls.id : undefined,
+				...(analyzerId === undefined ? {} : { sushiAnalyzerId: analyzerId }),
+			}) ?? hap));
+		});
+	};
+	registerVisualizer('_pianoroll', 'pianoroll');
+	registerVisualizer('_scope', 'scope');
+}
+
+function numericTime(value: unknown): number | undefined {
+	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	if (value && typeof (value as { valueOf?: () => unknown }).valueOf === 'function') {
+		const numeric = Number((value as { valueOf: () => unknown }).valueOf());
+		return Number.isFinite(numeric) ? numeric : undefined;
 	}
+	return undefined;
+}
+
+/**
+ * Mirror the anonymous pattern id allocation in @strudel/core/repl. Every
+ * dollar-suffixed source lane consumes an index, even when that lane does not
+ * request a visualizer.
+ */
+function visualizerPatternIds(source: string): Map<string, string> {
+	const ids = new Map<string, string>();
+	let anonymousIndex = 0;
+	for (const block of getSourceBlockDetails(source)) {
+		if (!block.label?.endsWith('$')) continue;
+		ids.set(block.id, `${block.label}${anonymousIndex}`);
+		anonymousIndex += 1;
+	}
+	return ids;
 }
 
 let soundfontRuntimePromise: Promise<SoundfontRuntime> | undefined;
@@ -303,6 +384,9 @@ export class StrudelAdapter {
 	private repl: StrudelRepl | undefined;
 	private activePattern: StrudelPattern | undefined;
 	private activeSource = '';
+	private sliderValues = new Map<string, number>();
+	private visualizerPatternIds = new Map<string, string>();
+	private visualizerAnalyzerIds = new Map<string, number>();
 	private preloadPromise: Promise<void> | undefined;
 	private sampleBankPromise: Promise<void> | undefined;
 	private initPromise: Promise<void> | undefined;
@@ -338,7 +422,7 @@ export class StrudelAdapter {
 			this.module = module;
 			this.repl = await module.initStrudel({
 				prebake: async () => {
-					registerSushiCompatibility(module);
+					registerSushiCompatibility(module, this.sliderValues);
 					// @strudel/web only registers oscillator synths by default. Strudel.cc
 					// adds its GM soundfonts and the two sample collections below before
 					// evaluating user code, so ordinary Strudel snippets resolve the same
@@ -369,7 +453,7 @@ export class StrudelAdapter {
 			});
 			// Keep editor-only Strudel helpers available after initialization too;
 			// this is idempotent when the prebake hook already installed them.
-			registerSushiCompatibility(module);
+			registerSushiCompatibility(module, this.sliderValues);
 			if (this.destroyed) {
 				try {
 					this.repl.stop();
@@ -391,6 +475,9 @@ export class StrudelAdapter {
 			this.module = undefined;
 			this.activePattern = undefined;
 			this.activeSource = '';
+			this.sliderValues.clear();
+			this.visualizerPatternIds.clear();
+			this.visualizerAnalyzerIds.clear();
 			this.preloadPromise = undefined;
 			this.sampleBankPromise = undefined;
 			this.activeEvaluation = undefined;
@@ -567,6 +654,8 @@ export class StrudelAdapter {
 
 			this.activePattern = pattern as StrudelPattern;
 			this.activeSource = source;
+			this.visualizerPatternIds = visualizerPatternIds(source);
+			this.visualizerAnalyzerIds.clear();
 			this.preloadPromise = undefined;
 
 			return { ok: true };
@@ -939,6 +1028,66 @@ export class StrudelAdapter {
 		return this.enqueueSerialized(() => this.seekNow(cycle));
 	}
 
+	/** Return the live scheduler cursor for animation clients such as the lane visualizers. */
+	public getCurrentCycle(): number {
+		return this.readCurrentCycle();
+	}
+
+	/**
+	 * Query visualizer events for one source lane. The query is deliberately
+	 * read-only and bounded by the caller's viewport, so animation never mutates
+	 * Strudel state or competes with the serialized transport queue.
+	 */
+	public getVisualizerHaps(
+		trackId: string,
+		visualizer: StrudelVisualizer,
+		begin: number,
+		end: number,
+	): VisualizerHap[] {
+		const pattern = this.activePattern;
+		const patternId = this.visualizerPatternIds.get(trackId);
+		if (!pattern?.queryArc || !patternId || !Number.isFinite(begin) || !Number.isFinite(end) || end <= begin) return [];
+
+		try {
+			const cps = this.repl?.scheduler?.cps;
+			const queried = pattern.queryArc(begin, end, {
+				...(typeof cps === 'number' && Number.isFinite(cps) ? { _cps: cps } : {}),
+			});
+			if (!Array.isArray(queried)) return [];
+
+			return queried.flatMap((hap) => {
+				if (hap.context?.sushiPatternId !== patternId || hap.context?.sushiVisualizer !== visualizer) return [];
+				const analyzerId = typeof hap.context?.sushiAnalyzerId === 'number' ? hap.context.sushiAnalyzerId : undefined;
+				if (analyzerId !== undefined) this.visualizerAnalyzerIds.set(trackId, analyzerId);
+				const wholeBegin = numericTime(hap.whole?.begin);
+				const wholeEnd = numericTime(hap.whole?.end);
+				const duration = numericTime(hap.duration);
+				const hapEnd = numericTime(hap.endClipped)
+					?? (wholeBegin !== undefined && duration !== undefined ? wholeBegin + duration : wholeEnd);
+				if (wholeBegin === undefined || hapEnd === undefined || hapEnd <= wholeBegin) return [];
+				const rawValue = hap.value;
+				const value = rawValue && typeof rawValue === 'object'
+					? rawValue as Record<string, unknown>
+					: { value: rawValue };
+				return [{ begin: wholeBegin, end: hapEnd, value, ...(analyzerId === undefined ? {} : { analyzerId }) }];
+			});
+		} catch {
+			return [];
+		}
+	}
+
+	/** Read the Strudel analyser attached to a scope lane when the Web Audio runtime provides it. */
+	public getVisualizerScopeData(trackId: string): number[] | undefined {
+		const analyzerId = this.visualizerAnalyzerIds.get(trackId);
+		if (analyzerId === undefined || !this.module?.getAnalyzerData) return undefined;
+		try {
+			const data = this.module.getAnalyzerData('time', analyzerId);
+			return data ? Array.from(data) : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	private async seekNow(cycle: number): Promise<AdapterResult> {
 		let transportTouched = false;
 		try {
@@ -986,6 +1135,9 @@ export class StrudelAdapter {
 		this.module = undefined;
 		this.activePattern = undefined;
 		this.activeSource = '';
+		this.sliderValues.clear();
+		this.visualizerPatternIds.clear();
+		this.visualizerAnalyzerIds.clear();
 		this.preloadPromise = undefined;
 		this.sampleBankPromise = undefined;
 		try {

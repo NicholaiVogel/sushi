@@ -1,7 +1,8 @@
 import type { ChangeEvent, RefObject } from 'react';
 import type { RuntimeState } from '../../lib/project/model';
 import type { SourceGlobals } from '../../lib/project/source-mapper';
-import { EDITOR_PRESETS, type EditorPreset } from '../../lib/project/presets';
+import type { EditorPreset } from '../../lib/project/presets';
+import type { StoredProjectSummary } from '../../lib/project/storage';
 import {
 	formatClock,
 	formatCycle,
@@ -10,6 +11,7 @@ import {
 	KEY_ROOT_OPTIONS,
 } from './helpers';
 import type { HeaderPopover, PersistenceState } from './types';
+import { SettingsMenu } from './SettingsMenu';
 
 export interface StudioHeaderProps {
 	headerRef: RefObject<HTMLElement | null>;
@@ -29,10 +31,14 @@ export interface StudioHeaderProps {
 	openPopover: HeaderPopover | null;
 	canUndo: boolean;
 	canRedo: boolean;
+	localProjects: readonly StoredProjectSummary[];
+	localProjectsLoading: boolean;
+	localProjectsError: string | null;
 	projectImportInputRef: RefObject<HTMLInputElement | null>;
 	onTogglePopover: (popover: HeaderPopover) => void;
 	onProjectNameChange: (name: string) => void;
 	onPersistProject: () => void;
+	onSaveProject: () => void;
 	onSetTempo: (bpm: number) => void;
 	onSetQuarterNotesPerCycle: (value: number) => void;
 	onSetKey: (key: string) => void;
@@ -46,6 +52,8 @@ export interface StudioHeaderProps {
 	onPause: () => void;
 	onStop: () => void;
 	onLoadPreset: (preset: EditorPreset) => void;
+	onLoadLocalProject: (projectId: string) => void;
+	onRefreshLocalProjects: () => void;
 }
 
 export function StudioHeader({
@@ -66,10 +74,14 @@ export function StudioHeader({
 	openPopover,
 	canUndo,
 	canRedo,
+	localProjects,
+	localProjectsLoading,
+	localProjectsError,
 	projectImportInputRef,
 	onTogglePopover,
 	onProjectNameChange,
 	onPersistProject,
+	onSaveProject,
 	onSetTempo,
 	onSetQuarterNotesPerCycle,
 	onSetKey,
@@ -83,38 +95,41 @@ export function StudioHeader({
 	onPause,
 	onStop,
 	onLoadPreset,
+	onLoadLocalProject,
+	onRefreshLocalProjects,
 }: StudioHeaderProps) {
 	return (
 		<header className="studio-topbar" ref={headerRef}>
 			<div className="topbar-brand-group">
+				<div className="topbar-settings-control">
+					<button className="topbar-settings-button" type="button" onClick={() => onTogglePopover('settings')} disabled={isBusy} aria-expanded={openPopover === 'settings'} aria-haspopup="dialog" aria-label="Open Sushi settings" title="Open Sushi settings">
+						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+					</button>
+					{openPopover === 'settings' ? <SettingsMenu
+						persistenceState={persistenceState}
+						saveStateLabel={saveStateLabel}
+						isDirty={isDirty}
+						isBusy={isBusy}
+						localProjects={localProjects}
+						localProjectsLoading={localProjectsLoading}
+						localProjectsError={localProjectsError}
+						projectImportInputRef={projectImportInputRef}
+						onSaveProject={onSaveProject}
+						onExportProject={onExportProject}
+						onImportProject={onImportProject}
+						onLoadPreset={onLoadPreset}
+						onLoadLocalProject={onLoadLocalProject}
+						onRefreshLocalProjects={onRefreshLocalProjects}
+					/> : null}
+				</div>
 				<a className="wordmark" href="/" aria-label="Sushi home">
-					<span className="wordmark-mark" aria-hidden="true">◒</span> sushi
+					<img className="wordmark-logo" src="/logos/brand-wordmark-white.png" alt="sushi" />
 				</a>
 			</div>
 			<div className="topbar-session">
 				<div className="session-name-row">
 					<label className="sr-only" htmlFor="project-name">Project name</label>
 					<input id="project-name" className="project-name-input" value={projectName} onChange={(event) => onProjectNameChange(event.target.value)} onBlur={onPersistProject} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} aria-label="Project name" title="Rename project" />
-					<div className="topbar-preset-control">
-						<button className="topbar-preset-button" type="button" onClick={() => onTogglePopover('presets')} disabled={isBusy} aria-expanded={openPopover === 'presets'} aria-haspopup="dialog" aria-label="Load a preset" title="Load a preset">Presets</button>
-						{openPopover === 'presets' ? (
-							<div className="topbar-preset-popover" role="dialog" aria-label="Load a preset">
-								<div className="preset-popover-heading">
-									<strong className="topbar-popover-title">Load a preset</strong>
-									<span>Replace the editor source. Undo restores the current source.</span>
-								</div>
-								<div className="preset-list">
-									{EDITOR_PRESETS.map((preset) => (
-										<button className="preset-option" type="button" key={preset.id} onClick={() => onLoadPreset(preset)} disabled={isBusy}>
-											<span className="preset-option-heading"><strong>{preset.name}</strong><small>{preset.bpm} BPM · {preset.key}</small></span>
-											<span className="preset-option-description">{preset.description}</span>
-											<span className="preset-option-meta">{preset.lanes} SOURCE LANES</span>
-										</button>
-									))}
-								</div>
-							</div>
-						) : null}
-					</div>
 					<span className={`save-state ${isDirty || persistenceState === 'loading' ? 'save-state-dirty' : ''}`} title={persistenceState === 'unavailable' ? 'IndexedDB is unavailable; this session will not persist after reload.' : 'Project state is saved locally'}><span className="save-dot" aria-hidden="true" />{saveStateLabel}</span>
 				</div>
 				<div className="topbar-transport" aria-label="Transport controls">
@@ -154,20 +169,13 @@ export function StudioHeader({
 						<button className="transport-button transport-pause" type="button" onClick={onPause} disabled={!canPlay || runtime.transport !== 'playing'} aria-label="Pause playback" title="Pause at the current cycle">Ⅱ</button>
 					</div>
 					<div className="topbar-transport-right">
-						<div className="topbar-source-actions-right" aria-label="Source history and project actions">
+						<div className="topbar-source-actions-right" aria-label="Source history">
 							<button className="transport-button source-action-button" type="button" onClick={onUndoSource} disabled={isBusy || isDirty || !canUndo} aria-label="Undo source edit" title="Undo source edit">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8 4 12l5 4" /><path d="M4 12h8a6 6 0 0 1 6 6" /></svg>
 							</button>
 							<button className="transport-button source-action-button" type="button" onClick={onRedoSource} disabled={isBusy || isDirty || !canRedo} aria-label="Redo source edit" title="Redo source edit">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 8 5 4-5 4" /><path d="M20 12h-8a6 6 0 0 0-6 6" /></svg>
 							</button>
-							<button className="transport-button source-action-button" type="button" onClick={onExportProject} disabled={isBusy} aria-label="Export Sushi project" title="Export project">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11" /><path d="m8 8 4-4 4 4" /><path d="M5 14v5h14v-5" /></svg>
-							</button>
-							<button className="transport-button source-action-button" type="button" onClick={() => projectImportInputRef.current?.click()} disabled={isBusy} aria-label="Import Sushi project" title="Import project">
-								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V9" /><path d="m8 16 4 4 4-4" /><path d="M5 10V5h14v5" /></svg>
-							</button>
-							<input ref={projectImportInputRef} className="project-import-input" type="file" accept="application/json,.json" onChange={onImportProject} aria-label="Import Sushi project file" />
 						</div>
 						<div className="transport-status" aria-label="Playback status">
 							<span className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>

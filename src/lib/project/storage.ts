@@ -16,6 +16,13 @@ export type StoredProjectRecord = ProjectDocumentV1 & {
 	savedAt: number;
 };
 
+export interface StoredProjectSummary {
+	id: string;
+	name: string;
+	revision: number;
+	savedAt: number;
+}
+
 export interface ProjectExportV1 {
 	format: 'sushi-project';
 	formatVersion: 1;
@@ -166,6 +173,25 @@ export async function loadProjectSnapshot(projectId: string): Promise<StoredProj
 
 			const { activeRevision, savedAt: _savedAt, ...project } = record;
 			resolve({ project, activeRevision });
+		};
+		request.onerror = () => reject(request.error ?? storageUnavailable());
+		transaction.onerror = () => reject(transaction.error ?? storageUnavailable());
+	}));
+}
+
+/** List the project records available in local IndexedDB, newest first. */
+export async function listStoredProjects(): Promise<StoredProjectSummary[]> {
+	const database = await openDatabase();
+	return closeAfter(database, new Promise((resolve, reject) => {
+		const transaction = database.transaction(PROJECT_STORE, 'readonly');
+		const request = transaction.objectStore(PROJECT_STORE).getAll();
+		request.onsuccess = () => {
+			const records = (request.result as unknown[])
+				.map((value) => readStoredRecord(value))
+				.filter((record): record is StoredProjectRecord => record !== undefined)
+				.map(({ id, name, source, savedAt }) => ({ id, name, revision: source.revision, savedAt }))
+				.sort((left, right) => right.savedAt - left.savedAt);
+			resolve(records);
 		};
 		request.onerror = () => reject(request.error ?? storageUnavailable());
 		transaction.onerror = () => reject(transaction.error ?? storageUnavailable());

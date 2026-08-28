@@ -41,6 +41,8 @@ export interface WebMcpTrackState {
 	timing: TrackTiming;
 	gain: WebMcpControlState;
 	pan: WebMcpControlState;
+	color?: string;
+	colorEditable?: boolean;
 	muted: boolean;
 	soloed: boolean;
 }

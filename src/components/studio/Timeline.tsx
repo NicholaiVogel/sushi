@@ -14,6 +14,8 @@ import {
 } from './helpers';
 import type { HeaderPopover, TrackDetails } from './types';
 import { TrackLane, type TimelineCell } from './TrackLane';
+import type { StrudelVisualizer, VisualizerHap } from '../../lib/strudel/adapter';
+import type { SourceEffectMethod } from '../../lib/project/source-mapper';
 
 export interface TimelineProps {
 	timelineViewportRef: RefObject<HTMLElement | null>;
@@ -34,6 +36,9 @@ export interface TimelineProps {
 	validTrackDetails: Map<string, TrackDetails>;
 	sourceGlobals: SourceGlobals;
 	runtime: RuntimeState;
+	getCurrentCycle: () => number;
+	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
+	getVisualizerScopeData: (trackId: string) => number[] | undefined;
 	isBusy: boolean;
 	selectedTrackId: string | null;
 	renamingTrackId: string | null;
@@ -55,6 +60,10 @@ export interface TimelineProps {
 	onToggleTrackMode: (trackId: string, mode: 'mute' | 'solo', active: boolean) => void;
 	onSetTrackGain: (trackId: string, value: number) => void;
 	onSetTrackPan: (trackId: string, value: number) => void;
+	onSetTrackSlider: (trackId: string, sliderId: string, value: number) => void;
+	onSetTrackEffect: (trackId: string, effectId: string, value: number | 'rand') => void;
+	onAddTrackEffect: (trackId: string, method: SourceEffectMethod) => void;
+	onRemoveTrackEffect: (trackId: string, effectId: string) => void;
 	onStartTimingDrag: (event: PointerEvent<HTMLElement>, trackId: string, edge: 'start' | 'end' | 'move') => void;
 	onSetTrackRange: (trackId: string, startCycle: number, endCycle: number) => void;
 }
@@ -78,6 +87,9 @@ export function Timeline({
 	validTrackDetails,
 	sourceGlobals,
 	runtime,
+	getCurrentCycle,
+	getVisualizerHaps,
+	getVisualizerScopeData,
 	isBusy,
 	selectedTrackId,
 	renamingTrackId,
@@ -99,6 +111,10 @@ export function Timeline({
 	onToggleTrackMode,
 	onSetTrackGain,
 	onSetTrackPan,
+	onSetTrackSlider,
+	onSetTrackEffect,
+	onAddTrackEffect,
+	onRemoveTrackEffect,
 	onStartTimingDrag,
 	onSetTrackRange,
 }: TimelineProps) {
@@ -155,7 +171,7 @@ export function Timeline({
 				return <TrackLane
 					block={block}
 					index={index}
-					trackColor={getTrackColor(index)}
+					trackColor={getTrackColor(trackDetails?.color)}
 					trackDetails={trackDetails}
 					timing={getTrackTimingForTimeline(trackDetails, songEndCycle)}
 					songEndCycle={songEndCycle}
@@ -164,6 +180,9 @@ export function Timeline({
 					timelineCells={timelineCells}
 					timelineCellCount={timelineCellCount}
 					runtime={runtime}
+					getCurrentCycle={getCurrentCycle}
+					getVisualizerHaps={getVisualizerHaps}
+					getVisualizerScopeData={getVisualizerScopeData}
 					selected={selectedTrackId === block.id}
 					renaming={renamingTrackId === block.id}
 					renamingValue={renamingTrackValue}
@@ -177,6 +196,10 @@ export function Timeline({
 					onToggleMode={onToggleTrackMode}
 					onSetGain={onSetTrackGain}
 					onSetPan={onSetTrackPan}
+					onSetSlider={onSetTrackSlider}
+					onSetEffect={onSetTrackEffect}
+					onAddEffect={onAddTrackEffect}
+					onRemoveEffect={onRemoveTrackEffect}
 					onStartTimingDrag={onStartTimingDrag}
 					onSetTrackRange={onSetTrackRange}
 					key={block.id}

@@ -65,7 +65,7 @@ export interface TimingDrag {
 	lastPointerClientX: number;
 }
 
-export type HeaderPopover = 'tempo' | 'key' | 'help' | 'length' | 'presets';
+export type HeaderPopover = 'tempo' | 'key' | 'help' | 'length' | 'settings';
 
 export type TrackDetails = ReturnType<typeof getSourceBlockDetails>[number];
 

@@ -13,10 +13,15 @@ export interface SourceBlockDetails extends SourceBlockSummary {
 	expression?: string;
 	marker: boolean;
 	timing: TrackTiming;
+	visualizer?: TrackVisualizer;
+	sliders: SourceSlider[];
+	effects: SourceEffect[];
 	gain?: number;
 	pan?: number;
+	color?: string;
 	gainEditable: boolean;
 	panEditable: boolean;
+	colorEditable: boolean;
 	muted: boolean;
 	soloed: boolean;
 }
@@ -28,6 +33,63 @@ export interface SourceGlobals {
 }
 
 export type TrackTimingMode = 'full' | 'seqPLoop' | 'arrange';
+
+/** A Strudel editor visualizer requested by a source track. */
+export type TrackVisualizer = 'pianoroll' | 'scope';
+
+/** A numeric Strudel `slider(...)` widget projected onto a source lane. */
+export interface SourceSlider {
+	/** Stable within a source lane; based on the slider call's ordinal. */
+	id: string;
+	/** Human-readable method/control name, for example `lpf`. */
+	label: string;
+	value: number;
+	min: number;
+	max: number;
+	step?: number;
+}
+
+export type SourceEffectMethod = 'detune' | 'lpenv' | 'octave' | 'room';
+export type SourceEffectKind = 'numeric' | 'random' | 'dynamic';
+
+/** A supported Strudel effect call projected onto a source lane. */
+export interface SourceEffect {
+	/** Stable within a source lane; based on the effect method and ordinal. */
+	id: string;
+	method: SourceEffectMethod;
+	label: string;
+	kind: SourceEffectKind;
+	/** The original first argument, retained for dynamic/source-backed values. */
+	expression: string;
+	value?: number;
+	min: number;
+	max: number;
+	step: number;
+	defaultValue: number;
+	supportsRandom: boolean;
+}
+
+export interface SourceEffectDefinition {
+	method: SourceEffectMethod;
+	label: string;
+	min: number;
+	max: number;
+	step: number;
+	defaultValue: number;
+	supportsRandom: boolean;
+}
+
+/**
+ * The first FX palette is intentionally small and source-friendly. Keeping
+ * definitions in one place makes the lane control reusable and gives future
+ * Strudel methods a single, typed extension point.
+ */
+export const SOURCE_EFFECT_DEFINITIONS: readonly SourceEffectDefinition[] = [
+	{ method: 'detune', label: 'DETUNE', min: 0, max: 24, step: 0.1, defaultValue: 0, supportsRandom: true },
+	{ method: 'lpenv', label: 'LP ENV', min: -8, max: 8, step: 0.1, defaultValue: 1, supportsRandom: false },
+	{ method: 'octave', label: 'OCTAVE', min: -4, max: 4, step: 1, defaultValue: 0, supportsRandom: false },
+	{ method: 'room', label: 'ROOM', min: 0, max: 1, step: 0.01, defaultValue: 0.5, supportsRandom: false },
+];
 
 export interface TrackTiming {
 	mode: TrackTimingMode;
@@ -50,6 +112,8 @@ const DEFAULT_TRACK_END_CYCLE = 4;
 const setcpmWithDivisionPattern = new RegExp(`(\\bsetcpm\\s*\\(\\s*)(${numericLiteral})(\\s*\\/\\s*)(${numericLiteral})(\\s*\\))`);
 const setcpmSingleValuePattern = new RegExp(`(\\bsetcpm\\s*\\(\\s*)(${numericLiteral})(\\s*\\))`);
 const keyDeclarationPattern = /^(\s*(?:const|let|var)\s+key\s*=\s*)(["'])([^"'\r\n]*)(\2)(\s*;?)/m;
+const colorMethodPattern = /(\.color\s*\(\s*)(["'`])([^"'`\r\n]*)(\2)(\s*\))/;
+const safeColorPattern = /^(?:#[0-9a-f]{3}|#[0-9a-f]{4}|#[0-9a-f]{6}|#[0-9a-f]{8}|(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^()\r\n]*\)|[a-z]+)$/i;
 
 export function getSourceGlobals(source: string): SourceGlobals {
 	const tempoMatch = source.match(new RegExp(`\\bsetcpm\\s*\\(\\s*(${numericLiteral})(?:\\s*\\/\\s*(${numericLiteral}))?\\s*\\)`));
@@ -212,8 +276,320 @@ function numericMethodValue(expression: string, method: 'gain' | 'pan'): number 
 	return Number.isFinite(value) ? value : undefined;
 }
 
-function hasMethod(expression: string, method: 'gain' | 'pan'): boolean {
+function hasMethod(expression: string, method: string): boolean {
 	return new RegExp(`\\.${method}\\s*\\(`).test(expression);
+}
+
+function normalizeSourceColor(value: string): string | undefined {
+	const normalized = value.trim();
+	return normalized && safeColorPattern.test(normalized) ? normalized : undefined;
+}
+
+function sourceColorValue(expression: string): string | undefined {
+	const match = expression.match(colorMethodPattern);
+	return match ? normalizeSourceColor(match[3]) : undefined;
+}
+
+interface SourceSliderCall {
+	index: number;
+	start: number;
+	end: number;
+	valueStart: number;
+	valueEnd: number;
+	arguments: string[];
+	label: string;
+}
+
+interface SourceEffectCall {
+	method: SourceEffectMethod;
+	ordinal: number;
+	start: number;
+	end: number;
+	valueStart: number;
+	valueEnd: number;
+	arguments: string[];
+}
+
+function sourceEffectDefinition(method: string): SourceEffectDefinition | undefined {
+	return SOURCE_EFFECT_DEFINITIONS.find((definition) => definition.method === method);
+}
+
+function skipSourceString(source: string, start: number, end: number): number {
+	const quote = source[start];
+	let escaped = false;
+	for (let index = start + 1; index < end; index += 1) {
+		const character = source[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (character === '\\') {
+			escaped = true;
+			continue;
+		}
+		if (character === quote) return index + 1;
+	}
+	return end;
+}
+
+function findMatchingCallEnd(source: string, open: number): number | undefined {
+	let depth = 1;
+	for (let index = open + 1; index < source.length; index += 1) {
+		const character = source[index];
+		const next = source[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(source, index, source.length) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = source.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? source.length : lineEnd) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = source.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? source.length : commentEnd + 2) - 1;
+			continue;
+		}
+		if (character === '(') depth += 1;
+		if (character === ')' && --depth === 0) return index;
+	}
+	return undefined;
+}
+
+function splitCallArguments(source: string, start: number, end: number): Array<{ start: number; end: number; text: string }> {
+	const result: Array<{ start: number; end: number; text: string }> = [];
+	let argumentStart = start;
+	let depth = 0;
+	for (let index = start; index < end; index += 1) {
+		const character = source[index];
+		const next = source[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(source, index, end) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = source.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? end : Math.min(lineEnd, end)) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = source.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? end : Math.min(commentEnd + 2, end)) - 1;
+			continue;
+		}
+		if (character === '(' || character === '[' || character === '{') depth += 1;
+		if (character === ')' || character === ']' || character === '}') depth = Math.max(0, depth - 1);
+		if (character === ',' && depth === 0) {
+			result.push({ start: argumentStart, end: index, text: source.slice(argumentStart, index) });
+			argumentStart = index + 1;
+		}
+	}
+	result.push({ start: argumentStart, end, text: source.slice(argumentStart, end) });
+	return result;
+}
+
+function sliderMethodLabel(expression: string, start: number, index: number): string {
+	const prefix = expression.slice(0, start);
+	const method = prefix.match(/\.([A-Za-z_$][\w$]*)\s*\(\s*$/)?.[1];
+	return method ? method.toUpperCase() : `SLIDER ${index + 1}`;
+}
+
+function sourceSliderCalls(expression: string): SourceSliderCall[] {
+	const calls: SourceSliderCall[] = [];
+	let callIndex = 0;
+	for (let index = 0; index < expression.length; index += 1) {
+		const character = expression[index];
+		const next = expression[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(expression, index, expression.length) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = expression.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? expression.length : lineEnd) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = expression.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? expression.length : commentEnd + 2) - 1;
+			continue;
+		}
+		if (!expression.startsWith('slider', index) || /[\w$]/.test(expression[index - 1] ?? '') || /[\w$]/.test(expression[index + 6] ?? '')) continue;
+		let open = index + 6;
+		while (/\s/.test(expression[open] ?? '')) open += 1;
+		if (expression[open] !== '(') continue;
+		const close = findMatchingCallEnd(expression, open);
+		if (close === undefined) continue;
+		const args = splitCallArguments(expression, open + 1, close);
+		const firstArg = args[0];
+		if (firstArg && firstArg.text.trim()) {
+			calls.push({
+				index: callIndex,
+				start: index,
+				end: close + 1,
+				valueStart: firstArg.start,
+				valueEnd: firstArg.end,
+				arguments: args.map((argument) => argument.text),
+				label: sliderMethodLabel(expression, index, callIndex),
+			});
+		}
+		callIndex += 1;
+		index = close;
+	}
+	return calls;
+}
+
+function sourceEffectCalls(expression: string): SourceEffectCall[] {
+	const calls: SourceEffectCall[] = [];
+	const ordinals = new Map<SourceEffectMethod, number>();
+	for (let index = 0; index < expression.length; index += 1) {
+		const character = expression[index];
+		const next = expression[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(expression, index, expression.length) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = expression.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? expression.length : lineEnd) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = expression.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? expression.length : commentEnd + 2) - 1;
+			continue;
+		}
+		if (character !== '.') continue;
+
+		let methodEnd = index + 1;
+		while (/[A-Za-z0-9_$]/.test(expression[methodEnd] ?? '')) methodEnd += 1;
+		const method = expression.slice(index + 1, methodEnd);
+		const definition = sourceEffectDefinition(method);
+		if (!definition) continue;
+		let open = methodEnd;
+		while (/\s/.test(expression[open] ?? '')) open += 1;
+		if (expression[open] !== '(') continue;
+		const close = findMatchingCallEnd(expression, open);
+		if (close === undefined) continue;
+		const args = splitCallArguments(expression, open + 1, close);
+		const firstArg = args[0];
+		if (firstArg && firstArg.text.trim()) {
+			const ordinal = ordinals.get(definition.method) ?? 0;
+			ordinals.set(definition.method, ordinal + 1);
+			calls.push({
+				method: definition.method,
+				ordinal,
+				start: index,
+				end: close + 1,
+				valueStart: firstArg.start,
+				valueEnd: firstArg.end,
+				arguments: args.map((argument) => argument.text),
+			});
+		}
+		index = close;
+	}
+	return calls;
+}
+
+function numericSliderArgument(value: string | undefined): number | undefined {
+	if (value === undefined || !value.trim()) return undefined;
+	const trimmed = value.trim();
+	if (!new RegExp(`^${numericLiteral}$`).test(trimmed)) return undefined;
+	const numeric = Number(trimmed);
+	return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function sourceSliders(expression: string): SourceSlider[] {
+	return sourceSliderCalls(expression).flatMap((call) => {
+		const value = numericSliderArgument(call.arguments[0]);
+		if (value === undefined) return [];
+		const min = numericSliderArgument(call.arguments[1]) ?? 0;
+		const max = numericSliderArgument(call.arguments[2]) ?? 1;
+		if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) return [];
+		const step = numericSliderArgument(call.arguments[3]);
+		return [{
+			id: `slider-${call.index}`,
+			label: call.label,
+			value: Math.max(Math.min(value, Math.max(min, max)), Math.min(min, max)),
+			min: Math.min(min, max),
+			max: Math.max(min, max),
+			...(step !== undefined && step > 0 ? { step } : {}),
+		}];
+	});
+}
+
+function sourceEffectKind(value: string, supportsRandom: boolean): SourceEffectKind {
+	return supportsRandom && value.trim() === 'rand' ? 'random' : numericSliderArgument(value) === undefined ? 'dynamic' : 'numeric';
+}
+
+function sourceEffects(expression: string): SourceEffect[] {
+	return sourceEffectCalls(expression).flatMap((call) => {
+		const definition = sourceEffectDefinition(call.method);
+		if (!definition) return [];
+		const argument = call.arguments[0] ?? '';
+		const numericValue = numericSliderArgument(argument);
+		const kind = sourceEffectKind(argument, definition.supportsRandom);
+		const min = definition.min;
+		const max = numericValue === undefined ? definition.max : Math.max(definition.max, numericValue);
+		return [{
+			id: `effect-${call.method}-${call.ordinal}`,
+			method: call.method,
+			label: definition.label,
+			kind,
+			expression: argument.trim(),
+			...(numericValue === undefined ? {} : { value: Math.max(min, Math.min(max, numericValue)) }),
+			min,
+			max,
+			step: definition.step,
+			defaultValue: definition.defaultValue,
+			supportsRandom: definition.supportsRandom,
+		}];
+	});
+}
+
+function withoutSourceComments(source: string): string {
+	let result = '';
+	let quote: string | undefined;
+	let escaped = false;
+	for (let index = 0; index < source.length; index += 1) {
+		const character = source[index];
+		const next = source[index + 1];
+		if (quote) {
+			result += character;
+			if (escaped) escaped = false;
+			else if (character === '\\') escaped = true;
+			else if (character === quote) quote = undefined;
+			continue;
+		}
+		if (character === '"' || character === "'" || character === '`') {
+			quote = character;
+			result += character;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			while (index < source.length && source[index] !== '\n') index += 1;
+			result += '\n';
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			index += 2;
+			while (index < source.length && !(source[index] === '*' && source[index + 1] === '/')) index += 1;
+			if (index < source.length) index += 1;
+			result += ' ';
+			continue;
+		}
+		result += character;
+	}
+	return result;
+}
+
+function sourceVisualizerValue(expression: string): TrackVisualizer | undefined {
+	const uncommentedExpression = withoutSourceComments(expression);
+	const pianorollIndex = uncommentedExpression.search(/\._pianoroll\s*\(/);
+	const scopeIndex = uncommentedExpression.search(/\._scope\s*\(/);
+	if (pianorollIndex < 0 && scopeIndex < 0) return undefined;
+	return scopeIndex > pianorollIndex ? 'scope' : 'pianoroll';
 }
 
 export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_TRACK_END_CYCLE): SourceBlockDetails[] {
@@ -222,8 +598,11 @@ export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_
 			return {
 				...block,
 				timing: { mode: 'full', startCycle: 0, endCycle: defaultEndCycle },
+				sliders: [],
+				effects: [],
 				gainEditable: false,
 				panEditable: false,
+				colorEditable: false,
 				muted: false,
 				soloed: false,
 			};
@@ -233,13 +612,22 @@ export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_
 		const modes = modeFromLabel(block.label);
 		const gain = numericMethodValue(expression, 'gain');
 		const pan = numericMethodValue(expression, 'pan');
+		const color = sourceColorValue(expression);
+		const visualizer = sourceVisualizerValue(expression);
+		const sliders = sourceSliders(expression);
+		const effects = sourceEffects(expression);
 		return {
 			...block,
 			timing: getSourceTrackTiming(expression, defaultEndCycle),
+			...(visualizer === undefined ? {} : { visualizer }),
+			sliders,
+			effects,
 			gain,
 			pan,
+			...(color === undefined ? {} : { color }),
 			gainEditable: !hasMethod(expression, 'gain') || gain !== undefined,
 			panEditable: !hasMethod(expression, 'pan') || pan !== undefined,
+			colorEditable: !hasMethod(expression, 'color') || color !== undefined,
 			...modes,
 		};
 	});
@@ -349,6 +737,133 @@ export function updateTrackGain(source: string, trackId: string, value: number):
 
 export function updateTrackPan(source: string, trackId: string, value: number): string {
 	return updateNumericMethod(source, trackId, 'pan', value);
+}
+
+function formatSliderValue(value: number, step?: number): string {
+	// Preserve compact source while respecting decimal slider steps. Most
+	// Strudel controls use integral values, but values such as `.75` are common
+	// for gain and modulation controls.
+	const precision = step !== undefined && step < 1
+		? Math.min(8, Math.max(2, (String(step).split('.')[1] ?? '').length + 1))
+		: 6;
+	const rounded = Math.round(value * 10 ** precision) / 10 ** precision;
+	return formatNumber(rounded);
+}
+
+function replaceCallFirstArgument(
+	expression: string,
+	call: Pick<SourceSliderCall | SourceEffectCall, 'valueStart' | 'valueEnd' | 'arguments'>,
+	replacement: string,
+): string {
+	const firstArgument = call.arguments[0] ?? '';
+	const leadingWhitespace = firstArgument.match(/^\s*/)?.[0].length ?? 0;
+	const trailingWhitespace = firstArgument.match(/\s*$/)?.[0].length ?? 0;
+	const valueStart = call.valueStart + leadingWhitespace;
+	const valueEnd = Math.max(valueStart, call.valueEnd - trailingWhitespace);
+	return `${expression.slice(0, valueStart)}${replacement}${expression.slice(valueEnd)}`;
+}
+
+/** Update one numeric `slider(...)` widget without disturbing its bounds. */
+export function updateTrackSlider(source: string, trackId: string, sliderId: string, value: number): string {
+	if (!Number.isFinite(value)) return source;
+	const match = sliderId.match(/^slider-(\d+)$/);
+	if (!match) return source;
+	const sliderIndex = Number(match[1]);
+	if (!Number.isInteger(sliderIndex) || sliderIndex < 0) return source;
+
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const call = sourceSliderCalls(expression).find((candidate) => candidate.index === sliderIndex);
+		if (!call) return { label, expression };
+		const current = numericSliderArgument(call.arguments[0]);
+		const min = numericSliderArgument(call.arguments[1]) ?? 0;
+		const max = numericSliderArgument(call.arguments[2]) ?? 1;
+		if (current === undefined || !Number.isFinite(min) || !Number.isFinite(max) || min === max) return { label, expression };
+		const step = numericSliderArgument(call.arguments[3]);
+		const next = Math.max(Math.min(value, Math.max(min, max)), Math.min(min, max));
+		return {
+			label,
+			expression: replaceCallFirstArgument(expression, call, formatSliderValue(next, step)),
+		};
+	});
+}
+
+function effectIdParts(effectId: string): { method: SourceEffectMethod; ordinal: number } | undefined {
+	const match = effectId.match(/^effect-(detune|lpenv|octave|room)-(\d+)$/);
+	if (!match) return undefined;
+	const ordinal = Number(match[2]);
+	return Number.isInteger(ordinal) && ordinal >= 0
+		? { method: match[1] as SourceEffectMethod, ordinal }
+		: undefined;
+}
+
+function effectNumericBounds(definition: SourceEffectDefinition, current: number | undefined): { min: number; max: number } {
+	return {
+		min: definition.min,
+		max: current === undefined ? definition.max : Math.max(definition.max, current),
+	};
+}
+
+/** Update one supported Strudel FX call, preserving dynamic/random modes. */
+export function updateTrackEffect(source: string, trackId: string, effectId: string, value: number | 'rand'): string {
+	const parts = effectIdParts(effectId);
+	if (!parts) return source;
+	const definition = sourceEffectDefinition(parts.method);
+	if (!definition || (value === 'rand' && !definition.supportsRandom)) return source;
+
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const call = sourceEffectCalls(expression).find((candidate) => candidate.method === parts.method && candidate.ordinal === parts.ordinal);
+		if (!call) return { label, expression };
+		if (value === 'rand') return { label, expression: replaceCallFirstArgument(expression, call, 'rand') };
+
+		const current = numericSliderArgument(call.arguments[0]);
+		const bounds = effectNumericBounds(definition, current);
+		const normalized = Math.max(bounds.min, Math.min(bounds.max, value));
+		return {
+			label,
+			expression: replaceCallFirstArgument(expression, call, formatSliderValue(normalized, definition.step)),
+		};
+	});
+}
+
+/** Add one supported Strudel effect if the track does not already use it. */
+export function addTrackEffect(source: string, trackId: string, method: SourceEffectMethod): string {
+	const definition = sourceEffectDefinition(method);
+	if (!definition) return source;
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		if (sourceEffectCalls(expression).some((call) => call.method === method)) return { label, expression };
+		return {
+			label,
+			expression: appendExpressionCall(expression, `.${method}(${formatSliderValue(definition.defaultValue, definition.step)})`),
+		};
+	});
+}
+
+/** Remove one supported Strudel effect call while keeping the chain valid. */
+export function removeTrackEffect(source: string, trackId: string, effectId: string): string {
+	const parts = effectIdParts(effectId);
+	if (!parts) return source;
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const call = sourceEffectCalls(expression).find((candidate) => candidate.method === parts.method && candidate.ordinal === parts.ordinal);
+		if (!call) return { label, expression };
+		return { label, expression: `${expression.slice(0, call.start)}${expression.slice(call.end)}` };
+	});
+}
+
+function replaceColorMethod(expression: string, color: string): string | undefined {
+	if (colorMethodPattern.test(expression)) {
+		return expression.replace(colorMethodPattern, (_match, prefix: string, quote: string, _oldColor: string, closingQuote: string, suffix: string) => `${prefix}${quote}${color}${closingQuote}${suffix}`);
+	}
+	if (hasMethod(expression, 'color')) return undefined;
+	return appendExpressionCall(expression, `.color(${JSON.stringify(color)})`);
+}
+
+export function updateTrackColor(source: string, trackId: string, value: string): string {
+	const color = normalizeSourceColor(value);
+	if (!color) return source;
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const updatedExpression = replaceColorMethod(expression, color);
+		return updatedExpression === undefined ? { label, expression } : { label, expression: updatedExpression };
+	});
 }
 
 /**

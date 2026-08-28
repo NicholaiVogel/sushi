@@ -104,6 +104,8 @@ export function useStudioWebMcp({
 			line: track.line,
 			...(track.label === undefined ? {} : { label: track.label }),
 			...(track.expression === undefined ? {} : { expression: track.expression }),
+			...(track.color === undefined ? {} : { color: track.color }),
+			colorEditable: track.colorEditable,
 			timing: getTrackTimingForTimeline(track, current.songEndCycle),
 			gain: { ...(track.gain === undefined ? {} : { value: track.gain }), editable: track.gainEditable },
 			pan: { ...(track.pan === undefined ? {} : { value: track.pan }), editable: track.panEditable },
