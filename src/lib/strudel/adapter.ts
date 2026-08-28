@@ -453,10 +453,13 @@ function isAudioPolicyError(error: unknown): boolean {
  * The only application layer that talks to Strudel.
  *
  * Importing @strudel/web at module evaluation time would execute its browser
- * setup during Astro's server build, so the package is intentionally loaded
- * inside init(). Evaluation requests are serialized because the REPL reports
- * errors through a shared callback. Failed candidates restore the last valid
- * source because the REPL hushes before evaluating a new source document.
+ * setup during Astro's server build, so the browser's unbundled web entry is
+ * intentionally loaded inside init(). That entry shares @strudel/core and
+ * @strudel/transpiler with the CodeMirror package, which keeps widget methods
+ * and registrations on the same runtime. Evaluation requests are serialized
+ * because the REPL reports errors through a shared callback. Failed candidates
+ * restore the last valid source because the REPL hushes before evaluating a new
+ * source document.
  */
 export class StrudelAdapter {
 	private destroyed = false;
@@ -484,7 +487,7 @@ export class StrudelAdapter {
 
 	public constructor(
 		private readonly onRuntimeUpdate?: (update: AdapterRuntimeUpdate) => void,
-		private readonly loadModule: StrudelModuleLoader = async () => (await import('@strudel/web')) as unknown as StrudelModule,
+		private readonly loadModule: StrudelModuleLoader = async () => (await import('@strudel/web/web.mjs')) as unknown as StrudelModule,
 		private readonly onEvaluation?: (update: StrudelEvaluationUpdate) => void,
 	) {}
 
@@ -502,10 +505,20 @@ export class StrudelAdapter {
 
 			const module = await this.loadModule();
 			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
-			// @strudel/web does not expose Pattern, while the editor package adds
-			// its official widget methods to the shared @strudel/core prototype.
-			// Give the compatibility layer the same prototype even when the web
-			// bundle keeps that export private.
+			// The editor package owns the official widget methods and transpiler
+			// registrations. Load its lightweight widget module before the runtime's
+			// prebake so both packages decorate the same Pattern prototype. If an
+			// embedding host omits CodeMirror, the compatibility registrations below
+			// still keep reduced runtimes playable.
+			try {
+				await import('@strudel/codemirror/widget.mjs');
+			} catch {
+				// `registerSushiCompatibility` supplies a reduced fallback for hosts
+				// that cannot load the optional editor widget module.
+			}
+			// The unbundled web entry exports Pattern, while older embedding hosts
+			// may still provide the self-contained bundle. Give the compatibility
+			// layer the shared prototype in either case.
 			if (!module.Pattern?.prototype) {
 				try {
 					const core = await import('@strudel/core') as { Pattern?: { prototype: Record<string, unknown> } };

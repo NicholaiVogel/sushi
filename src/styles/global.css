@@ -751,6 +751,7 @@ a { color: inherit; }
 
 .source-editor-shell {
 	display: block;
+	position: relative;
 	min-height: 0;
 	flex: 1 1 auto;
 	border-bottom: 1px solid var(--line);
@@ -787,6 +788,60 @@ a { color: inherit; }
 	--font-family: var(--mono);
 	--font-size: 12px;
 }
+
+.source-editor-host-hidden { visibility: hidden; pointer-events: none; }
+
+.source-editor-fallback {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	width: 100%;
+	height: 100%;
+	min-height: 0;
+	background: #0a0c0d;
+}
+
+.source-editor-fallback-input {
+	width: 100%;
+	height: 100%;
+	min-height: 0;
+	padding: 14px;
+	border: 0;
+	outline: 0;
+	resize: none;
+	background: transparent;
+	color: #dce5d7;
+	font-family: var(--mono);
+	font-size: 12px;
+	line-height: var(--editor-line-height);
+	tab-size: 2;
+	white-space: pre;
+}
+
+.source-editor-fallback-input:focus { outline: 0; }
+
+.source-editor-error {
+	position: absolute;
+	top: 10px;
+	right: 10px;
+	left: 10px;
+	z-index: 20;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 8px 10px;
+	border: 1px solid rgba(255, 122, 104, 0.55);
+	background: rgba(17, 22, 23, 0.96);
+	color: var(--danger);
+	font-family: var(--mono);
+	font-size: 9px;
+	line-height: 1.35;
+}
+
+.source-editor-error span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-editor-error button { flex: 0 0 auto; padding: 5px 8px; border: 1px solid rgba(255, 122, 104, 0.65); border-radius: 3px; background: transparent; color: var(--danger); font-family: var(--mono); font-size: 9px; text-transform: uppercase; }
+.source-editor-error button:hover { background: rgba(255, 122, 104, 0.12); }
 
 .source-editor-host .cm-scroller {
 	padding-top: 14px !important;

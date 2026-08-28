@@ -24,6 +24,14 @@ declare module '@strudel/web' {
 	export function evaluate(code: string, autoplay?: boolean): Promise<unknown>;
 }
 
+// The browser-facing web entry intentionally re-exports the external Strudel
+// packages instead of the self-contained dist bundle. Keeping this declaration
+// separate lets the adapter opt into that shared-runtime entry without
+// changing the public package typings used elsewhere in the app.
+declare module '@strudel/web/web.mjs' {
+	export * from '@strudel/web';
+}
+
 declare module '@strudel/core' {
 	export const Pattern: { prototype: Record<string, unknown> };
 }
@@ -60,6 +68,12 @@ declare module '@strudel/codemirror' {
 	export function updateSliderWidgets(view: StrudelEditorView, widgets: Array<Record<string, any>>): void;
 	export function updateWidgets(view: StrudelEditorView, widgets: Array<Record<string, any>>): void;
 	export const codemirrorSettings: { get(): StrudelEditorSettings };
+}
+
+// Importing this module registers Strudel's official inline visualizer widgets
+// on the shared Pattern/transpiler runtime before source evaluation begins.
+declare module '@strudel/codemirror/widget.mjs' {
+	export function registerWidget(type: string, fn?: (...args: any[]) => unknown): void;
 }
 
 declare module '@strudel/soundfonts' {

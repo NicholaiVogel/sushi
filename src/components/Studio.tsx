@@ -93,6 +93,7 @@ export default function Studio() {
 	const [localProjectsError, setLocalProjectsError] = useState<string | null>(null);
 	const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
 	const [editorModule, setEditorModule] = useState<StrudelCodeMirrorModule | null>(null);
+	const [editorModuleError, setEditorModuleError] = useState<string | null>(null);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
@@ -104,6 +105,7 @@ export default function Studio() {
 	const sourceEditorViewRef = useRef<StrudelEditorView | null>(null);
 	const editorEvaluationRef = useRef<StrudelEvaluationUpdate | null>(null);
 	const editorModuleRef = useRef<StrudelCodeMirrorModule | null>(null);
+	const editorLoadAttemptRef = useRef(0);
 	const projectImportInputRef = useRef<HTMLInputElement | null>(null);
 	const timelineViewportRef = useRef<HTMLElement | null>(null);
 	const timelineShellRef = useRef<HTMLElement | null>(null);
@@ -218,21 +220,31 @@ export default function Studio() {
 		if (update) applyEditorEvaluation(update);
 	}, [applyEditorEvaluation]);
 
-	useEffect(() => {
-		let active = true;
+	const loadEditorModule = useCallback(() => {
+		const attempt = editorLoadAttemptRef.current + 1;
+		editorLoadAttemptRef.current = attempt;
+		editorModuleRef.current = null;
+		setEditorModule(null);
+		setEditorModuleError(null);
 		void import('@strudel/codemirror').then((loadedEditorModule) => {
-			if (!active) return;
+			if (editorLoadAttemptRef.current !== attempt) return;
 			editorModuleRef.current = loadedEditorModule;
 			setEditorModule(loadedEditorModule);
 			const update = editorEvaluationRef.current;
 			if (update) applyEditorEvaluation(update);
 		}).catch((error) => {
+			if (editorLoadAttemptRef.current !== attempt) return;
 			console.error('[sushi] could not load the Strudel code editor', error);
+			setEditorModuleError(error instanceof Error ? error.message : String(error));
 		});
-		return () => {
-			active = false;
-		};
 	}, [applyEditorEvaluation]);
+
+	useEffect(() => {
+		loadEditorModule();
+		return () => {
+			editorLoadAttemptRef.current += 1;
+		};
+	}, [loadEditorModule]);
 
 	useEffect(() => {
 		const generation = studioGenerationRef.current + 1;
@@ -1384,7 +1396,6 @@ export default function Studio() {
 	useEffect(() => stopTimelineSeekDrag, [stopTimelineSeekDrag]);
 
 	const blocks = useMemo(() => getSourceBlocks(studio.lastValid), [studio.lastValid]);
-	const draftBlocks = useMemo(() => getSourceBlocks(studio.draft), [studio.draft]);
 	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft).map((block) => [block.id, block])), [studio.draft]);
 	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid).map((block) => [block.id, block])), [studio.lastValid]);
 	const contextMenuTrack = useMemo(() => blocks.find((block) => block.id === contextMenu?.trackId), [blocks, contextMenu?.trackId]);
@@ -1511,9 +1522,9 @@ export default function Studio() {
 			<div className="studio-body" style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
 				<SourceEditor
 					draft={studio.draft}
-					draftBlockCount={draftBlocks.length}
 					diagnostics={studio.diagnostics}
 					editorModule={editorModule}
+					editorError={editorModuleError}
 					sourceEditorViewRef={sourceEditorViewRef}
 					runtimeTransport={studio.runtime.transport}
 					getCurrentCycle={getCurrentCycle}
@@ -1528,6 +1539,7 @@ export default function Studio() {
 					onValidate={() => { void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studioRef.current.revision }); }}
 					onStop={() => { void dispatch({ type: 'stop' }); }}
 					onReady={handleEditorReady}
+					onRetryEditor={loadEditorModule}
 				/>
 				<div className="editor-resize-divider">
 					<button
