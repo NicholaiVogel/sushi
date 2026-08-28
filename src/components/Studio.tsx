@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent as ReactChangeEvent, type ClipboardEvent as ReactClipboardEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent as ReactChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
 	createInitialProject,
 	DEFAULT_SONG_END_CYCLE,
@@ -9,6 +9,7 @@ import {
 	LEGACY_DEFAULT_SOURCE,
 	type SourceDiagnostic,
 } from '../lib/project/model';
+import type { StrudelEditorView } from '@strudel/codemirror';
 import {
 	getSourceBlockDetails,
 	getSourceGlobals,
@@ -29,19 +30,17 @@ import {
 	updateTrackEffect,
 	updateTrackSlider,
 } from '../lib/project/source-mapper';
-import { getSourceLineNumbers, replaceSourceSelection } from '../lib/project/editor';
 import type { EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
 	getTimelineZoomForVisibleCycles,
 } from '../lib/project/timeline';
-import { highlightStrudel } from '../lib/project/syntax-highlight';
 import { listStoredProjects, loadProjectSnapshot, parseProjectExport, saveProjectSnapshot, serializeProjectSnapshot, type StoredProjectSnapshot, type StoredProjectSummary } from '../lib/project/storage';
-import { isAudioLockedError, StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate, type StrudelVisualizer, type VisualizerHap } from '../lib/strudel/adapter';
+import { isAudioLockedError, StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate, type StrudelEvaluationUpdate, type StrudelHap, type StrudelVisualizer, type VisualizerHap } from '../lib/strudel/adapter';
 import type { WebMcpMutationResult, WebMcpRegistration } from '../lib/webmcp/tools';
 import { TransactionCache } from '../lib/webmcp/transaction-cache';
 import { StudioHeader } from './studio/StudioHeader';
-import { SourceEditor, CanvasDiagnostic } from './studio/SourceEditor';
+import { SourceEditor, CanvasDiagnostic, type StrudelCodeMirrorModule } from './studio/SourceEditor';
 import { Timeline } from './studio/Timeline';
 import { TrackContextMenu } from './studio/TrackContextMenu';
 import { useStudioWebMcp } from './studio/useStudioWebMcp';
@@ -93,23 +92,25 @@ export default function Studio() {
 	const [localProjectsLoading, setLocalProjectsLoading] = useState(false);
 	const [localProjectsError, setLocalProjectsError] = useState<string | null>(null);
 	const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
+	const [editorModule, setEditorModule] = useState<StrudelCodeMirrorModule | null>(null);
+	const [editorModuleError, setEditorModuleError] = useState<string | null>(null);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
 	const mountedRef = useRef(true);
-	const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
-	const sourceHighlightRef = useRef<HTMLPreElement | null>(null);
-	const editorGutterRef = useRef<HTMLDivElement | null>(null);
 	const studioShellRef = useRef<HTMLDivElement | null>(null);
 	const transportClockRef = useRef<HTMLSpanElement | null>(null);
 	const transportCycleRef = useRef<HTMLSpanElement | null>(null);
 	const liveSourceGlobalsRef = useRef<ReturnType<typeof getSourceGlobals> | null>(null);
+	const sourceEditorViewRef = useRef<StrudelEditorView | null>(null);
+	const editorEvaluationRef = useRef<StrudelEvaluationUpdate | null>(null);
+	const editorModuleRef = useRef<StrudelCodeMirrorModule | null>(null);
+	const editorLoadAttemptRef = useRef(0);
 	const projectImportInputRef = useRef<HTMLInputElement | null>(null);
 	const timelineViewportRef = useRef<HTMLElement | null>(null);
 	const timelineShellRef = useRef<HTMLElement | null>(null);
 	const timelineZoomAnchorRef = useRef<number | null>(null);
 	const editorResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
-	const editorScrollFrameRef = useRef<number | null>(null);
 	const pendingTrackSourceRef = useRef<{ source: string; baseRevision: number } | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const sourceCommitQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -128,36 +129,6 @@ export default function Studio() {
 	const sourceTransactionsRef = useRef(new TransactionCache<WebMcpMutationResult>(SOURCE_HISTORY_LIMIT));
 	const webmcpRegistrationRef = useRef<WebMcpRegistration | null>(null);
 	const webmcpAvailableRef = useRef(false);
-
-	const applyEditorScroll = useCallback(() => {
-		const editor = sourceEditorRef.current;
-		if (!editor) return;
-		const { scrollLeft, scrollTop } = editor;
-		if (sourceHighlightRef.current) {
-			// Keep the highlight layer out of the browser's nested scrolling
-			// algorithm. Transforming the overflowing pre directly means the
-			// transparent textarea and its selection paint from the same origin,
-			// even when a browser reports scroll events before layout settles.
-			sourceHighlightRef.current.scrollTop = 0;
-			sourceHighlightRef.current.scrollLeft = 0;
-			sourceHighlightRef.current.style.transform = `translate(${-scrollLeft}px, ${-scrollTop}px)`;
-		}
-		if (editorGutterRef.current) editorGutterRef.current.scrollTop = scrollTop;
-	}, []);
-
-	const syncEditorScroll = useCallback(() => {
-		applyEditorScroll();
-		if (typeof window === 'undefined') return;
-		if (editorScrollFrameRef.current !== null) window.cancelAnimationFrame(editorScrollFrameRef.current);
-		editorScrollFrameRef.current = window.requestAnimationFrame(() => {
-			editorScrollFrameRef.current = null;
-			applyEditorScroll();
-		});
-	}, [applyEditorScroll]);
-
-	useEffect(() => () => {
-		if (editorScrollFrameRef.current !== null) window.cancelAnimationFrame(editorScrollFrameRef.current);
-	}, []);
 
 	const handleEditorResizePointerMove = useCallback((event: PointerEvent) => {
 		const drag = editorResizeRef.current;
@@ -233,11 +204,53 @@ export default function Studio() {
 		setSourceHistoryVersion((version) => version + 1);
 	}, []);
 
+	const applyEditorEvaluation = useCallback((update: StrudelEvaluationUpdate) => {
+		editorEvaluationRef.current = update;
+		const editor = sourceEditorViewRef.current;
+		const editorModule = editorModuleRef.current;
+		if (!editor || !editorModule) return;
+		const widgets = update.meta?.widgets ?? [];
+		editorModule.updateSliderWidgets(editor, widgets.filter((widget) => widget.type === 'slider'));
+		editorModule.updateWidgets(editor, widgets.filter((widget) => widget.type !== 'slider'));
+		editorModule.updateMiniLocations(editor, update.meta?.miniLocations ?? []);
+	}, []);
+
+	const handleEditorReady = useCallback(() => {
+		const update = editorEvaluationRef.current;
+		if (update) applyEditorEvaluation(update);
+	}, [applyEditorEvaluation]);
+
+	const loadEditorModule = useCallback(() => {
+		const attempt = editorLoadAttemptRef.current + 1;
+		editorLoadAttemptRef.current = attempt;
+		editorModuleRef.current = null;
+		setEditorModule(null);
+		setEditorModuleError(null);
+		void import('@strudel/codemirror').then((loadedEditorModule) => {
+			if (editorLoadAttemptRef.current !== attempt) return;
+			editorModuleRef.current = loadedEditorModule;
+			setEditorModule(loadedEditorModule);
+			const update = editorEvaluationRef.current;
+			if (update) applyEditorEvaluation(update);
+		}).catch((error) => {
+			if (editorLoadAttemptRef.current !== attempt) return;
+			console.error('[sushi] could not load the Strudel code editor', error);
+			setEditorModuleError(error instanceof Error ? error.message : String(error));
+		});
+	}, [applyEditorEvaluation]);
+
+	useEffect(() => {
+		loadEditorModule();
+		return () => {
+			editorLoadAttemptRef.current += 1;
+		};
+	}, [loadEditorModule]);
+
 	useEffect(() => {
 		const generation = studioGenerationRef.current + 1;
 		studioGenerationRef.current = generation;
 		mountedRef.current = true;
-		const adapter = new StrudelAdapter(patchRuntime);
+		const adapter = new StrudelAdapter(patchRuntime, undefined, applyEditorEvaluation);
 		adapterRef.current = adapter;
 		const isCurrentSession = () => mountedRef.current && studioGenerationRef.current === generation;
 
@@ -371,7 +384,7 @@ export default function Studio() {
 			adapter.destroy();
 			adapterRef.current = null;
 		};
-	}, [patchRuntime, patchStudio]);
+	}, [applyEditorEvaluation, patchRuntime, patchStudio]);
 
 	const persistStudioSnapshot = useCallback(async (
 		snapshot: StoredProjectSnapshot = snapshotFromStudio(studioRef.current),
@@ -526,36 +539,20 @@ export default function Studio() {
 	}, []);
 
 	const handleEditorPaste = useCallback(
-		(event: ReactClipboardEvent<HTMLTextAreaElement>) => {
-			const pastedText = event.clipboardData.getData('text/plain');
-			if (!pastedText) return;
-
-			event.preventDefault();
-			const editor = event.currentTarget;
+		(source: string, _caret: number) => {
 			const current = studioRef.current;
-			const replacement = replaceSourceSelection(
-				current.draft,
-				pastedText,
-				editor.selectionStart,
-				editor.selectionEnd,
-			);
 			const baseRevision = current.revision;
 			cancelPendingTrackCommit();
 			patchStudio({
-				draft: replacement.source,
+				draft: source,
 				...(current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
 			});
 			// A complete paste is an intentional source replacement. Validate it as
 			// one transaction so the timeline follows the pasted song immediately;
 			// invalid source stays a draft and is surfaced with diagnostics.
-			void commitSource(replacement.source, { expectedRevision: baseRevision });
-			requestAnimationFrame(() => {
-				if (sourceEditorRef.current !== editor) return;
-				editor.setSelectionRange(replacement.caret, replacement.caret);
-				syncEditorScroll();
-			});
+			void commitSource(source, { expectedRevision: baseRevision });
 		},
-		[cancelPendingTrackCommit, commitSource, patchStudio, syncEditorScroll],
+		[cancelPendingTrackCommit, commitSource, patchStudio],
 	);
 
 	const queueTrackCommit = useCallback(
@@ -1413,16 +1410,16 @@ export default function Studio() {
 	const isDirty = studio.draft !== studio.lastValid;
 	const isBusy = studio.phase === 'booting' || studio.phase === 'validating';
 	const canPlay = !isBusy && studio.runtime.audioState !== 'initializing';
-	const draftLines = useMemo(() => getSourceLineNumbers(studio.draft), [studio.draft]);
 	const activeLaneCount = blocks.length.toString().padStart(2, '0');
 	const currentSeconds = cyclesToSeconds(studio.runtime.currentCycle, sourceGlobals);
 	const songEndSeconds = cyclesToSeconds(studio.songEndCycle, sourceGlobals);
+	const getCurrentCycle = useCallback(() => adapterRef.current?.getCurrentCycle() ?? studioRef.current.runtime.currentCycle, []);
+	const getEditorHaps = useCallback((begin: number, end: number): StrudelHap[] => adapterRef.current?.getEditorHaps(begin, end) ?? [], []);
 	const getVisualizerHaps = useCallback((trackId: string, visualizer: StrudelVisualizer, begin: number, end: number): VisualizerHap[] => adapterRef.current?.getVisualizerHaps(trackId, visualizer, begin, end) ?? [], []);
 	const getVisualizerScopeData = useCallback((trackId: string): ArrayLike<number> | undefined => adapterRef.current?.getVisualizerScopeData(trackId), []);
 	const getVisualizerSpectrumData = useCallback((trackId: string): ArrayLike<number> | undefined => adapterRef.current?.getVisualizerSpectrumData(trackId), []);
 	const cycleStep = getSourceCycleStep(studio.lastValid);
 	const saveStateLabel = studio.persistenceState === 'loading' ? 'LOADING' : studio.persistenceState === 'unavailable' ? 'LOCAL ONLY' : isDirty ? 'DRAFT' : 'SAVED';
-	const highlightedSource = useMemo(() => highlightStrudel(studio.draft), [studio.draft]);
 	const timelineCellCount = Math.max(1, Math.ceil(studio.songEndCycle / TIMELINE_SNAP_CYCLE));
 	const timelineSongCycles = Math.max(TIMELINE_SNAP_CYCLE, studio.songEndCycle);
 	const zoomOutCycles = timelineSongCycles;
@@ -1475,10 +1472,6 @@ export default function Studio() {
 		if (renamingTrackId && !blocks.some((block) => block.id === renamingTrackId)) cancelTrackRename();
 	}, [blocks, cancelTrackRename, contextMenu, renamingTrackId, selectedTrackId]);
 
-	useEffect(() => {
-		syncEditorScroll();
-	}, [studio.draft, syncEditorScroll]);
-
 	return (
 		<div className="studio-shell" ref={studioShellRef}>
 			<StudioHeader
@@ -1529,22 +1522,25 @@ export default function Studio() {
 			<div className="studio-body" style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
 				<SourceEditor
 					draft={studio.draft}
-					draftLines={draftLines}
-					highlightedSource={highlightedSource}
 					diagnostics={studio.diagnostics}
-					sourceEditorRef={sourceEditorRef}
-					sourceHighlightRef={sourceHighlightRef}
-					editorGutterRef={editorGutterRef}
+					editorModule={editorModule}
+					editorError={editorModuleError}
+					sourceEditorViewRef={sourceEditorViewRef}
+					runtimeTransport={studio.runtime.transport}
+					getCurrentCycle={getCurrentCycle}
+					getEditorHaps={getEditorHaps}
 					onPaste={handleEditorPaste}
 					onChange={(nextDraft) => {
 						patchStudio({
 							draft: nextDraft,
 							...(studioRef.current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
 						});
-									}}
-									onScroll={syncEditorScroll}
-									onValidate={() => { void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studioRef.current.revision }); }}
-								/>
+					}}
+					onValidate={() => { void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studioRef.current.revision }); }}
+					onStop={() => { void dispatch({ type: 'stop' }); }}
+					onReady={handleEditorReady}
+					onRetryEditor={loadEditorModule}
+				/>
 				<div className="editor-resize-divider">
 					<button
 						className="editor-resize-handle"

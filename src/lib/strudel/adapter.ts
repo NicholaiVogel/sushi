@@ -7,11 +7,12 @@ interface StrudelModule {
 	initStrudel(options?: {
 		onEvalError?: (error: unknown) => void;
 		onToggle?: (started: boolean) => void;
+		afterEval?: (update: StrudelEvaluationUpdate) => void;
 		prebake?: () => void | Promise<void>;
 		beforeStart?: () => void | Promise<void>;
 		sync?: boolean;
-		setInterval?: typeof setInterval;
-		clearInterval?: typeof clearInterval;
+		setInterval?: (...args: any[]) => any;
+		clearInterval?: (...args: any[]) => void;
 	}): Promise<StrudelRepl>;
 	register?: (name: string, func: (...args: any[]) => unknown, patternify?: boolean) => unknown;
 	ref?: (accessor: () => unknown) => unknown;
@@ -22,7 +23,7 @@ interface StrudelModule {
 	samples?: (sampleMap: string, baseUrl?: string, options?: Record<string, unknown>) => Promise<void>;
 	registerSound?: (name: string, trigger: (time: number, value: Record<string, any>, onended: () => void) => Promise<unknown>, data?: Record<string, unknown>) => void;
 	getAnalyserById?: (id: number, fftSize?: number, smoothingTimeConstant?: number) => unknown;
-	getAnalyzerData?: (type?: 'time' | 'frequency', id?: number) => ArrayLike<number>;
+	getAnalyzerData?: (...args: any[]) => ArrayLike<number>;
 	getAudioContext?: () => AudioContext;
 	getSound?: (name: string) => { data?: Record<string, any> } | undefined;
 	getSoundIndex?: (value: unknown, size: number) => number;
@@ -45,20 +46,33 @@ interface SoundfontRuntime {
 	getFontBufferSource: (name: string, value: Record<string, any>, audioContext: AudioContext) => Promise<AudioBufferSourceNode>;
 }
 
-interface StrudelHap {
+export interface StrudelHap {
 	value?: Record<string, any>;
 	hasOnset?: () => boolean;
 	whole?: { begin?: unknown; end?: unknown };
 	endClipped?: unknown;
 	duration?: unknown;
-	context?: Record<string, unknown>;
-	setContext?: (context: Record<string, unknown>) => StrudelHap;
+	context?: Record<string, any>;
+	setContext?: (context: Record<string, any>) => StrudelHap;
 }
 
-interface StrudelPattern {
+export interface StrudelPattern {
 	queryArc?: (begin: number, end: number, controls?: Record<string, unknown>) => StrudelHap[];
 	withHaps?: (func: (haps: StrudelHap[], state: { controls?: Record<string, unknown> }) => StrudelHap[]) => StrudelPattern;
 	analyze?: (id?: number) => StrudelPattern;
+}
+
+export interface StrudelEvaluationMeta {
+	miniLocations?: Array<[number, number]>;
+	widgets?: Array<Record<string, any>>;
+}
+
+export interface StrudelEvaluationUpdate {
+	code: string;
+	pattern: StrudelPattern;
+	meta?: StrudelEvaluationMeta;
+	range?: [number, number];
+	widgetRemoved?: boolean;
 }
 
 export type StrudelVisualizer = TrackVisualizer;
@@ -147,6 +161,9 @@ function appendRuntimeSilence(source: string): string {
  * rebuilding the pattern graph on every change.
  */
 let activeSliderValues: Map<string, number> | undefined;
+let sliderMessageListenerInstalled = false;
+const visualizerWrapperMarker = Symbol('sushiVisualizerWrapper');
+const registeredVisualizerNames = new WeakMap<object, Set<string>>();
 
 function unpureSliderValue(value: unknown): unknown {
 	if (value && typeof value === 'object' && '__pure' in value) {
@@ -175,36 +192,69 @@ function registerSushiCompatibility(module: StrudelModule, sliderValues: Map<str
 		globalScope.sliderWithID = typeof registered === 'function' ? registered : sliderWithID;
 	}
 
-	// These drawing hooks are supplied by strudel.cc's editor packages, not by
-	// @strudel/web. Keep the hooks in the pattern graph, rather than dropping
-	// identity methods, so the Sushi timeline can query the same events that the
-	// scheduler will play. The source lane id is added later by Strudel's REPL
-	// when it calls Pattern.p(), and therefore survives the final stacked pattern.
+	if (!sliderMessageListenerInstalled && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+		window.addEventListener('message', (event) => {
+			const data = event.data as { type?: unknown; id?: unknown; value?: unknown } | null;
+			if (data?.type !== 'cm-slider') return;
+			const key = String(data.id);
+			const value = Number(data.value);
+			if (Number.isFinite(value) && activeSliderValues?.has(key)) activeSliderValues.set(key, value);
+		});
+		sliderMessageListenerInstalled = true;
+	}
+
+	const tagVisualizerPattern = (pattern: unknown, visualizer: StrudelVisualizer, analyzerId?: number): unknown => {
+		const candidate = pattern as StrudelPattern;
+		if (typeof candidate.withHaps !== 'function') return pattern;
+		const analyze = candidate.analyze;
+		const analyzed = (visualizer === 'scope' || visualizer === 'spectrum') && analyzerId !== undefined && typeof analyze === 'function'
+			? analyze.call(candidate, analyzerId)
+			: candidate;
+		if (typeof analyzed.withHaps !== 'function') return analyzed;
+		return analyzed.withHaps((haps, state) => {
+			// Scheduler queries are the audio-critical path. The lane identity is
+			// only needed by Sushi's visualizer query, so leave those haps untouched
+			// when Cyclist/NeoCyclist asks for events to play. This avoids cloning and
+			// re-contextualizing every event on every scheduler tick.
+			if (state.controls?.cyclist || state.controls?.neocyclist) return haps;
+			return haps.map((hap) => hap.setContext?.({
+				...(hap.context ?? {}),
+				sushiVisualizer: visualizer,
+				sushiPatternId: typeof state.controls?.id === 'string' ? state.controls.id : undefined,
+				...(analyzerId === undefined ? {} : { sushiAnalyzerId: analyzerId }),
+			}) ?? hap);
+		});
+	};
+
+	// These drawing hooks are supplied by strudel.cc's editor package when it
+	// is loaded. Wrap those methods instead of replacing them, so the official
+	// inline widgets keep their behavior while the Sushi timeline can continue
+	// to query the same tagged events. Older/fake runtimes without the methods
+	// use the registration fallback below.
 	let nextAnalyzerId = 1000;
 	const registerVisualizer = (name: string, visualizer: StrudelVisualizer) => {
-		if (typeof module.Pattern?.prototype[name] === 'function') return;
+		const prototype = module.Pattern?.prototype;
+		const existing = prototype?.[name];
+		if (typeof existing === 'function') {
+			if ((existing as { [visualizerWrapperMarker]?: boolean })[visualizerWrapperMarker]) return;
+			const wrapped = function (this: unknown, ...args: unknown[]) {
+				const result = existing.apply(this, args);
+				const analyzerId = visualizer === 'scope' || visualizer === 'spectrum' ? nextAnalyzerId++ : undefined;
+				return tagVisualizerPattern(result, visualizer, analyzerId);
+			};
+			Object.defineProperty(wrapped, visualizerWrapperMarker, { value: true });
+			if (prototype) prototype[name] = wrapped;
+			return;
+		}
+
+		const moduleObject = module as object;
+		const registered = registeredVisualizerNames.get(moduleObject) ?? new Set<string>();
+		if (registered.has(name)) return;
+		registered.add(name);
+		registeredVisualizerNames.set(moduleObject, registered);
 		module.register?.(name, (pattern: unknown) => {
-			const candidate = pattern as StrudelPattern;
-			if (typeof candidate.withHaps !== 'function') return pattern;
 			const analyzerId = visualizer === 'scope' || visualizer === 'spectrum' ? nextAnalyzerId++ : undefined;
-			const analyze = candidate.analyze;
-			const analyzed = analyzerId !== undefined && typeof analyze === 'function'
-				? analyze.call(candidate, analyzerId)
-				: candidate;
-			if (typeof analyzed.withHaps !== 'function') return analyzed;
-			return analyzed.withHaps((haps, state) => {
-				// Scheduler queries are the audio-critical path. The lane identity is
-				// only needed by Sushi's visualizer query, so leave those haps untouched
-				// when Cyclist/NeoCyclist asks for events to play. This avoids cloning and
-				// re-contextualizing every event on every scheduler tick.
-				if (state.controls?.cyclist || state.controls?.neocyclist) return haps;
-				return haps.map((hap) => hap.setContext?.({
-					...(hap.context ?? {}),
-					sushiVisualizer: visualizer,
-					sushiPatternId: typeof state.controls?.id === 'string' ? state.controls.id : undefined,
-					...(analyzerId === undefined ? {} : { sushiAnalyzerId: analyzerId }),
-				}) ?? hap);
-			});
+			return tagVisualizerPattern(pattern, visualizer, analyzerId);
 		});
 	};
 	registerVisualizer('_pianoroll', 'pianoroll');
@@ -403,10 +453,13 @@ function isAudioPolicyError(error: unknown): boolean {
  * The only application layer that talks to Strudel.
  *
  * Importing @strudel/web at module evaluation time would execute its browser
- * setup during Astro's server build, so the package is intentionally loaded
- * inside init(). Evaluation requests are serialized because the REPL reports
- * errors through a shared callback. Failed candidates restore the last valid
- * source because the REPL hushes before evaluating a new source document.
+ * setup during Astro's server build, so the browser's unbundled web entry is
+ * intentionally loaded inside init(). That entry shares @strudel/core and
+ * @strudel/transpiler with the CodeMirror package, which keeps widget methods
+ * and registrations on the same runtime. Evaluation requests are serialized
+ * because the REPL reports errors through a shared callback. Failed candidates
+ * restore the last valid source because the REPL hushes before evaluating a new
+ * source document.
  */
 export class StrudelAdapter {
 	private destroyed = false;
@@ -434,7 +487,8 @@ export class StrudelAdapter {
 
 	public constructor(
 		private readonly onRuntimeUpdate?: (update: AdapterRuntimeUpdate) => void,
-		private readonly loadModule: StrudelModuleLoader = async () => (await import('@strudel/web')) as unknown as StrudelModule,
+		private readonly loadModule: StrudelModuleLoader = async () => (await import('@strudel/web/web.mjs')) as unknown as StrudelModule,
+		private readonly onEvaluation?: (update: StrudelEvaluationUpdate) => void,
 	) {}
 
 	public async init(): Promise<void> {
@@ -451,6 +505,29 @@ export class StrudelAdapter {
 
 			const module = await this.loadModule();
 			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
+			// The editor package owns the official widget methods and transpiler
+			// registrations. Load its lightweight widget module before the runtime's
+			// prebake so both packages decorate the same Pattern prototype. If an
+			// embedding host omits CodeMirror, the compatibility registrations below
+			// still keep reduced runtimes playable.
+			try {
+				await import('@strudel/codemirror/widget.mjs');
+			} catch {
+				// `registerSushiCompatibility` supplies a reduced fallback for hosts
+				// that cannot load the optional editor widget module.
+			}
+			// The unbundled web entry exports Pattern, while older embedding hosts
+			// may still provide the self-contained bundle. Give the compatibility
+			// layer the shared prototype in either case.
+			if (!module.Pattern?.prototype) {
+				try {
+					const core = await import('@strudel/core') as { Pattern?: { prototype: Record<string, unknown> } };
+					if (core.Pattern) module.Pattern = { prototype: core.Pattern.prototype };
+				} catch {
+					// The fallback registrations below still support reduced test
+					// runtimes that do not expose the core package.
+				}
+			}
 			this.module = module;
 			this.repl = await module.initStrudel({
 				// Sushi owns one transport per studio. Keep Cyclist local instead of
@@ -481,6 +558,14 @@ export class StrudelAdapter {
 					this.sampleBankPromise = this.preloadSampleBanks(module);
 				},
 				beforeStart: () => this.preloadActivePattern(),
+				afterEval: (update) => {
+					this.activePattern = update.pattern;
+					try {
+						this.onEvaluation?.(update);
+					} catch (error) {
+						console.warn('[sushi] editor evaluation callback failed', error);
+					}
+				},
 				onEvalError: (error) => {
 					if (this.activeEvaluation) this.activeEvaluation.error = error;
 				},
@@ -1121,6 +1206,20 @@ export class StrudelAdapter {
 	/** Return the live scheduler cursor for animation clients such as the lane visualizers. */
 	public getCurrentCycle(): number {
 		return this.readCurrentCycle();
+	}
+
+	/** Query the same source-location haps that Strudel uses for live editor highlighting. */
+	public getEditorHaps(begin: number, end: number, pattern = this.activePattern): StrudelHap[] {
+		if (!pattern?.queryArc || !Number.isFinite(begin) || !Number.isFinite(end) || end <= begin) return [];
+		try {
+			const cps = this.repl?.scheduler?.cps;
+			const queried = pattern.queryArc(begin, end, {
+				...(typeof cps === 'number' && Number.isFinite(cps) ? { _cps: cps } : {}),
+			});
+			return Array.isArray(queried) ? queried : [];
+		} catch {
+			return [];
+		}
 	}
 
 	/**
