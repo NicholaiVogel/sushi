@@ -89,7 +89,8 @@ a { color: inherit; }
 .studio-topbar {
 	position: sticky;
 	top: 0;
-	z-index: 10;
+	/* Keep the header's popovers above the editor's own positioned layers. */
+	z-index: 50;
 	display: grid;
 	grid-template-columns: minmax(0, 1fr) minmax(0, 1040px) minmax(0, 1fr);
 	align-items: center;
