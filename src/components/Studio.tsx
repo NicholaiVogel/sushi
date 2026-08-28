@@ -1043,11 +1043,10 @@ export default function Studio() {
 		}
 	}, [applyProjectSnapshot, patchStudio]);
 
-	const loadEditorPreset = useCallback(async (preset: EditorPreset) => {
+	const loadEditorPreset = useCallback(async (preset: EditorPreset, expectedRevision = studioRef.current.revision): Promise<CommitSourceResult> => {
 		cancelPendingTrackCommit();
-		const current = studioRef.current;
-		const result = await commitSource(preset.source, { expectedRevision: current.revision });
-		if (!result.ok) return;
+		const result = await commitSource(preset.source, { expectedRevision });
+		if (!result.ok) return result;
 
 		const presetEndCycle = getTimelineCapacityForEndCycle(Math.max(DEFAULT_SONG_END_CYCLE, getExplicitSourceEndCycle(preset.source)));
 		adapterRef.current?.setSongEndCycle(presetEndCycle);
@@ -1055,6 +1054,7 @@ export default function Studio() {
 		setOpenHeaderPopover(null);
 		await persistStudioSnapshot();
 		void refreshLocalProjects();
+		return result;
 	}, [cancelPendingTrackCommit, commitSource, patchStudio, persistStudioSnapshot, refreshLocalProjects]);
 
 	const saveProject = useCallback(() => {
@@ -1314,6 +1314,7 @@ export default function Studio() {
 		commitTrackRange,
 		deleteTrack,
 		renameTrack,
+		loadTemplate: loadEditorPreset,
 	});
 	const seekTimelineAtClientX = useCallback(
 		(clientX: number, ruler: HTMLElement) => {

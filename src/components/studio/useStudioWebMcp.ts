@@ -24,12 +24,14 @@ import {
 	type WebMcpRegistration,
 	type WebMcpStateSnapshot,
 	type WebMcpTempoInput,
+	type WebMcpTemplateLoadInput,
 	type WebMcpTimelineExtensionInput,
 	type WebMcpTrackMutationInput,
 	type WebMcpTrackRangeInput,
 	type WebMcpTrackRenameInput,
 	type WebMcpValidationResult,
 } from '../../lib/webmcp/tools';
+import { getEditorPreset, type EditorPreset } from '../../lib/project/presets';
 import { stableSerialize, TransactionCache, TransactionReuseError } from '../../lib/webmcp/transaction-cache';
 import {
 	formatCycle,
@@ -72,6 +74,7 @@ export interface UseStudioWebMcpOptions {
 	commitTrackRange: (trackId: string, startCycle: number, endCycle: number) => Promise<CommitSourceResult>;
 	deleteTrack: (trackId: string) => Promise<CommitSourceResult>;
 	renameTrack: (trackId: string, name: string) => Promise<CommitSourceResult>;
+	loadTemplate: (preset: EditorPreset, expectedRevision?: number) => Promise<CommitSourceResult>;
 }
 
 export function useStudioWebMcp({
@@ -91,6 +94,7 @@ export function useStudioWebMcp({
 	commitTrackRange,
 	deleteTrack,
 	renameTrack,
+	loadTemplate,
 }: UseStudioWebMcpOptions) {
 	const getWebMcpState = useCallback((): WebMcpStateSnapshot => {
 		const current = studioRef.current;
@@ -432,6 +436,114 @@ export function useStudioWebMcp({
 		[commitTrackRange, trackMutationForWebMcp],
 	);
 
+	const loadTemplateForWebMcp = useCallback(
+		(input: WebMcpTemplateLoadInput): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			'load_editor_template',
+			input.transactionId,
+			async () => {
+				const current = studioRef.current;
+				const preset = getEditorPreset(input.templateId);
+				if (!preset) {
+					const state = getWebMcpState();
+					return makeMutationResult(
+						state,
+						'load_editor_template',
+						input.transactionId,
+						current.draft,
+						current.revision,
+						false,
+						`No editor template exists with ID ${JSON.stringify(input.templateId)}.`,
+						{ code: 'TEMPLATE_NOT_FOUND', message: `No editor template exists with ID ${JSON.stringify(input.templateId)}.` },
+						['source', 'project', 'timeline'],
+					);
+				}
+
+				if (input.baseRevision !== current.revision) {
+					const state = getWebMcpState();
+					return {
+						ok: false,
+						action: 'load_editor_template',
+						affectedEntityIds: ['source', 'project', 'timeline'],
+						message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+						state,
+						revision: state.source.revision,
+						activeRevision: state.source.activeRevision,
+						transactionId: input.transactionId,
+						error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
+						conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
+					};
+				}
+
+				const beforeSource = current.draft;
+				let result: CommitSourceResult;
+				try {
+					result = await loadTemplate(preset, input.baseRevision);
+				} catch (error) {
+					const state = getWebMcpState();
+					return makeMutationResult(
+						state,
+						'load_editor_template',
+						input.transactionId,
+						beforeSource,
+						input.baseRevision,
+						false,
+						'The editor template could not be loaded.',
+						{ code: 'TEMPLATE_LOAD_FAILED', message: error instanceof Error ? error.message : String(error) },
+						['source', 'project', 'timeline'],
+					);
+				}
+
+				const state = getWebMcpState();
+				if (result.conflict) {
+					return {
+						ok: false,
+						action: 'load_editor_template',
+						affectedEntityIds: ['source', 'project', 'timeline'],
+						message: `Revision conflict: expected ${formatRevision(result.conflict.expectedRevision)}, current is ${formatRevision(result.conflict.actualRevision)}.`,
+						state,
+						revision: state.source.revision,
+						activeRevision: state.source.activeRevision,
+						transactionId: input.transactionId,
+						error: { code: 'REVISION_CONFLICT', message: 'The source changed while this transaction was waiting to commit.' },
+						conflict: result.conflict,
+					};
+				}
+				if (result.ok) {
+					return makeMutationResult(
+						state,
+						'load_editor_template',
+						input.transactionId,
+						beforeSource,
+						input.baseRevision,
+						true,
+						`Loaded editor template ${JSON.stringify(preset.name)} at ${formatRevision(state.source.revision)}.`,
+						undefined,
+						['source', 'project', 'timeline'],
+					);
+				}
+
+				const diagnostic = result.error;
+				return makeMutationResult(
+					state,
+					'load_editor_template',
+					input.transactionId,
+					beforeSource,
+					input.baseRevision,
+					false,
+					`Editor template was rejected; ${formatRevision(state.source.activeRevision)} remains active.`,
+					{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the editor template.', details: diagnostic ? { diagnostic } : undefined },
+					['source', 'project', 'timeline'],
+				);
+			},
+			stableSerialize(input),
+		).catch((error) => {
+			if (!(error instanceof TransactionReuseError)) throw error;
+			const state = getWebMcpState();
+			return makeMutationResult(state, 'load_editor_template', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+		}),
+		[getWebMcpState, loadTemplate, sourceTransactionsRef, studioRef],
+	);
+
 	const patchSourceForWebMcp = useCallback(
 		(input: SourcePatchInput): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
 			'patch_strudel_source',
@@ -592,6 +704,7 @@ export function useStudioWebMcp({
 
 	const webmcpController = useMemo<WebMcpController>(() => ({
 		getState: getWebMcpState,
+		loadTemplate: loadTemplateForWebMcp,
 		writeSource: (input) => sourceMutationForWebMcp('write_strudel_source', input),
 		patchSource: patchSourceForWebMcp,
 		setTempo: setTempoForWebMcp,
@@ -604,7 +717,7 @@ export function useStudioWebMcp({
 		controlPlayback: controlPlaybackForWebMcp,
 		undoSourceEdit: undoSourceForWebMcp,
 		redoSourceEdit: redoSourceForWebMcp,
-	}), [controlPlaybackForWebMcp, deleteTrackForWebMcp, extendTimelineForWebMcp, getWebMcpState, patchSourceForWebMcp, redoSourceForWebMcp, renameTrackForWebMcp, setKeyForWebMcp, setTempoForWebMcp, setTrackRangeForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
+	}), [controlPlaybackForWebMcp, deleteTrackForWebMcp, extendTimelineForWebMcp, getWebMcpState, loadTemplateForWebMcp, patchSourceForWebMcp, redoSourceForWebMcp, renameTrackForWebMcp, setKeyForWebMcp, setTempoForWebMcp, setTrackRangeForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
 
 	useEffect(() => {
 		let disposed = false;

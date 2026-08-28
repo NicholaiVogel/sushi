@@ -40,6 +40,8 @@ $: note("<c3 eb3 g3 bb3>")
 
 Sushi uses [WebMCP](https://webmachinelearning.github.io/webmcp) to connect compatible agents to the studio. Agents can read and modify source, inspect musical state, and control playback, making it possible to collaborate on patterns and arrangements through natural-language assistance.
 
+The WebMCP integration also exposes the curated editor templates: agents can use `list_editor_templates` to browse available compositions, `view_editor_template` to inspect one, and `load_editor_template` to load it into the current session.
+
 ## Run locally
 
 ```sh

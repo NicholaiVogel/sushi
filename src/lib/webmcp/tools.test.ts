@@ -39,6 +39,7 @@ const state: WebMcpStateSnapshot = {
 function testController(): WebMcpController {
 	return {
 		getState: () => state,
+		loadTemplate: async (input) => ({ ok: true, action: 'load_editor_template', affectedEntityIds: ['source', 'project', 'timeline'], message: 'template loaded', state, revision: 1, activeRevision: 1, transactionId: input.transactionId }),
 		writeSource: async () => ({ ok: true, action: 'write_strudel_source', affectedEntityIds: ['source'], message: 'accepted', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
 		patchSource: async () => ({ ok: true, action: 'patch_strudel_source', affectedEntityIds: ['source'], message: 'accepted', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
 		setTempo: async () => ({ ok: true, action: 'set_tempo', affectedEntityIds: ['source'], message: 'tempo set', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
@@ -182,11 +183,12 @@ describe('WebMCP tool adapter', () => {
 	test('exposes the contract tools and revision-aware schemas', () => {
 		const tools = createWebMcpTools(testController());
 		expect(tools.map((tool) => tool.name)).toEqual([...WEBMCP_TOOL_NAMES]);
-		const sourceReaders = tools.filter((tool) => ['open_studio_session', 'inspect_strudel_state', 'read_strudel_source', 'validate_strudel_source'].includes(tool.name));
+		const sourceReaders = tools.filter((tool) => ['open_studio_session', 'inspect_strudel_state', 'read_strudel_source', 'validate_strudel_source', 'view_editor_template'].includes(tool.name));
 		expect(sourceReaders.every((tool) => tool.annotations?.readOnlyHint === true && tool.annotations?.untrustedContentHint === true)).toBe(true);
-		const sourceWriters = tools.filter((tool) => ['write_strudel_source', 'patch_strudel_source', 'control_playback', 'undo_source_edit', 'redo_source_edit'].includes(tool.name));
+		const sourceWriters = tools.filter((tool) => ['write_strudel_source', 'patch_strudel_source', 'load_editor_template', 'control_playback', 'undo_source_edit', 'redo_source_edit'].includes(tool.name));
 		expect(sourceWriters.every((tool) => tool.annotations?.readOnlyHint === false && tool.annotations?.untrustedContentHint === true)).toBe(true);
 		expect(tools.find((tool) => tool.name === 'lookup_strudel_reference')?.annotations).toEqual({ readOnlyHint: true });
+		expect(tools.find((tool) => tool.name === 'list_editor_templates')?.annotations).toEqual({ readOnlyHint: true });
 		const write = tools.find((tool) => tool.name === 'write_strudel_source');
 		expect(write?.inputSchema).toMatchObject({ required: ['source', 'baseRevision', 'transactionId'] });
 		const patch = tools.find((tool) => tool.name === 'patch_strudel_source');
@@ -203,6 +205,12 @@ describe('WebMCP tool adapter', () => {
 		expect(rangeTool?.inputSchema).toMatchObject({ required: ['startCycle', 'endCycle', 'baseRevision', 'transactionId'] });
 		const extendTool = tools.find((tool) => tool.name === 'extend_timeline');
 		expect(extendTool?.inputSchema).toMatchObject({ required: ['baseRevision', 'transactionId'] });
+		const listTemplates = tools.find((tool) => tool.name === 'list_editor_templates');
+		expect(listTemplates?.inputSchema).toMatchObject({ properties: { query: { type: 'string' }, limit: { type: 'integer' } } });
+		const viewTemplate = tools.find((tool) => tool.name === 'view_editor_template');
+		expect(viewTemplate?.inputSchema).toMatchObject({ required: ['templateId'] });
+		const loadTemplate = tools.find((tool) => tool.name === 'load_editor_template');
+		expect(loadTemplate?.inputSchema).toMatchObject({ required: ['templateId', 'baseRevision', 'transactionId'] });
 	});
 
 	test('rejects malformed tool inputs before dispatch', async () => {
@@ -260,6 +268,32 @@ describe('WebMCP tool adapter', () => {
 		const lookup = createWebMcpTools(testController()).find((tool) => tool.name === 'lookup_strudel_reference');
 		const result = await lookup?.execute({ query: 'gain' }, { signal: new AbortController().signal }) as { results: Array<{ id: string }> };
 		expect(result.results[0]?.id).toBe('gain');
+	});
+
+	test('lists and views curated editor templates', async () => {
+		const tools = createWebMcpTools(testController());
+		const list = tools.find((tool) => tool.name === 'list_editor_templates');
+		const view = tools.find((tool) => tool.name === 'view_editor_template');
+		const listed = await list?.execute({ query: 'witch' }, { signal: new AbortController().signal }) as { templates: Array<{ id: string; source?: string }> };
+		expect(listed.templates).toEqual([{ id: 'witch-house-climax', name: 'Witch-House Climax', description: 'A cinematic 24-cycle build from sparse arpeggios into a dense, distorted climax.', bpm: 84, key: 'F minor', lanes: 16 }]);
+		expect(listed.templates[0]).not.toHaveProperty('source');
+
+		const viewed = await view?.execute({ templateId: 'witch-house-climax' }, { signal: new AbortController().signal }) as { template: { id: string; source: string } };
+		expect(viewed.template.id).toBe('witch-house-climax');
+		expect(viewed.template.source).toContain('const key = "F:minor"');
+	});
+
+	test('validates and dispatches editor template loads', async () => {
+		let received: unknown;
+		const controller = { ...testController(), loadTemplate: async (input: Parameters<WebMcpController['loadTemplate']>[0]) => {
+			received = input;
+			return { ok: true, action: 'load_editor_template', affectedEntityIds: ['source', 'project', 'timeline'], message: 'loaded', state, revision: 1, activeRevision: 1, transactionId: input.transactionId };
+		} };
+		const load = createWebMcpTools(controller).find((tool) => tool.name === 'load_editor_template');
+		const signal = new AbortController().signal;
+		await expect(load?.execute({ templateId: '  witch-house-climax  ', baseRevision: 0, transactionId: 'load-template' }, { signal })).resolves.toMatchObject({ ok: true });
+		expect(received).toEqual({ templateId: 'witch-house-climax', baseRevision: 0, transactionId: 'load-template' });
+		expect(await load?.execute({ templateId: 'missing', baseRevision: 0, transactionId: 'load-invalid' }, { signal })).toEqual({ ok: false, error: { code: 'TEMPLATE_NOT_FOUND', message: 'No editor template exists with ID "missing".' } });
 	});
 
 	test('handles native executeTool callbacks that omit optional cancellation options', async () => {

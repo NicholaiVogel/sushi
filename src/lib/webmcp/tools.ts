@@ -2,12 +2,16 @@
 
 import type { SourceDiagnostic, RuntimeState } from '../project/model';
 import type { SourceBlockDetails, TrackTiming } from '../project/source-mapper';
+import { getEditorPreset, listEditorPresets, summarizeEditorPreset, type EditorPresetSummary } from '../project/presets';
 import { lookupStrudelReference, STRUDEL_REFERENCE_VERSION, type StrudelReferenceEntry, type StrudelReferenceKind } from '../strudel/reference';
 
 export const WEBMCP_TOOL_NAMES = [
 	'open_studio_session',
 	'inspect_strudel_state',
 	'read_strudel_source',
+	'list_editor_templates',
+	'view_editor_template',
+	'load_editor_template',
 	'write_strudel_source',
 	'patch_strudel_source',
 	'set_tempo',
@@ -123,6 +127,12 @@ export interface WebMcpValidationResult {
 	error?: WebMcpError;
 }
 
+export interface WebMcpTemplateLoadInput {
+	templateId: string;
+	baseRevision: number;
+	transactionId: string;
+}
+
 export type WebMcpPlaybackAction = 'play' | 'pause' | 'resume' | 'stop' | 'seek';
 
 export interface WebMcpPlaybackResult {
@@ -187,6 +197,7 @@ export interface SourcePatchInput {
 
 export interface WebMcpController {
 	getState: () => WebMcpStateSnapshot;
+	loadTemplate: (input: WebMcpTemplateLoadInput) => Promise<WebMcpMutationResult>;
 	writeSource: (input: SourceMutationInput) => Promise<WebMcpMutationResult>;
 	patchSource: (input: SourcePatchInput) => Promise<WebMcpMutationResult>;
 	setTempo: (input: WebMcpTempoInput) => Promise<WebMcpMutationResult>;
@@ -329,6 +340,7 @@ const MAX_EDIT_COUNT = 100;
 const MAX_TRANSACTION_LENGTH = 128;
 const MAX_TRACK_NAME_LENGTH = 120;
 const MAX_KEY_LENGTH = 64;
+const MAX_TEMPLATE_QUERY_LENGTH = 120;
 
 const EMPTY_SCHEMA = {
 	type: 'object',
@@ -382,6 +394,38 @@ function readTransactionInput(value: unknown): { ok: true; transactionId: string
 	if (typeof value !== 'string' || !value.trim()) return { ok: false, result: invalidInput('transactionId must be a non-empty string.') };
 	if (value.length > MAX_TRANSACTION_LENGTH) return { ok: false, result: invalidInput(`transactionId must be at most ${MAX_TRANSACTION_LENGTH} characters.`) };
 	return { ok: true, transactionId: value };
+}
+
+function readTemplateIdInput(value: unknown): { ok: true; templateId: string } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (typeof value !== 'string' || !value.trim()) return { ok: false, result: invalidInput('templateId must be a non-empty string.') };
+	if (value.trim().length > MAX_TRANSACTION_LENGTH) return { ok: false, result: invalidInput(`templateId must contain 1-${MAX_TRANSACTION_LENGTH} characters.`) };
+	return { ok: true, templateId: value.trim() };
+}
+
+function readTemplateListInput(value: unknown): { ok: true; query?: string; limit?: number } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	if (value.query !== undefined && (typeof value.query !== 'string' || value.query.length > MAX_TEMPLATE_QUERY_LENGTH)) {
+		return { ok: false, result: invalidInput(`query must be a string of at most ${MAX_TEMPLATE_QUERY_LENGTH} characters.`) };
+	}
+	if (value.limit !== undefined && (!isInteger(value.limit) || value.limit < 1 || value.limit > 12)) {
+		return { ok: false, result: invalidInput('limit must be an integer from 1 to 12.') };
+	}
+	return {
+		ok: true,
+		...(value.query === undefined ? {} : { query: value.query }),
+		...(value.limit === undefined ? {} : { limit: value.limit }),
+	};
+}
+
+function readTemplateLoadInput(value: unknown): { ok: true; input: WebMcpTemplateLoadInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	const template = readTemplateIdInput(value.templateId);
+	if (!template.ok) return template;
+	const revision = readRevisionInput(value.baseRevision);
+	if (!revision.ok) return revision;
+	const transaction = readTransactionInput(value.transactionId);
+	if (!transaction.ok) return transaction;
+	return { ok: true, input: { templateId: template.templateId, baseRevision: revision.revision, transactionId: transaction.transactionId } };
 }
 
 function readMutationInput(value: unknown): { ok: true; input: SourceMutationInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
@@ -623,6 +667,62 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 					diagnostics: state.diagnostics,
 				};
 			});
+		}),
+
+		createTool({
+			name: 'list_editor_templates',
+			title: 'List Sushi editor templates',
+			description: 'List the curated Sushi editor templates available to load, including each template’s stable ID, description, tempo, key, and lane count. Source text is omitted; use view_editor_template for a full source preview.',
+			inputSchema: schema({ query: { type: 'string', maxLength: MAX_TEMPLATE_QUERY_LENGTH }, limit: { type: 'integer', minimum: 1, maximum: 12 } }),
+			annotations: READ_ONLY_REFERENCE_ANNOTATIONS,
+		}, (input: { query?: unknown; limit?: unknown }, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readTemplateListInput(input);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => ({
+				ok: true,
+				action: 'list_editor_templates',
+				templates: listEditorPresets(parsed.query, parsed.limit) as EditorPresetSummary[],
+			}));
+		}),
+
+		createTool({
+			name: 'view_editor_template',
+			title: 'View a Sushi editor template',
+			description: 'Read one curated Sushi editor template’s metadata and complete Strudel source without changing the current project.',
+			inputSchema: schema({ templateId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH } }, ['templateId']),
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
+		}, (input: { templateId?: unknown }, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readTemplateIdInput(input.templateId);
+			if (!parsed.ok) return parsed.result;
+			return executeSafely(() => {
+				const preset = getEditorPreset(parsed.templateId);
+				if (!preset) return failed({ code: 'TEMPLATE_NOT_FOUND', message: `No editor template exists with ID ${JSON.stringify(parsed.templateId)}.` });
+				const summary: EditorPresetSummary = summarizeEditorPreset(preset);
+				return { ok: true, action: 'view_editor_template', template: { ...summary, source: preset.source } };
+			});
+		}),
+
+		createTool({
+			name: 'load_editor_template',
+			title: 'Load a Sushi editor template',
+			description: 'Replace the current source with a curated Sushi editor template and activate it after Strudel validation. Requires the current source revision and an idempotency transaction ID.',
+			inputSchema: schema({
+				templateId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+				baseRevision: { type: 'integer', minimum: 0 },
+				transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH },
+			}, ['templateId', 'baseRevision', 'transactionId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readTemplateLoadInput(input);
+			if (!parsed.ok) return parsed.result;
+			if (!getEditorPreset(parsed.input.templateId)) return failed({ code: 'TEMPLATE_NOT_FOUND', message: `No editor template exists with ID ${JSON.stringify(parsed.input.templateId)}.` });
+			return executeSafely(() => controller.loadTemplate(parsed.input));
 		}),
 
 		createTool({

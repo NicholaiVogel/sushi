@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { getSourceBlockDetails } from './source-mapper';
-import { EDITOR_PRESETS } from './presets';
+import { EDITOR_PRESETS, getEditorPreset, listEditorPresets } from './presets';
 
 describe('editor presets', () => {
 	test('includes the curated witch-house composition with matching lane metadata', () => {
@@ -22,5 +22,26 @@ describe('editor presets', () => {
 
 		expect(new Set(ids).size).toBe(ids.length);
 		expect(ids).toEqual(['witch-house-climax']);
+	});
+
+	test('lists metadata without exposing source text', () => {
+		const templates = listEditorPresets();
+
+		expect(templates).toEqual([{
+			id: 'witch-house-climax',
+			name: 'Witch-House Climax',
+			description: 'A cinematic 24-cycle build from sparse arpeggios into a dense, distorted climax.',
+			bpm: 84,
+			key: 'F minor',
+			lanes: 16,
+		}]);
+		expect(templates[0]).not.toHaveProperty('source');
+	});
+
+	test('filters templates by metadata and resolves exact IDs', () => {
+		expect(listEditorPresets('witch-house')[0]?.id).toBe('witch-house-climax');
+		expect(listEditorPresets('does-not-exist')).toEqual([]);
+		expect(getEditorPreset('witch-house-climax')?.source).toContain('const key = "F:minor"');
+		expect(getEditorPreset('missing-template')).toBeUndefined();
 	});
 });
