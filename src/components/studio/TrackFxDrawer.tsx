@@ -227,6 +227,12 @@ export function TrackFxDrawer({
 	}, [track.id]);
 
 	useEffect(() => {
+		if (mode !== 'sounds' || sounds.length <= 1) return;
+		const voiceList = soundPickerRef.current?.querySelector<HTMLElement>('.track-sound-voice-list');
+		voiceList?.scrollTo({ left: 0, behavior: 'auto' });
+	}, [mode, sounds.length, track.id]);
+
+	useEffect(() => {
 		if (!effectPickerOpen && !soundPickerOpen) return undefined;
 		const handlePointerDown = (event: PointerEvent) => {
 			const target = event.target as Node;
@@ -370,10 +376,6 @@ export function TrackFxDrawer({
 			<div className="track-fx-drawer-body">
 				{mode === 'effects' ? (
 					<>
-						{sounds.length > 1 ? <div className="track-fx-layered-notice">
-							<span><strong>{sounds.length} layered voices</strong><small>Sound calls inside this track’s callbacks</small></span>
-							<button type="button" onClick={() => setMode('sounds')}>View sources</button>
-						</div> : null}
 						{sliders.length ? <section className="track-fx-drawer-section track-fx-drawer-source-section" aria-labelledby="track-fx-source-heading">
 							<div className="track-fx-drawer-section-heading">
 								<h3 id="track-fx-source-heading">Source controls</h3>
@@ -405,149 +407,61 @@ export function TrackFxDrawer({
 
 						<section className={`track-fx-drawer-section track-fx-drawer-chain-section${sliders.length ? '' : ' track-fx-drawer-chain-section-full'}`} aria-labelledby="track-fx-chain-heading">
 							<div className="track-fx-drawer-section-heading">
-								<h3 id="track-fx-chain-heading">Effect chain</h3>
+								<div className="track-fx-drawer-section-heading-main">
+									<h3 id="track-fx-chain-heading">Effects</h3>
+									{sounds.length > 1 ? <button className="track-fx-layered-control" type="button" onClick={() => setMode('sounds')} aria-label={`View ${sounds.length} layered sound sources`}>
+										<span>{sounds.length} voices</span>
+										<span>View sources</span>
+									</button> : null}
+								</div>
 								<span>{effectSummary(effects)}</span>
 							</div>
-							<div className="track-fx-drawer-add">
-								<span className="track-fx-drawer-add-label">Add effect</span>
-								<div className="track-fx-drawer-add-controls">
-									<div className="track-fx-effect-picker" ref={effectPickerRef}>
-										<button
-											id="track-fx-add-select"
-											className={`track-fx-effect-picker-trigger${effectPickerOpen ? ' track-fx-effect-picker-trigger-open' : ''}`}
-											type="button"
-											aria-haspopup="dialog"
-											aria-expanded={effectPickerOpen}
-											disabled={isBusy || !trackDetails || addableDefinitions.every((definition) => presentMethods.has(definition.method))}
-											onClick={toggleEffectPicker}
-											aria-label={selectedAddDefinition ? `${selectedAddDefinition.label} selected for ${track.name}` : `Choose an effect to add to ${track.name}`}
-										>
-											<span>{selectedAddDefinition?.label ?? 'Choose effect…'}</span>
-											<span aria-hidden="true">⌄</span>
-										</button>
-										{effectPickerOpen && effectPickerPosition && typeof document !== 'undefined' ? createPortal(
-											<div
-												ref={effectPickerPopoverRef}
-												className="track-fx-effect-picker-popover"
-												role="dialog"
-								aria-label={`Choose an effect to add to ${track.name}`}
-								style={{
-									'--track-color': trackColor,
-									left: effectPickerPosition.left,
-													width: effectPickerPosition.width,
-													maxHeight: effectPickerPosition.maxHeight,
-													...(effectPickerPosition.top !== undefined ? { top: effectPickerPosition.top } : { bottom: effectPickerPosition.bottom ?? 12 }),
-												} as CSSProperties}
-											>
-												<div className="track-fx-effect-picker-header">
-													<strong>Effects</strong>
-													<button type="button" aria-label="Close effect picker" onClick={() => setEffectPickerOpen(false)}>×</button>
+							<div className="track-fx-drawer-effect-list" aria-label={`${track.name} effects`}>
+								{effects.map((effect, index) => {
+									const enabled = effectIsEnabled(effect);
+									const hasSourceParameter = effect.parameters.some((parameter) => parameter.kind === 'dynamic');
+									return (
+										<div className={`track-fx-drawer-effect ${enabled ? '' : 'track-fx-drawer-effect-bypassed'}`} key={effect.id}>
+											<div className="track-fx-drawer-effect-heading">
+												<button
+													className="track-fx-bypass"
+													type="button"
+													role="switch"
+													aria-checked={enabled}
+													disabled={isBusy || !trackDetails}
+													onClick={() => onToggleEffect(track.id, effect.id, !enabled)}
+													aria-label={`${enabled ? 'Bypass' : 'Enable'} ${effect.label.toLowerCase()} on ${track.name}`}
+													title={enabled ? `Bypass ${effect.label.toLowerCase()}` : `Enable ${effect.label.toLowerCase()}`}
+												>
+													<span aria-hidden="true" />
+												</button>
+													<div className="track-fx-drawer-effect-title">
+														<strong>{effect.label}</strong>
+														{effect.definition.source === 'fallback' ? <span className="track-fx-unknown-badge">UNMAPPED</span> : null}
+														{effect.definition.source === 'fallback' && !hasSourceParameter ? <code title={effect.expression}>{effect.expression || `.${effect.method}()`}</code> : null}
 												</div>
-												<input
-													className="track-fx-effect-picker-search"
-													type="search"
-													value={effectQuery}
-													placeholder="Search effects…"
-													onChange={(event) => setEffectQuery(event.target.value)}
-													aria-label={`Search effects for ${track.name}`}
-													autoFocus
-												/>
-												<div className="track-fx-effect-picker-browse">
-													<div className="track-fx-effect-picker-groups-pane">
-														<span className="track-fx-effect-picker-groups-heading">Browse by category</span>
-														<div className="track-fx-effect-picker-groups" role="tablist" aria-label="Filter effects by category">
-															<button type="button" role="tab" aria-selected={!effectGroupFilter} className={!effectGroupFilter ? 'track-fx-effect-picker-group-active' : ''} onClick={() => setEffectGroupFilter('')}>All effects</button>
-															{effectGroups.map((group) => (
-																<button key={group} type="button" role="tab" aria-selected={effectGroupFilter === group} className={effectGroupFilter === group ? 'track-fx-effect-picker-group-active' : ''} onClick={() => setEffectGroupFilter(group)}>{groupLabel(group)}</button>
-															))}
-														</div>
-													</div>
-													<div className="track-fx-effect-picker-results" role="listbox" aria-label={`Available effects for ${track.name}`}>
-														{filteredAddableDefinitions.length ? filteredAddableDefinitions.map((definition) => {
-															const alreadyAdded = presentMethods.has(definition.method);
-															return (
-																<button
-																	className={`track-fx-effect-picker-option${addSelection === definition.method ? ' track-fx-effect-picker-option-selected' : ''}`}
-																	type="button"
-																	role="option"
-																	aria-selected={addSelection === definition.method}
-																	disabled={isBusy || !trackDetails || alreadyAdded}
-																	onClick={() => {
-																		setAddSelection(definition.method);
-																		setEffectPickerOpen(false);
-																		setEffectQuery('');
-																	}}
-																	aria-label={`${definition.label}${alreadyAdded ? ' already added' : ''}`}
-																>
-																	<span>
-																		<strong>{definition.label}</strong>
-																		<code>.{definition.method}()</code>
-																	</span>
-																	<small>{definition.description}</small>
-																	{alreadyAdded ? <em>ADDED</em> : null}
-																</button>
-															);
-														}) : <p className="track-fx-effect-picker-empty">No effects match “{effectQuery}”.</p>}
-													</div>
+												<span className="track-fx-effect-info" title={effect.definition.description} aria-label={effect.definition.description}>i</span>
+												<div className="track-fx-drawer-effect-actions" role="group" aria-label={`${effect.label} order and removal`}>
+													<button type="button" onClick={() => onReorderEffect(track.id, effect.id, 'up')} disabled={isBusy || !trackDetails || index === 0} aria-label={`Move ${effect.label.toLowerCase()} up`} title="Move effect left">←</button>
+													<button type="button" onClick={() => onReorderEffect(track.id, effect.id, 'down')} disabled={isBusy || !trackDetails || index === effects.length - 1} aria-label={`Move ${effect.label.toLowerCase()} down`} title="Move effect right">→</button>
+													<button className="track-fx-remove" type="button" onClick={() => onRemoveEffect(track.id, effect.id)} disabled={isBusy || !trackDetails} aria-label={`Remove ${effect.label.toLowerCase()} from ${track.name}`} title={`Remove ${effect.label.toLowerCase()}`}>×</button>
 												</div>
-											</div>,
-											document.body,
-										) : null}
-									</div>
-									<button type="button" onClick={addEffect} disabled={isBusy || !trackDetails || !addSelection} aria-label={`Add selected effect to ${track.name}`}>ADD</button>
-								</div>
-							</div>
-							{effects.length ? (
-								<div className="track-fx-drawer-effect-list">
-									{effects.map((effect, index) => {
-										const enabled = effectIsEnabled(effect);
-										return (
-											<div className={`track-fx-drawer-effect ${enabled ? '' : 'track-fx-drawer-effect-bypassed'}`} key={effect.id}>
-												<div className="track-fx-drawer-effect-heading">
-													<button
-														className="track-fx-bypass"
-														type="button"
-														role="switch"
-														aria-checked={enabled}
-														disabled={isBusy || !trackDetails}
-														onClick={() => onToggleEffect(track.id, effect.id, !enabled)}
-														aria-label={`${enabled ? 'Bypass' : 'Enable'} ${effect.label.toLowerCase()} on ${track.name}`}
-														title={enabled ? `Bypass ${effect.label.toLowerCase()}` : `Enable ${effect.label.toLowerCase()}`}
-													>
-														<span aria-hidden="true" />
-													</button>
-													<strong>{effect.label}</strong>
-													{effect.definition.source === 'fallback' ? <span className="track-fx-unknown-badge">UNMAPPED</span> : null}
-													<code title={effect.expression}>{effect.expression}</code>
-													<div className="track-fx-drawer-effect-actions" role="group" aria-label={`${effect.label} order and removal`}>
-														<button type="button" onClick={() => onReorderEffect(track.id, effect.id, 'up')} disabled={isBusy || !trackDetails || index === 0} aria-label={`Move ${effect.label.toLowerCase()} up`} title="Move effect up">↑</button>
-														<button type="button" onClick={() => onReorderEffect(track.id, effect.id, 'down')} disabled={isBusy || !trackDetails || index === effects.length - 1} aria-label={`Move ${effect.label.toLowerCase()} down`} title="Move effect down">↓</button>
-														<button className="track-fx-remove" type="button" onClick={() => onRemoveEffect(track.id, effect.id)} disabled={isBusy || !trackDetails} aria-label={`Remove ${effect.label.toLowerCase()} from ${track.name}`} title={`Remove ${effect.label.toLowerCase()}`}>×</button>
-													</div>
-												</div>
-												<div className="track-fx-drawer-effect-parameters">
-													{effect.parameters.map((parameter) => {
-															const parameterMode = effectMode(parameter);
-															const parameterValue = parameter.value ?? (typeof parameter.defaultValue === 'number' ? parameter.defaultValue : 0);
-															return (
-															<div className="track-fx-drawer-effect-control" key={`${effect.id}-parameter-${parameter.index}`}>
+											</div>
+											<div className="track-fx-drawer-effect-parameters">
+												{effect.parameters.map((parameter) => {
+													const parameterMode = effectMode(parameter);
+													const parameterValue = parameter.value ?? (typeof parameter.defaultValue === 'number' ? parameter.defaultValue : 0);
+													const numericParameter = parameter.type === 'number' && parameter.min !== undefined && parameter.max !== undefined;
+													const sourceParameter = parameter.kind === 'dynamic';
+													return (
+														<div className={`track-fx-drawer-effect-control${sourceParameter ? ' track-fx-drawer-effect-control-source' : ''}${numericParameter ? ' track-fx-drawer-effect-control-numeric' : ''}`} key={`${effect.id}-parameter-${parameter.index}`}>
+															<div className="track-fx-parameter-head">
 																<span className="track-fx-parameter-label">{parameter.label}</span>
-																{parameter.type === 'option' && parameter.options?.length ? (
-																	<select
-																		className="track-fx-mode"
-																		value={parameter.expression.replace(/^['"`]|['"`]$/g, '')}
-																		disabled={isBusy || !trackDetails || !enabled}
-																		onChange={(event) => onSetEffect(track.id, effect.id, event.target.value, parameter.index)}
-																		aria-label={`${track.name} ${effect.label.toLowerCase()} ${parameter.label.toLowerCase()}`}
-																	>
-																		{parameter.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-																	</select>
-																) : parameter.type === 'number' && parameter.min !== undefined && parameter.max !== undefined ? (
-																	<>
+																{numericParameter ? (
 																	<select
 																		className="track-fx-mode"
 																		value={parameterMode}
-																		disabled={isBusy || !trackDetails}
+																		disabled={isBusy || !trackDetails || !enabled}
 																		onChange={(event) => {
 																			if (event.target.value === 'random') onSetEffect(track.id, effect.id, 'rand', parameter.index);
 																			if (event.target.value === 'manual') onSetEffect(track.id, effect.id, parameterValue, parameter.index);
@@ -558,46 +472,164 @@ export function TrackFxDrawer({
 																		<option value="manual">MANUAL</option>
 																		{parameter.supportsRandom ? <option value="random">RANDOM</option> : null}
 																	</select>
-																		<input
-																			className="track-fx-range"
-																			type="range"
-																			min={parameter.min}
-																			max={parameter.max}
-																			step={parameter.step ?? 0.01}
-																			value={parameterValue}
-																			disabled={isBusy || !trackDetails || !enabled || parameterMode !== 'manual'}
-																			onChange={(event) => onSetEffect(track.id, effect.id, Number(event.target.value), parameter.index)}
-																			aria-label={`${track.name} ${effect.label.toLowerCase()} ${parameter.label.toLowerCase()}`}
-																			title={`${parameter.label}: ${parameter.min}–${parameter.max}`}
-																		/>
-																		<output>{formatParameterValue(parameter)}</output>
-																	</>
-																) : (
+																) : null}
+																{numericParameter && !sourceParameter ? <output>{formatParameterValue(parameter)}</output> : null}
+															</div>
+															{sourceParameter ? (
+																<div className="track-fx-source-field">
+																	<span className="track-fx-source-field-mark" aria-hidden="true">ƒx</span>
 																	<input
-																		className="track-fx-expression"
+																		className="track-fx-expression track-fx-source-expression"
 																		type="text"
 																		value={parameter.expression}
 																		disabled={isBusy || !trackDetails || !enabled}
 																		onChange={(event) => onSetEffect(track.id, effect.id, event.target.value, parameter.index)}
-																		aria-label={`${track.name} ${effect.label.toLowerCase()} ${parameter.label.toLowerCase()}`}
+																		aria-label={`${track.name} ${effect.label.toLowerCase()} ${parameter.label.toLowerCase()} source expression`}
+																		title="Strudel source expression"
 																	/>
-																)}
 																</div>
-															);
-														})}
-												</div>
-											</div>
-										);
-									})}
+															) : parameter.type === 'option' && parameter.options?.length ? (
+																<select
+																	className="track-fx-option"
+																	value={parameter.expression.replace(/^['"`]|['"`]$/g, '')}
+																	disabled={isBusy || !trackDetails || !enabled}
+																	onChange={(event) => onSetEffect(track.id, effect.id, event.target.value, parameter.index)}
+																	aria-label={`${track.name} ${effect.label.toLowerCase()} ${parameter.label.toLowerCase()}`}
+																>
+																	{parameter.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+																</select>
+															) : numericParameter ? (
+																parameterMode === 'random' ? <span className="track-fx-random-value">RAND</span> : <input
+																	className="track-fx-range"
+																	type="range"
+																	min={parameter.min}
+																	max={parameter.max}
+																	step={parameter.step ?? 0.01}
+																	value={parameterValue}
+																	disabled={isBusy || !trackDetails || !enabled}
+																	onChange={(event) => onSetEffect(track.id, effect.id, Number(event.target.value), parameter.index)}
+																	aria-label={`${track.name} ${effect.label.toLowerCase()} ${parameter.label.toLowerCase()}`}
+																	title={`${parameter.label}: ${parameter.min}–${parameter.max}`}
+																/>
+															) : (
+																<input
+																	className="track-fx-expression"
+																	type="text"
+																	value={parameter.expression}
+																	disabled={isBusy || !trackDetails || !enabled}
+																	onChange={(event) => onSetEffect(track.id, effect.id, event.target.value, parameter.index)}
+																	aria-label={`${track.name} ${effect.label.toLowerCase()} ${parameter.label.toLowerCase()}`}
+																/>
+															)}
+														</div>
+												);
+											})}
+										</div>
+									</div>
+									);
+								})}
+								<div className="track-fx-drawer-add track-fx-drawer-add-tile">
+									<span className="track-fx-drawer-add-icon" aria-hidden="true">＋</span>
+									<strong className="track-fx-drawer-add-label">Add effect</strong>
+									<small>Browse the Strudel effect library</small>
+									<div className="track-fx-drawer-add-controls">
+										<div className="track-fx-effect-picker" ref={effectPickerRef}>
+											<button
+												id="track-fx-add-select"
+												className={`track-fx-effect-picker-trigger${effectPickerOpen ? ' track-fx-effect-picker-trigger-open' : ''}`}
+												type="button"
+												aria-haspopup="dialog"
+												aria-expanded={effectPickerOpen}
+												disabled={isBusy || !trackDetails || addableDefinitions.every((definition) => presentMethods.has(definition.method))}
+												onClick={toggleEffectPicker}
+												aria-label={selectedAddDefinition ? `${selectedAddDefinition.label} selected for ${track.name}` : `Choose an effect to add to ${track.name}`}
+											>
+												<span>{selectedAddDefinition?.label ?? 'Choose effect…'}</span>
+												<span aria-hidden="true">⌄</span>
+											</button>
+											{effectPickerOpen && effectPickerPosition && typeof document !== 'undefined' ? createPortal(
+												<div
+													ref={effectPickerPopoverRef}
+													className="track-fx-effect-picker-popover"
+													role="dialog"
+													aria-label={`Choose an effect to add to ${track.name}`}
+													style={{
+														'--track-color': trackColor,
+														left: effectPickerPosition.left,
+														width: effectPickerPosition.width,
+														maxHeight: effectPickerPosition.maxHeight,
+														...(effectPickerPosition.top !== undefined ? { top: effectPickerPosition.top } : { bottom: effectPickerPosition.bottom ?? 12 }),
+													} as CSSProperties}
+												>
+													<div className="track-fx-effect-picker-header">
+														<strong>Effects</strong>
+														<button type="button" aria-label="Close effect picker" onClick={() => setEffectPickerOpen(false)}>×</button>
+													</div>
+													<input
+														className="track-fx-effect-picker-search"
+														type="search"
+														value={effectQuery}
+														placeholder="Search effects…"
+														onChange={(event) => setEffectQuery(event.target.value)}
+														aria-label={`Search effects for ${track.name}`}
+														autoFocus
+													/>
+													<div className="track-fx-effect-picker-browse">
+														<div className="track-fx-effect-picker-groups-pane">
+															<span className="track-fx-effect-picker-groups-heading">Browse by category</span>
+															<div className="track-fx-effect-picker-groups" role="tablist" aria-label="Filter effects by category">
+																<button type="button" role="tab" aria-selected={!effectGroupFilter} className={!effectGroupFilter ? 'track-fx-effect-picker-group-active' : ''} onClick={() => setEffectGroupFilter('')}>All effects</button>
+																{effectGroups.map((group) => (
+																	<button key={group} type="button" role="tab" aria-selected={effectGroupFilter === group} className={effectGroupFilter === group ? 'track-fx-effect-picker-group-active' : ''} onClick={() => setEffectGroupFilter(group)}>{groupLabel(group)}</button>
+																))}
+															</div>
+														</div>
+														<div className="track-fx-effect-picker-results" role="listbox" aria-label={`Available effects for ${track.name}`}>
+															{filteredAddableDefinitions.length ? filteredAddableDefinitions.map((definition) => {
+																const alreadyAdded = presentMethods.has(definition.method);
+																return (
+																	<button
+																		className={`track-fx-effect-picker-option${addSelection === definition.method ? ' track-fx-effect-picker-option-selected' : ''}`}
+																		type="button"
+																		role="option"
+																		aria-selected={addSelection === definition.method}
+																		disabled={isBusy || !trackDetails || alreadyAdded}
+																		onClick={() => {
+																			setAddSelection(definition.method);
+																			setEffectPickerOpen(false);
+																			setEffectQuery('');
+																		}}
+																		aria-label={`${definition.label}${alreadyAdded ? ' already added' : ''}`}
+																	>
+																			<span>
+																				<strong>{definition.label}</strong>
+																				<code>.{definition.method}()</code>
+																			</span>
+																			<small>{definition.description}</small>
+																			{alreadyAdded ? <em>ADDED</em> : null}
+																		</button>
+																	);
+																}) : <p className="track-fx-effect-picker-empty">No effects match “{effectQuery}”.</p>}
+														</div>
+													</div>
+												</div>,
+												document.body,
+											) : null}
+										</div>
+										<button type="button" onClick={addEffect} disabled={isBusy || !trackDetails || !addSelection} aria-label={`Add selected effect to ${track.name}`}>ADD</button>
+									</div>
 								</div>
-							) : <p className="track-fx-drawer-empty-copy">No effects yet. Use Add effect above to build this track’s chain.</p>}
+							</div>
 						</section>
 					</>
 				) : mode === 'sounds' ? (
 					<section className="track-fx-drawer-section track-fx-drawer-sounds-section" aria-labelledby="track-fx-sounds-heading">
 						<div className="track-fx-drawer-section-heading">
-							<h3 id="track-fx-sounds-heading">Track sound</h3>
-							<span>{sounds.length ? `${sounds.length} voice${sounds.length === 1 ? '' : 's'}` : 'no sound'}</span>
+							<div className="track-fx-drawer-section-heading-main">
+								<h3 id="track-fx-sounds-heading">Sounds</h3>
+								{sounds.length > 1 ? <span className="track-sound-voice-count">{sounds.length} voices</span> : null}
+							</div>
+							<span>{sounds.length === 1 ? 'CURRENT .SOUND()' : sounds.length ? 'LAYERED SOURCES' : 'NO SOUND'}</span>
 						</div>
 						{sounds.length <= 1 ? <div className="track-sound-current">
 							<div>
@@ -609,46 +641,61 @@ export function TrackFxDrawer({
 								<span className="track-sound-definition-meta">{soundTypeLabel(sound.definition.type)} · {sound.definition.category.replace(/[-_]+/g, ' ')}</span>
 							) : sound ? <span className="track-fx-unknown-badge">UNMAPPED</span> : null}
 						</div> : null}
-					<div className="track-sound-picker" ref={soundPickerRef}>
-						{sounds.length > 1 ? (
-							<div className="track-sound-voice-list" aria-label={`${track.name} sound sources`}>
-								<div className="track-sound-voice-list-heading">
-									<span>Sound sources</span>
-									<strong>{sounds.length} voices</strong>
-								</div>
-								{sounds.map((voice) => (
-									<div className={`track-sound-voice${soundPickerTargetId === voice.id ? ' track-sound-voice-selected' : ''}`} key={voice.id}>
-										<div className="track-sound-voice-copy">
-											<span className="track-sound-voice-label">{voice.label}</span>
-											<strong>{voice.definition?.label ?? voice.token ?? 'Custom source expression'}</strong>
-											<code title={voice.expression}>{voice.expression}</code>
-											<small>{voice.definition ? `${soundTypeLabel(voice.definition.type)} · ${soundCategoryLabel(voice.definition.category)}` : 'Custom source expression'}</small>
-										</div>
+						<div className={`track-sound-picker${sounds.length > 1 ? ' track-sound-picker-layered' : ''}`} ref={soundPickerRef}>
+							{sounds.length > 1 ? (
+								<div className="track-sound-voice-list" aria-label={`${track.name} sound sources`}>
+									<div className="track-sound-voice-add">
+										<span className="track-sound-voice-add-icon" aria-hidden="true">＋</span>
+										<strong>Choose voice</strong>
+										<small>Browse or replace a Strudel sound</small>
 										<button
-											className="track-sound-voice-change"
+											className={`track-sound-picker-trigger${soundPickerOpen ? ' track-sound-picker-trigger-open' : ''}`}
 											type="button"
+											aria-haspopup="dialog"
+											aria-expanded={soundPickerOpen}
+											onClick={(event) => toggleSoundPicker(soundPickerTargetId, event.currentTarget)}
 											disabled={isBusy || !trackDetails}
-											onClick={(event) => openSoundPicker(voice.id, event.currentTarget)}
-											aria-label={`Change ${voice.label.toLowerCase()} for ${track.name}`}
+											aria-label={`Browse Strudel sounds for ${track.name}`}
 										>
-											Change
-										</button>
+												<span>Add or replace a voice</span>
+												<span aria-hidden="true">⌄</span>
+											</button>
 									</div>
-								))}
-							</div>
-						) : null}
-						<button
-							className={`track-sound-picker-trigger${soundPickerOpen ? ' track-sound-picker-trigger-open' : ''}`}
-							type="button"
-							aria-haspopup="dialog"
-							aria-expanded={soundPickerOpen}
-							onClick={(event) => toggleSoundPicker(sound?.id ?? soundPickerTargetId, event.currentTarget)}
-							disabled={isBusy || !trackDetails}
-							aria-label={`Browse Strudel sounds for ${track.name}`}
-						>
-							<span>{sounds.length > 1 ? 'Add or replace a voice' : 'Browse sounds'}</span>
-							<span aria-hidden="true">⌄</span>
-						</button>
+									{sounds.map((voice, index) => (
+										<article className={`track-sound-voice${soundPickerTargetId === voice.id ? ' track-sound-voice-selected' : ''}`} key={voice.id}>
+											<div className="track-sound-voice-copy">
+												<div className="track-sound-voice-topline">
+													<span className="track-sound-voice-index">{String(index + 1).padStart(2, '0')}</span>
+													<span className="track-sound-voice-label">{voice.label}</span>
+												</div>
+												<strong>{voice.definition?.label ?? voice.token ?? 'Custom source expression'}</strong>
+												<code title={voice.expression}>{voice.expression}</code>
+												<small>{voice.definition ? `${soundTypeLabel(voice.definition.type)} · ${soundCategoryLabel(voice.definition.category)}` : 'Custom source expression'}</small>
+											</div>
+											<button
+												className="track-sound-voice-change"
+												type="button"
+												disabled={isBusy || !trackDetails}
+												onClick={(event) => openSoundPicker(voice.id, event.currentTarget)}
+												aria-label={`Change ${voice.label.toLowerCase()} for ${track.name}`}
+											>
+												Change sound
+											</button>
+										</article>
+									))}
+								</div>
+							) : <button
+								className={`track-sound-picker-trigger${soundPickerOpen ? ' track-sound-picker-trigger-open' : ''}`}
+								type="button"
+								aria-haspopup="dialog"
+								aria-expanded={soundPickerOpen}
+								onClick={(event) => toggleSoundPicker(sound?.id ?? soundPickerTargetId, event.currentTarget)}
+								disabled={isBusy || !trackDetails}
+								aria-label={`Browse Strudel sounds for ${track.name}`}
+							>
+								<span>{sounds.length ? 'Change sound' : 'Choose a sound'}</span>
+								<span aria-hidden="true">⌄</span>
+							</button>}
 						{soundPickerOpen && soundPickerPosition && typeof document !== 'undefined' ? createPortal(
 							<div
 								ref={soundPickerPopoverRef}
@@ -791,7 +838,7 @@ export function TrackFxDrawer({
 							document.body,
 						) : null}
 					</div>
-						<p className="track-sound-note">Choosing a sound writes a literal source value. Custom and dynamic expressions remain intact until you choose a replacement.</p>
+						<p className="track-sound-note">Choosing a sound writes a literal <code>.sound(...)</code> value; custom expressions stay intact until replaced.</p>
 					</section>
 				) : (
 					<section className="track-fx-drawer-section track-fx-drawer-midi-placeholder" aria-labelledby="track-fx-midi-heading">
