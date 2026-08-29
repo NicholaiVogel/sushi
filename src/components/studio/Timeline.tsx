@@ -14,7 +14,6 @@ import {
 import type { HeaderPopover, TrackDetails } from './types';
 import { TrackLane, type TimelineCell } from './TrackLane';
 import type { StrudelVisualizer, VisualizerHap } from '../../lib/strudel/adapter';
-import type { SourceEffectMethod } from '../../lib/project/source-mapper';
 
 export interface TimelineProps {
 	timelineViewportRef: RefObject<HTMLElement | null>;
@@ -40,6 +39,7 @@ export interface TimelineProps {
 	getVisualizerSpectrumData: (trackId: string) => ArrayLike<number> | undefined;
 	isBusy: boolean;
 	selectedTrackId: string | null;
+	fxDrawerTrackId: string | null;
 	renamingTrackId: string | null;
 	renamingTrackValue: string;
 	openPopover: HeaderPopover | null;
@@ -50,6 +50,8 @@ export interface TimelineProps {
 	onStartTimelineSeekDrag: (event: PointerEvent<HTMLButtonElement>) => void;
 	onTimelineSeekKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => void;
 	onSelectTrack: (trackId: string) => void;
+	onOpenTrackFxDrawer: (trackId: string) => void;
+	onToggleTrackEffects: (trackId: string, enabled: boolean) => void;
 	onOpenTrackContextMenu: (event: MouseEvent<HTMLElement>, trackId: string) => void;
 	onTrackLaneKeyDown: (event: KeyboardEvent<HTMLDivElement>, trackId: string) => void;
 	onStartRename: (trackId: string) => void;
@@ -59,10 +61,6 @@ export interface TimelineProps {
 	onToggleTrackMode: (trackId: string, mode: 'mute' | 'solo', active: boolean) => void;
 	onSetTrackGain: (trackId: string, value: number) => void;
 	onSetTrackPan: (trackId: string, value: number) => void;
-	onSetTrackSlider: (trackId: string, sliderId: string, value: number) => void;
-	onSetTrackEffect: (trackId: string, effectId: string, value: number | 'rand') => void;
-	onAddTrackEffect: (trackId: string, method: SourceEffectMethod) => void;
-	onRemoveTrackEffect: (trackId: string, effectId: string) => void;
 	onStartTimingDrag: (event: PointerEvent<HTMLElement>, trackId: string, edge: 'start' | 'end' | 'move') => void;
 	onSetTrackRange: (trackId: string, startCycle: number, endCycle: number) => void;
 }
@@ -91,6 +89,7 @@ export function Timeline({
 	getVisualizerSpectrumData,
 	isBusy,
 	selectedTrackId,
+	fxDrawerTrackId,
 	renamingTrackId,
 	renamingTrackValue,
 	openPopover,
@@ -101,6 +100,8 @@ export function Timeline({
 	onStartTimelineSeekDrag,
 	onTimelineSeekKeyDown,
 	onSelectTrack,
+	onOpenTrackFxDrawer,
+	onToggleTrackEffects,
 	onOpenTrackContextMenu,
 	onTrackLaneKeyDown,
 	onStartRename,
@@ -110,10 +111,6 @@ export function Timeline({
 	onToggleTrackMode,
 	onSetTrackGain,
 	onSetTrackPan,
-	onSetTrackSlider,
-	onSetTrackEffect,
-	onAddTrackEffect,
-	onRemoveTrackEffect,
 	onStartTimingDrag,
 	onSetTrackRange,
 }: TimelineProps) {
@@ -183,9 +180,12 @@ export function Timeline({
 					getVisualizerScopeData={getVisualizerScopeData}
 					getVisualizerSpectrumData={getVisualizerSpectrumData}
 					selected={selectedTrackId === block.id}
+					fxDrawerOpen={fxDrawerTrackId === block.id}
 					renaming={renamingTrackId === block.id}
 					renamingValue={renamingTrackValue}
 					onSelect={onSelectTrack}
+					onOpenFxDrawer={onOpenTrackFxDrawer}
+					onToggleEffects={onToggleTrackEffects}
 					onContextMenu={onOpenTrackContextMenu}
 					onLaneKeyDown={onTrackLaneKeyDown}
 					onStartRename={onStartRename}
@@ -195,10 +195,6 @@ export function Timeline({
 					onToggleMode={onToggleTrackMode}
 					onSetGain={onSetTrackGain}
 					onSetPan={onSetTrackPan}
-					onSetSlider={onSetTrackSlider}
-					onSetEffect={onSetTrackEffect}
-					onAddEffect={onAddTrackEffect}
-					onRemoveEffect={onRemoveTrackEffect}
 					onStartTimingDrag={onStartTimingDrag}
 					onSetTrackRange={onSetTrackRange}
 					key={block.id}

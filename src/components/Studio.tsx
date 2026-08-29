@@ -16,20 +16,25 @@ import {
 	addTrackEffect,
 	cyclesToSeconds,
 	removeTrackEffect,
-	type SourceEffectMethod,
+	reorderTrackEffect,
+	toggleTrackEffect,
 	updateSourceKey,
 	updateSourceQuarterNotesPerCycle,
 	deleteTrack as deleteSourceTrack,
 	updateSourceBpm,
 	updateTrackGain,
 	updateTrackColor,
+	setTrackEffectsEnabled as setSourceTrackEffectsEnabled,
 	updateTrackMode,
 	updateTrackName as updateSourceTrackName,
 	updateTrackPan,
 	updateTrackRange as updateSourceTrackRange,
 	updateTrackEffect,
 	updateTrackSlider,
+	updateTrackSound as updateSourceTrackSound,
+	type SourceEffectValue,
 } from '../lib/project/source-mapper';
+import type { TrackEffectMethod } from '../lib/strudel/track-effects';
 import type { EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
@@ -43,7 +48,9 @@ import { StudioHeader } from './studio/StudioHeader';
 import { SourceEditor, CanvasDiagnostic, type StrudelCodeMirrorModule } from './studio/SourceEditor';
 import { Timeline } from './studio/Timeline';
 import { TrackContextMenu } from './studio/TrackContextMenu';
+import { TrackFxDrawer } from './studio/TrackFxDrawer';
 import { useStudioWebMcp } from './studio/useStudioWebMcp';
+import { APPEARANCE_STORAGE_KEY, normalizeAppearanceMode, readStoredAppearanceMode, type AppearanceMode } from '../lib/project/appearance';
 import {
 	clamp,
 	createInitialStudioState,
@@ -53,6 +60,7 @@ import {
 	getExplicitSourceEndCycle,
 	getKeyParts,
 	getSourceCycleStep,
+	getTrackColor,
 	getTrackTimingForTimeline,
 	formatClock,
 	formatCycle,
@@ -80,9 +88,12 @@ import type {
 } from './studio/types';
 export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
+	const [appearanceMode, setAppearanceMode] = useState<AppearanceMode>(readStoredAppearanceMode);
+	const [systemPrefersDark, setSystemPrefersDark] = useState(() => typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches);
 	const [editorWidth, setEditorWidth] = useState(350);
 	const [, setSourceHistoryVersion] = useState(0);
 	const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+	const [fxDrawerTrackId, setFxDrawerTrackId] = useState<string | null>(null);
 	const [contextMenu, setContextMenu] = useState<{ trackId: string; x: number; y: number } | null>(null);
 	const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
 	const [renamingTrackValue, setRenamingTrackValue] = useState('');
@@ -129,6 +140,39 @@ export default function Studio() {
 	const sourceTransactionsRef = useRef(new TransactionCache<WebMcpMutationResult>(SOURCE_HISTORY_LIMIT));
 	const webmcpRegistrationRef = useRef<WebMcpRegistration | null>(null);
 	const webmcpAvailableRef = useRef(false);
+	const isDarkMode = appearanceMode === 'dark' || (appearanceMode === 'system' && systemPrefersDark);
+
+	const handleAppearanceModeChange = useCallback((mode: AppearanceMode) => {
+		const nextMode = normalizeAppearanceMode(mode);
+		setAppearanceMode(nextMode);
+		try {
+			if (nextMode === 'system') window.localStorage.removeItem(APPEARANCE_STORAGE_KEY);
+			else window.localStorage.setItem(APPEARANCE_STORAGE_KEY, nextMode);
+		} catch {
+			// A blocked storage area should not prevent the in-session override.
+		}
+	}, []);
+
+	useEffect(() => {
+		if (typeof window === 'undefined') return undefined;
+		const media = window.matchMedia('(prefers-color-scheme: dark)');
+		const updatePreference = () => setSystemPrefersDark(media.matches);
+		updatePreference();
+		if (typeof media.addEventListener === 'function') {
+			media.addEventListener('change', updatePreference);
+			return () => media.removeEventListener('change', updatePreference);
+		}
+		media.addListener(updatePreference);
+		return () => media.removeListener(updatePreference);
+	}, []);
+
+	useEffect(() => {
+		if (typeof document === 'undefined') return;
+		const theme = isDarkMode ? 'dark' : 'light';
+		document.documentElement.dataset.theme = theme;
+		document.documentElement.style.colorScheme = theme;
+		document.querySelector('meta[name="theme-color"]')?.setAttribute('content', isDarkMode ? '#090b0c' : '#f4f6f3');
+	}, [isDarkMode]);
 
 	const handleEditorResizePointerMove = useCallback((event: PointerEvent) => {
 		const drag = editorResizeRef.current;
@@ -874,12 +918,27 @@ export default function Studio() {
 	);
 
 	const setTrackEffect = useCallback(
-		(trackId: string, effectId: string, value: number | 'rand') => updateTrackSource(trackId, (source) => updateTrackEffect(source, trackId, effectId, value)),
+		(trackId: string, effectId: string, value: SourceEffectValue, parameterIndex?: number) => updateTrackSource(trackId, (source) => updateTrackEffect(source, trackId, effectId, value, parameterIndex)),
+		[updateTrackSource],
+	);
+
+	const toggleTrackEffectInSource = useCallback(
+		(trackId: string, effectId: string, enabled: boolean) => updateTrackSource(trackId, (source) => toggleTrackEffect(source, trackId, effectId, enabled)),
+		[updateTrackSource],
+	);
+
+	const toggleTrackEffectsInSource = useCallback(
+		(trackId: string, enabled: boolean) => updateTrackSource(trackId, (source) => setSourceTrackEffectsEnabled(source, trackId, enabled)),
+		[updateTrackSource],
+	);
+
+	const reorderTrackEffectInSource = useCallback(
+		(trackId: string, effectId: string, direction: 'up' | 'down') => updateTrackSource(trackId, (source) => reorderTrackEffect(source, trackId, effectId, direction)),
 		[updateTrackSource],
 	);
 
 	const addTrackEffectToSource = useCallback(
-		(trackId: string, method: SourceEffectMethod) => updateTrackSource(trackId, (source) => addTrackEffect(source, trackId, method)),
+		(trackId: string, method: TrackEffectMethod) => updateTrackSource(trackId, (source) => addTrackEffect(source, trackId, method)),
 		[updateTrackSource],
 	);
 
@@ -890,6 +949,11 @@ export default function Studio() {
 
 	const setTrackColor = useCallback(
 		(trackId: string, value: string) => updateTrackSource(trackId, (source) => updateTrackColor(source, trackId, value)),
+		[updateTrackSource],
+	);
+
+	const setTrackSound = useCallback(
+		(trackId: string, value: string, soundId?: string) => updateTrackSource(trackId, (source) => updateSourceTrackSound(source, trackId, value, soundId)),
 		[updateTrackSource],
 	);
 
@@ -1069,16 +1133,23 @@ export default function Studio() {
 	const selectTrack = useCallback((trackId: string) => {
 		setSelectedTrackId(trackId);
 		setContextMenu(null);
+		setFxDrawerTrackId((current) => current ? trackId : current);
+	}, []);
+
+	const openTrackFxDrawer = useCallback((trackId: string) => {
+		setSelectedTrackId(trackId);
+		setContextMenu(null);
+		setFxDrawerTrackId((current) => current === trackId ? null : trackId);
 	}, []);
 
 	const beginTrackRename = useCallback((trackId: string) => {
 		const track = getSourceBlocks(studioRef.current.lastValid).find((block) => block.id === trackId);
 		if (!track) return;
-		setSelectedTrackId(trackId);
+		selectTrack(trackId);
 		setContextMenu(null);
 		setRenamingTrackId(trackId);
 		setRenamingTrackValue(track.name);
-	}, []);
+	}, [selectTrack]);
 
 	const cancelTrackRename = useCallback(() => {
 		setRenamingTrackId(null);
@@ -1399,6 +1470,11 @@ export default function Studio() {
 	const blocks = useMemo(() => getSourceBlocks(studio.lastValid), [studio.lastValid]);
 	const draftTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.draft).map((block) => [block.id, block])), [studio.draft]);
 	const validTrackDetails = useMemo(() => new Map(getSourceBlockDetails(studio.lastValid).map((block) => [block.id, block])), [studio.lastValid]);
+	const fxDrawerTrack = useMemo(() => blocks.find((block) => block.id === fxDrawerTrackId), [blocks, fxDrawerTrackId]);
+	const fxDrawerTrackDetails = fxDrawerTrack
+		? draftTrackDetails.get(fxDrawerTrack.id) ?? validTrackDetails.get(fxDrawerTrack.id)
+		: undefined;
+	const fxDrawerTrackColor = getTrackColor(fxDrawerTrackDetails?.color);
 	const contextMenuTrack = useMemo(() => blocks.find((block) => block.id === contextMenu?.trackId), [blocks, contextMenu?.trackId]);
 	const contextMenuTrackDetails = contextMenu?.trackId
 		? draftTrackDetails.get(contextMenu.trackId) ?? validTrackDetails.get(contextMenu.trackId)
@@ -1469,9 +1545,11 @@ export default function Studio() {
 
 	useEffect(() => {
 		if (selectedTrackId && !blocks.some((block) => block.id === selectedTrackId)) setSelectedTrackId(null);
+		if (fxDrawerTrackId && !blocks.some((block) => block.id === fxDrawerTrackId)) setFxDrawerTrackId(null);
 		if (contextMenu && !blocks.some((block) => block.id === contextMenu.trackId)) setContextMenu(null);
 		if (renamingTrackId && !blocks.some((block) => block.id === renamingTrackId)) cancelTrackRename();
-	}, [blocks, cancelTrackRename, contextMenu, renamingTrackId, selectedTrackId]);
+		if (fxDrawerTrackId && selectedTrackId && fxDrawerTrackId !== selectedTrackId && blocks.some((block) => block.id === selectedTrackId)) setFxDrawerTrackId(selectedTrackId);
+	}, [blocks, cancelTrackRename, contextMenu, fxDrawerTrackId, renamingTrackId, selectedTrackId]);
 
 	return (
 		<div className="studio-shell" ref={studioShellRef}>
@@ -1498,6 +1576,8 @@ export default function Studio() {
 				localProjects={localProjects}
 				localProjectsLoading={localProjectsLoading}
 				localProjectsError={localProjectsError}
+				appearanceMode={appearanceMode}
+				isDarkMode={isDarkMode}
 				projectImportInputRef={projectImportInputRef}
 				onTogglePopover={(popover) => setOpenHeaderPopover((current) => current === popover ? null : popover)}
 				onProjectNameChange={(name) => patchStudio({ projectName: name })}
@@ -1518,6 +1598,7 @@ export default function Studio() {
 				onLoadPreset={(preset) => { void loadEditorPreset(preset); }}
 				onLoadLocalProject={(projectId) => { void loadLocalProject(projectId); }}
 				onRefreshLocalProjects={() => { void refreshLocalProjects(); }}
+				onAppearanceModeChange={handleAppearanceModeChange}
 			/>
 
 			<div className="studio-body" style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
@@ -1582,6 +1663,7 @@ export default function Studio() {
 						getVisualizerSpectrumData={getVisualizerSpectrumData}
 						isBusy={isBusy}
 						selectedTrackId={selectedTrackId}
+						fxDrawerTrackId={fxDrawerTrackId}
 						renamingTrackId={renamingTrackId}
 						renamingTrackValue={renamingTrackValue}
 						openPopover={openHeaderPopover}
@@ -1592,6 +1674,8 @@ export default function Studio() {
 						onStartTimelineSeekDrag={startTimelineSeekDrag}
 						onTimelineSeekKeyDown={handleTimelineSeekKeyDown}
 						onSelectTrack={selectTrack}
+						onOpenTrackFxDrawer={openTrackFxDrawer}
+						onToggleTrackEffects={toggleTrackEffectsInSource}
 						onOpenTrackContextMenu={openTrackContextMenu}
 						onTrackLaneKeyDown={handleTrackLaneKeyDown}
 						onStartRename={beginTrackRename}
@@ -1601,10 +1685,6 @@ export default function Studio() {
 						onToggleTrackMode={toggleTrackMode}
 						onSetTrackGain={setTrackGain}
 						onSetTrackPan={setTrackPan}
-						onSetTrackSlider={setTrackSlider}
-						onSetTrackEffect={setTrackEffect}
-						onAddTrackEffect={addTrackEffectToSource}
-						onRemoveTrackEffect={removeTrackEffectFromSource}
 						onStartTimingDrag={startTimingDrag}
 						onSetTrackRange={setTrackRange}
 					/>
@@ -1612,6 +1692,21 @@ export default function Studio() {
 					{studio.diagnostics.length ? <CanvasDiagnostic diagnostic={studio.diagnostics[0]} /> : null}
 				</main>
 			</div>
+
+			{fxDrawerTrack ? <TrackFxDrawer
+				track={fxDrawerTrack}
+				trackColor={fxDrawerTrackColor}
+				trackDetails={fxDrawerTrackDetails}
+				isBusy={isBusy}
+				onClose={() => setFxDrawerTrackId(null)}
+				onSetSlider={setTrackSlider}
+				onSetEffect={setTrackEffect}
+				onToggleEffect={toggleTrackEffectInSource}
+				onAddEffect={addTrackEffectToSource}
+				onRemoveEffect={removeTrackEffectFromSource}
+				onReorderEffect={reorderTrackEffectInSource}
+				onSetSound={setTrackSound}
+			/> : null}
 
 			{contextMenu && contextMenuTrack ? <TrackContextMenu
 				track={contextMenuTrack}

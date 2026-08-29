@@ -2,6 +2,8 @@ import type { AssetManifestEntry, RuntimeState, SourceDiagnostic } from '../../l
 import { getSourceBlockDetails } from '../../lib/project/source-mapper';
 import type { StoredProjectSnapshot } from '../../lib/project/storage';
 
+export type { AppearanceMode } from '../../lib/project/appearance';
+
 export type StudioPhase = 'booting' | 'ready' | 'validating' | 'error';
 export type PersistenceState = 'loading' | 'ready' | 'unavailable';
 

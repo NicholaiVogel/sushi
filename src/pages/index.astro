@@ -15,6 +15,19 @@ const webmcpOriginTrialToken = import.meta.env.PUBLIC_WEBMCP_ORIGIN_TRIAL_TOKEN?
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width" />
+		<script is:inline>
+			(() => {
+				try {
+					const stored = window.localStorage.getItem('sushi-appearance');
+					const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+					const isDark = stored === 'dark' || (stored !== 'light' && prefersDark);
+					document.documentElement.dataset.theme = isDark ? 'dark' : 'light';
+					document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
+				} catch {
+					// The application will apply its default theme after hydration.
+				}
+			})();
+		</script>
 		<meta name="description" content={description} />
 		<meta name="theme-color" content="#0a0c0d" />
 		<meta name="generator" content={Astro.generator} />

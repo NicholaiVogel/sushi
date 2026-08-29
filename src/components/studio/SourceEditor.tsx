@@ -139,7 +139,7 @@ export function SourceEditor({
 						return true;
 					},
 				});
-				applySushiEditorTheme(editor);
+				applySushiEditorTheme(editor, editorModule.compartments?.theme);
 
 				if (disposed || !editor) {
 					editor?.destroy();

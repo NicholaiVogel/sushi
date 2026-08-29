@@ -1,4 +1,5 @@
 import type { SourceBlockSummary, SourceRange } from './model';
+import { extractStrudelSoundToken, getStrudelSoundDefinition } from '../strudel/sounds';
 
 export interface ParsedSourceBlock extends SourceBlockSummary {
 	sourceRange: SourceRange;
@@ -94,11 +95,7 @@ function firstSoundToken(expression: string): string | undefined {
 	const value = soundCall?.[1] ?? directSound?.[1];
 	if (!value) return undefined;
 
-	const token = value
-		.replace(/[<>]/g, ' ')
-		.split(/\s+/)
-		.find((part) => part && part !== '~');
-	return token?.replace(/^~/, '');
+	return extractStrudelSoundToken(value.replace(/[<>]/g, ' '));
 }
 
 const DISPLAY_NAME_OVERRIDES: Record<string, string> = {
@@ -123,6 +120,8 @@ function displayName(expression: string, index: number): string {
 	const normalizedToken = normalizedSoundToken(token);
 	const override = DISPLAY_NAME_OVERRIDES[normalizedToken];
 	if (override) return override;
+	const definition = getStrudelSoundDefinition(token);
+	if (definition) return definition.label;
 
 	const words = normalizedToken
 		.replace(/[_-]+/g, ' ')
@@ -135,6 +134,10 @@ function displayName(expression: string, index: number): string {
 
 function sourceType(expression: string): SourceBlockSummary['type'] {
 	const token = firstSoundToken(expression)?.toLowerCase() ?? '';
+	const definition = getStrudelSoundDefinition(token);
+	if (definition?.category.includes('drum') || definition?.category.includes('percussion')) return 'drum';
+	if (definition?.type === 'soundfont' || definition?.type === 'synth' || definition?.type === 'noise' || definition?.type === 'wavetable' || definition?.type === 'input') return 'synth';
+	if (definition?.type === 'sample') return 'sample';
 	if (/(?:bd|sd|cp|kick|snare|hat|drum|perc)/.test(token)) return 'drum';
 	if (/(?:synth|string|brass|piano|saw|sine|triangle|lead|bass|gm_)/.test(token)) return 'synth';
 	if (token) return 'sample';

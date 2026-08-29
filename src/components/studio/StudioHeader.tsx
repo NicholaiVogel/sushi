@@ -10,7 +10,7 @@ import {
 	getKeyParts,
 	KEY_ROOT_OPTIONS,
 } from './helpers';
-import type { HeaderPopover, PersistenceState } from './types';
+import type { AppearanceMode, HeaderPopover, PersistenceState } from './types';
 import { SettingsMenu } from './SettingsMenu';
 
 export interface StudioHeaderProps {
@@ -36,6 +36,8 @@ export interface StudioHeaderProps {
 	localProjects: readonly StoredProjectSummary[];
 	localProjectsLoading: boolean;
 	localProjectsError: string | null;
+	appearanceMode: AppearanceMode;
+	isDarkMode: boolean;
 	projectImportInputRef: RefObject<HTMLInputElement | null>;
 	onTogglePopover: (popover: HeaderPopover) => void;
 	onProjectNameChange: (name: string) => void;
@@ -56,6 +58,7 @@ export interface StudioHeaderProps {
 	onLoadPreset: (preset: EditorPreset) => void;
 	onLoadLocalProject: (projectId: string) => void;
 	onRefreshLocalProjects: () => void;
+	onAppearanceModeChange: (mode: AppearanceMode) => void;
 }
 
 export function StudioHeader({
@@ -81,6 +84,8 @@ export function StudioHeader({
 	localProjects,
 	localProjectsLoading,
 	localProjectsError,
+	appearanceMode,
+	isDarkMode,
 	projectImportInputRef,
 	onTogglePopover,
 	onProjectNameChange,
@@ -101,6 +106,7 @@ export function StudioHeader({
 	onLoadPreset,
 	onLoadLocalProject,
 	onRefreshLocalProjects,
+	onAppearanceModeChange,
 }: StudioHeaderProps) {
 	return (
 		<header className="studio-topbar" ref={headerRef}>
@@ -117,6 +123,8 @@ export function StudioHeader({
 						localProjects={localProjects}
 						localProjectsLoading={localProjectsLoading}
 						localProjectsError={localProjectsError}
+						appearanceMode={appearanceMode}
+						isDarkMode={isDarkMode}
 						projectImportInputRef={projectImportInputRef}
 						onSaveProject={onSaveProject}
 						onExportProject={onExportProject}
@@ -124,10 +132,11 @@ export function StudioHeader({
 						onLoadPreset={onLoadPreset}
 						onLoadLocalProject={onLoadLocalProject}
 						onRefreshLocalProjects={onRefreshLocalProjects}
+						onAppearanceModeChange={onAppearanceModeChange}
 					/> : null}
 				</div>
 				<a className="wordmark" href="/" aria-label="Sushi home">
-					<img className="wordmark-logo" src="/logos/brand-wordmark-white.png" alt="sushi" />
+					<img className="wordmark-logo" src={isDarkMode ? '/logos/brand-wordmark-white.png' : '/logos/brand-wordmark-color.png'} alt="sushi" />
 				</a>
 			</div>
 			<div className="topbar-session">

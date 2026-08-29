@@ -8,6 +8,7 @@ import {
 	getTrackDisplayTiming,
 	addTrackEffect,
 	removeTrackEffect,
+	reorderTrackEffect,
 	secondsToCycles,
 	updateSourceKey,
 	updateSourceQuarterNotesPerCycle,
@@ -21,6 +22,9 @@ import {
 	updateTrackRange,
 	updateTrackSlider,
 	updateTrackEffect,
+	updateTrackSound,
+	toggleTrackEffect,
+	setTrackEffectsEnabled,
 } from './source-mapper';
 
 const pulseId = 'trk_01J4PULSE';
@@ -142,7 +146,7 @@ $: s("sawtooth").lpf(slider(200, 200, 4000)).gain(slider(.5, 0, 1, .01))`;
 $: s("supersaw").detune(rand).lpenv(1).octave(0).room(1.7)`;
 		const [track] = getSourceBlockDetails(source);
 
-		expect(track.effects).toEqual([
+		expect(track.effects).toMatchObject([
 			{
 				id: 'effect-detune-0',
 				method: 'detune',
@@ -195,6 +199,8 @@ $: s("supersaw").detune(rand).lpenv(1).octave(0).room(1.7)`;
 				supportsRandom: false,
 			},
 		]);
+		expect(track.effects[0].definition.source).toBe('strudel');
+		expect(track.effects[0].parameters[0]).toMatchObject({ name: 'amount', kind: 'random' });
 
 		const manual = updateTrackEffect(source, 'trk_fx', 'effect-detune-0', 4.2);
 		const random = updateTrackEffect(manual, 'trk_fx', 'effect-detune-0', 'rand');
@@ -208,6 +214,101 @@ $: s("supersaw").detune(rand).lpenv(1).octave(0).room(1.7)`;
 
 		const addedRoom = addTrackEffect(withoutRoom, 'trk_fx', 'room');
 		expect(addedRoom).toContain('.room(0.5)');
+	});
+
+	test('bypasses and reorders supported Strudel FX controls in source', () => {
+		const source = `// @sushi-track {"id":"trk_fx_drawer","name":"FX layer","type":"synth","schema":1}
+$: s("supersaw").detune(rand).lpenv(1).octave(0).room(1.7)`;
+		const bypassed = toggleTrackEffect(source, 'trk_fx_drawer', 'effect-room-0', false);
+		const [bypassedTrack] = getSourceBlockDetails(bypassed);
+		expect(bypassed).toContain('/* @sushi-bypass .room(1.7) */');
+		expect(bypassedTrack.effects.at(-1)).toMatchObject({ id: 'effect-room-0', expression: '1.7', enabled: false });
+
+		const updated = updateTrackEffect(bypassed, 'trk_fx_drawer', 'effect-room-0', 0.25);
+		expect(updated).toContain('/* @sushi-bypass .room(0.25) */');
+		const restored = toggleTrackEffect(updated, 'trk_fx_drawer', 'effect-room-0', true);
+		expect(restored).toContain('.room(0.25)');
+		expect(restored).not.toContain('@sushi-bypass');
+
+		const moved = reorderTrackEffect(source, 'trk_fx_drawer', 'effect-room-0', 'up');
+		expect(moved.indexOf('.room(1.7)')).toBeLessThan(moved.indexOf('.octave(0)'));
+	});
+
+	test('ignores nested effect calls inside callback expressions', () => {
+		const source = `// @sushi-track {"id":"trk_nested_fx","name":"Nested FX","type":"synth","schema":1}
+$: s("bd").when(x => x.delay(1)).room(.2).crush(4)`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.effects.map((effect) => effect.method)).toEqual(['room', 'crush']);
+		const bypassed = toggleTrackEffect(source, 'trk_nested_fx', 'effect-room-0', false);
+		expect(bypassed).toContain('.when(x => x.delay(1))');
+		expect(bypassed).toContain('/* @sushi-bypass .room(.2) */');
+		expect(bypassed).not.toContain('@sushi-bypass .delay(1)');
+
+		const moved = reorderTrackEffect(source, 'trk_nested_fx', 'effect-room-0', 'down');
+		expect(moved).toContain('.when(x => x.delay(1)).crush(4).room(.2)');
+	});
+
+	test('discovers controls inside timing wrappers', () => {
+		const source = `// @sushi-track {"id":"trk_wrapped_chain","name":"Wrapped Chain","type":"synth","schema":1}
+$: seqPLoop([0, 4, s("bd").when(x => x.delay(1)).room(.2)])`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.sound?.token).toBe('bd');
+		expect(track.effects.map((effect) => effect.method)).toEqual(['room']);
+	});
+
+	test('resolves ambiguous Strudel aliases to their runtime controls', () => {
+		const source = `// @sushi-track {"id":"trk_alias_fx","name":"Alias FX","type":"synth","schema":1}
+$: s("bd").size(2).delaytime(.5)`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.effects.map((effect) => effect.method)).toEqual(['roomsize', 'delaytime']);
+		expect(updateTrackEffect(source, 'trk_alias_fx', 'effect-roomsize-0', 3)).toContain('.size(3)');
+	});
+
+	test('bulk enables and bypasses every effect in a source lane', () => {
+		const source = `// @sushi-track {"id":"trk_bulk_fx","name":"Bulk FX","type":"synth","schema":1}
+$: s("supersaw").detune(rand).room(1.7).futureEffect(sine.range(0, 1))`;
+		const bypassed = setTrackEffectsEnabled(source, 'trk_bulk_fx', false);
+		expect(bypassed.match(/@sushi-bypass/g)).toHaveLength(3);
+		expect(getSourceBlockDetails(bypassed)[0].effects.every((effect) => effect.enabled === false)).toBe(true);
+
+		const enabled = setTrackEffectsEnabled(bypassed, 'trk_bulk_fx', true);
+		expect(enabled).toContain('.detune(rand).room(1.7).futureEffect(sine.range(0, 1))');
+		expect(enabled).not.toContain('@sushi-bypass');
+	});
+
+	test('keeps unknown Strudel controls as generic effects and can edit them', () => {
+		const source = `// @sushi-track {"id":"trk_future_fx","name":"Future FX","type":"synth","schema":1}
+$: s("supersaw").futureEffect(sine.range(0, 1)).chorus(.4)`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.effects).toHaveLength(2);
+		expect(track.effects[0]).toMatchObject({ method: 'futureEffect', label: 'FUTURE EFFECT', definition: { source: 'fallback', group: 'unknown' }, kind: 'dynamic' });
+		expect(track.effects[0].parameters[0]).toMatchObject({ type: 'expression', expression: 'sine.range(0, 1)' });
+
+		const edited = updateTrackEffect(source, 'trk_future_fx', 'effect-futureEffect-0', 'triangle.range(0, 1)');
+		expect(edited).toContain('.futureEffect(triangle.range(0, 1)).chorus(.4)');
+		const bypassed = toggleTrackEffect(edited, 'trk_future_fx', 'effect-futureEffect-0', false);
+		expect(bypassed).toContain('/* @sushi-bypass .futureEffect(triangle.range(0, 1)) */');
+		const removed = removeTrackEffect(bypassed, 'trk_future_fx', 'effect-futureEffect-0');
+		expect(removed).toContain('.chorus(.4)');
+	});
+
+	test('does not classify ordinary pattern helpers as unknown effects', () => {
+		const source = `// @sushi-track {"id":"trk_pattern_helpers","name":"Pattern helpers","type":"synth","schema":1}
+$: n("0").scale("c:minor").fast(2).range(0, 1).when(() => true).room(.5)`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.effects.map((effect) => effect.method)).toEqual(['room']);
+	});
+
+	test('supports multi-parameter effect updates through the shared definitions', () => {
+		const source = `// @sushi-track {"id":"trk_distort","name":"Distort","type":"synth","schema":1}
+$: s("bd").distort(2, .5, "diode")`;
+		const updated = updateTrackEffect(source, 'trk_distort', 'effect-distort-0', 0.8, 1);
+		expect(updated).toContain('.distort(2, 0.8, "diode")');
 	});
 
 	test('ignores sliders inside source comments', () => {
@@ -475,6 +576,93 @@ $: s("sine") // ._scope()
 
 		expect(track.name).toBe('GM Synth Bass 1');
 		expect(track.type).toBe('synth');
+		expect(track.sound).toMatchObject({ method: 'sound', kind: 'static', value: 'gm_synth_bass_1', definition: { id: 'gm_synth_bass_1' } });
+	});
+
+	test('projects unknown and dynamic sounds without rejecting their source', () => {
+		const source = [
+			'// @sushi-track {"id":"trk_unknown_sound","name":"Unknown","type":"sample","schema":1}',
+			'$: s("future_custom_sound")',
+			'// @sushi-track {"id":"trk_dynamic_sound","name":"Dynamic","type":"sample","schema":1}',
+			'_: sound(soundName)',
+		].join('\n');
+		const [unknown, dynamic] = getSourceBlockDetails(source);
+
+		expect(unknown.sound).toMatchObject({ kind: 'static', value: 'future_custom_sound', token: 'future_custom_sound' });
+		expect(unknown.sound?.definition).toBeUndefined();
+		expect(dynamic.sound).toMatchObject({ kind: 'dynamic', expression: 'soundName', token: 'soundName' });
+	});
+
+	test('updates first sound calls and appends a sound to tracks without one', () => {
+		const source = [
+			'// @sushi-track {"id":"trk_short","name":"Short","type":"synth","schema":1}',
+			'$: n("c4").s("sawtooth").gain(.5)',
+			'// @sushi-track {"id":"trk_long","name":"Long","type":"synth","schema":1}',
+			'$: n("c4").sound(soundName).gain(.5)',
+			'// @sushi-track {"id":"trk_direct","name":"Direct","type":"synth","schema":1}',
+			'$: ("triangle").note("c4")',
+			'// @sushi-track {"id":"trk_append","name":"Append","type":"synth","schema":1}',
+			'$: n("c4").gain(.5)',
+		].join('\n');
+
+		const updated = updateTrackSound(source, 'trk_short', 'piano');
+		const dynamic = updateTrackSound(updated, 'trk_long', 'supersaw');
+		const direct = updateTrackSound(dynamic, 'trk_direct', 'sine');
+		const appended = updateTrackSound(direct, 'trk_append', 'bytebeat');
+
+		expect(appended).toContain('$: n("c4").s("piano").gain(.5)');
+		expect(appended).toContain('$: n("c4").sound("supersaw").gain(.5)');
+		expect(appended).toContain('$: ("sine").note("c4")');
+		expect(appended).toContain('$: n("c4").gain(.5).sound("bytebeat")');
+	});
+
+	test('keeps nested sound calls out of source sound edits', () => {
+		const source = `// @sushi-track {"id":"trk_nested_sound","name":"Nested Sound","type":"sample","schema":1}
+$: s("bd").when(() => s("sd")).sound("hh")`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.sound?.token).toBe('bd');
+		const updated = updateTrackSound(source, 'trk_nested_sound', 'cp');
+		expect(updated).toContain('$: s("cp").when(() => s("sd")).sound("hh")');
+	});
+
+	test('projects layered sound voices and updates a selected nested call', () => {
+		const source = `// @sushi-track {"id":"trk_layered_sound","name":"Layered","type":"synth","schema":1}
+$: seqPLoop([n("<0 2 -1 -2>/2")
+  .layer(
+    x => x.transpose(-12).sound("supersaw").gain(.22),
+    x => x.transpose(-24).sound("sine").gain(.15)
+  )
+  .lpf(1050)])`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.sounds.map((voice) => voice.token)).toEqual(['supersaw', 'sine']);
+		expect(track.sounds.map((voice) => voice.scope)).toEqual(['nested', 'nested']);
+		expect(track.sounds.map((voice) => voice.label)).toEqual(['Nested voice 1', 'Nested voice 2']);
+		expect(track.sound?.id).toBe('sound-0');
+
+		const updated = updateTrackSound(source, track.id, 'triangle', 'sound-1');
+		expect(updated).toContain('x => x.transpose(-12).sound("supersaw").gain(.22)');
+		expect(updated).toContain('x => x.transpose(-24).sound("triangle").gain(.15)');
+	});
+
+	test('keeps nested mixer and color calls out of track-level controls', () => {
+		const source = `// @sushi-track {"id":"trk_layered_mix","name":"Layered mix","type":"synth","schema":1}
+$: n("0").layer(
+  x => x.sound("supersaw").gain(.22).color("#ff0000"),
+  x => x.sound("sine").gain(.15)
+)`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.gain).toBeUndefined();
+		expect(track.color).toBeUndefined();
+		expect(track.gainEditable).toBe(true);
+		expect(track.colorEditable).toBe(true);
+
+		const withGain = updateTrackGain(source, track.id, 0.8);
+		const withColor = updateTrackColor(withGain, track.id, '#00ff00');
+		expect(withColor).toContain('x => x.sound("supersaw").gain(.22).color("#ff0000")');
+		expect(withColor).toContain(').gain(0.8).color("#00ff00")');
 	});
 
 	test('projects an ordinary seven-lane Strudel song without Sushi markers', () => {

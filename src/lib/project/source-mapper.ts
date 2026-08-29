@@ -1,10 +1,30 @@
 import { getParsedSourceBlocks } from './source-parser';
 import type { SourceBlockSummary, SourceRange } from './model';
+import {
+	getTrackEffectDefinition,
+	getTrackEffectParameterDefinition,
+	getUnknownTrackEffectDefinition,
+	isExcludedTrackControl,
+	isLikelyTrackEffectMethod,
+	normalizeTrackEffectMethod,
+	parseTrackEffectParameter,
+	type TrackEffectDefinition,
+	type TrackEffectGroup,
+	type TrackEffectInput,
+	type TrackEffectMethod,
+	type TrackEffectParameter,
+	type TrackEffectValueKind,
+} from '../strudel/track-effects';
+import {
+	parseStrudelSoundArgument,
+	type ParsedStrudelSoundArgument,
+	type StrudelSoundDefinition,
+} from '../strudel/sounds';
 
 /**
- * The small, deliberately conservative source subset used by the first DAW
- * surface. The source document remains canonical; this module only projects a
- * marked block and applies edits inside that complete block.
+ * The source document remains canonical; this module projects a marked block
+ * and applies edits inside that complete block. Strudel effect metadata lives
+ * in the shared library so this mapper does not need its own effect list.
  */
 export interface SourceBlockDetails extends SourceBlockSummary {
 	sourceRange: SourceRange;
@@ -14,6 +34,9 @@ export interface SourceBlockDetails extends SourceBlockSummary {
 	marker: boolean;
 	timing: TrackTiming;
 	visualizer?: TrackVisualizer;
+	sound?: SourceSound;
+	/** Every sound call in the lane, including voices nested in callbacks such as `.layer()`. */
+	sounds: SourceSound[];
 	sliders: SourceSlider[];
 	effects: SourceEffect[];
 	gain?: number;
@@ -37,6 +60,24 @@ export type TrackTimingMode = 'full' | 'seqPLoop' | 'arrange';
 /** A Strudel editor visualizer requested by a source track. */
 export type TrackVisualizer = 'pianoroll' | 'scope' | 'spectrum';
 
+/** Sound call location within a source lane. */
+export type SourceSoundMethod = 's' | 'sound' | 'direct';
+
+export type SourceSoundScope = 'track' | 'nested';
+
+export interface SourceSound extends ParsedStrudelSoundArgument {
+	/** Stable within a source lane for the current source projection. */
+	id: string;
+	method: SourceSoundMethod;
+	/** Top-level calls are track voices; callback calls are nested voices. */
+	scope: SourceSoundScope;
+	/** Callback nesting depth, where zero means the track expression itself. */
+	depth: number;
+	/** Compact role label for editors (for example, `Main voice` or `Nested voice 2`). */
+	label: string;
+	definition?: StrudelSoundDefinition;
+}
+
 /** A numeric Strudel `slider(...)` widget projected onto a source lane. */
 export interface SourceSlider {
 	/** Stable within a source lane; based on the slider call's ordinal. */
@@ -49,47 +90,33 @@ export interface SourceSlider {
 	step?: number;
 }
 
-export type SourceEffectMethod = 'detune' | 'lpenv' | 'octave' | 'room';
-export type SourceEffectKind = 'numeric' | 'random' | 'dynamic';
+/** A Strudel effect call projected onto a source lane. */
+export type SourceEffectMethod = TrackEffectMethod;
+export type SourceEffectKind = TrackEffectValueKind;
+export type SourceEffectValue = TrackEffectInput;
 
-/** A supported Strudel effect call projected onto a source lane. */
 export interface SourceEffect {
 	/** Stable within a source lane; based on the effect method and ordinal. */
 	id: string;
+	/** Canonical Strudel method used by the shared effect library. */
 	method: SourceEffectMethod;
+	/** The method metadata used by parsing, serialization, and the UI. */
+	definition: TrackEffectDefinition;
+	group: TrackEffectGroup;
 	label: string;
 	kind: SourceEffectKind;
 	/** The original first argument, retained for dynamic/source-backed values. */
 	expression: string;
+	/** False when Sushi has wrapped the call in a source-level bypass comment. */
+	enabled?: boolean;
 	value?: number;
 	min: number;
 	max: number;
 	step: number;
 	defaultValue: number;
 	supportsRandom: boolean;
+	parameters: TrackEffectParameter[];
 }
-
-export interface SourceEffectDefinition {
-	method: SourceEffectMethod;
-	label: string;
-	min: number;
-	max: number;
-	step: number;
-	defaultValue: number;
-	supportsRandom: boolean;
-}
-
-/**
- * The first FX palette is intentionally small and source-friendly. Keeping
- * definitions in one place makes the lane control reusable and gives future
- * Strudel methods a single, typed extension point.
- */
-export const SOURCE_EFFECT_DEFINITIONS: readonly SourceEffectDefinition[] = [
-	{ method: 'detune', label: 'DETUNE', min: 0, max: 24, step: 0.1, defaultValue: 0, supportsRandom: true },
-	{ method: 'lpenv', label: 'LP ENV', min: -8, max: 8, step: 0.1, defaultValue: 1, supportsRandom: false },
-	{ method: 'octave', label: 'OCTAVE', min: -4, max: 4, step: 1, defaultValue: 0, supportsRandom: false },
-	{ method: 'room', label: 'ROOM', min: 0, max: 1, step: 0.01, defaultValue: 0.5, supportsRandom: false },
-];
 
 export interface TrackTiming {
 	mode: TrackTimingMode;
@@ -272,15 +299,24 @@ function baseTrackLabel(label: string | undefined): string {
 	return withoutMode || '$';
 }
 
+function topLevelMethodMatch(expression: string, pattern: RegExp): RegExpMatchArray | undefined {
+	const callbackRanges = sourceCallbackRanges(expression);
+	const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+	for (const match of expression.matchAll(new RegExp(pattern.source, flags))) {
+		if (match.index === undefined || !sourceCallbackRangeAt(callbackRanges, match.index)) return match;
+	}
+	return undefined;
+}
+
 function numericMethodValue(expression: string, method: 'gain' | 'pan'): number | undefined {
-	const match = expression.match(new RegExp(`\\.${method}\\s*\\(\\s*(${numericLiteral})\\s*\\)`));
+	const match = topLevelMethodMatch(expression, new RegExp(`\\.${method}\\s*\\(\\s*(${numericLiteral})\\s*\\)`));
 	if (!match) return undefined;
 	const value = Number(match[1]);
 	return Number.isFinite(value) ? value : undefined;
 }
 
 function hasMethod(expression: string, method: string): boolean {
-	return new RegExp(`\\.${method}\\s*\\(`).test(expression);
+	return topLevelMethodMatch(expression, new RegExp(`\\.${method}\\s*\\(`)) !== undefined;
 }
 
 function normalizeSourceColor(value: string): string | undefined {
@@ -289,7 +325,7 @@ function normalizeSourceColor(value: string): string | undefined {
 }
 
 function sourceColorValue(expression: string): string | undefined {
-	const match = expression.match(colorMethodPattern);
+	const match = topLevelMethodMatch(expression, colorMethodPattern);
 	return match ? normalizeSourceColor(match[3]) : undefined;
 }
 
@@ -305,16 +341,25 @@ interface SourceSliderCall {
 
 interface SourceEffectCall {
 	method: SourceEffectMethod;
+	definition: TrackEffectDefinition;
 	ordinal: number;
 	start: number;
 	end: number;
+	callStart: number;
+	callEnd: number;
 	valueStart: number;
 	valueEnd: number;
 	arguments: string[];
+	enabled: boolean;
 }
 
-function sourceEffectDefinition(method: string): SourceEffectDefinition | undefined {
-	return SOURCE_EFFECT_DEFINITIONS.find((definition) => definition.method === method);
+interface SourceSoundCall {
+	method: SourceSoundMethod;
+	callStart: number;
+	callEnd: number;
+	valueStart: number;
+	valueEnd: number;
+	arguments: string[];
 }
 
 function skipSourceString(source: string, start: number, end: number): number {
@@ -360,6 +405,129 @@ function findMatchingCallEnd(source: string, open: number): number | undefined {
 	return undefined;
 }
 
+function findMatchingDelimiter(source: string, open: number, opening: string, closing: string): number | undefined {
+	let depth = 1;
+	for (let index = open + 1; index < source.length; index += 1) {
+		const character = source[index];
+		const next = source[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(source, index, source.length) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = source.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? source.length : lineEnd) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = source.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? source.length : commentEnd + 2) - 1;
+			continue;
+		}
+		if (character === opening) depth += 1;
+		if (character === closing && --depth === 0) return index;
+	}
+	return undefined;
+}
+
+interface SourceCallbackRange {
+	start: number;
+	end: number;
+}
+
+function findArrowExpressionEnd(source: string, start: number): number {
+	let depth = 0;
+	for (let index = start; index < source.length; index += 1) {
+		const character = source[index];
+		const next = source[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(source, index, source.length) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = source.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? source.length : lineEnd) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = source.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? source.length : commentEnd + 2) - 1;
+			continue;
+		}
+		if (character === '(' || character === '[' || character === '{') {
+			depth += 1;
+			continue;
+		}
+		if (character === ')' || character === ']' || character === '}') {
+			if (depth === 0) return index;
+			depth -= 1;
+			continue;
+		}
+		if (depth === 0 && (character === ',' || character === ';')) return index;
+	}
+	return source.length;
+}
+
+/**
+ * Locate callback bodies so source projections can keep nested pattern code
+ * intact while still discovering controls inside wrappers such as seqPLoop.
+ */
+function sourceCallbackRanges(expression: string): SourceCallbackRange[] {
+	const ranges: SourceCallbackRange[] = [];
+	for (let index = 0; index < expression.length; index += 1) {
+		const character = expression[index];
+		const next = expression[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(expression, index, expression.length) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = expression.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? expression.length : lineEnd) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = expression.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? expression.length : commentEnd + 2) - 1;
+			continue;
+		}
+		if (expression.startsWith('=>', index)) {
+			let bodyStart = index + 2;
+			while (/\s/.test(expression[bodyStart] ?? '')) bodyStart += 1;
+			if (expression[bodyStart] === '{') {
+				const close = findMatchingDelimiter(expression, bodyStart, '{', '}');
+				ranges.push({ start: bodyStart, end: close === undefined ? expression.length : close + 1 });
+				if (close !== undefined) index = close;
+				continue;
+			}
+			ranges.push({ start: bodyStart, end: findArrowExpressionEnd(expression, bodyStart) });
+			continue;
+		}
+		if (!expression.startsWith('function', index) || /[-\w$]/.test(expression[index - 1] ?? '') || /[-\w$]/.test(expression[index + 8] ?? '')) continue;
+		let bodyStart = index + 8;
+		let parameterDepth = 0;
+		for (; bodyStart < expression.length; bodyStart += 1) {
+			const bodyCharacter = expression[bodyStart];
+			if (bodyCharacter === '"' || bodyCharacter === "'" || bodyCharacter === '`') {
+				bodyStart = skipSourceString(expression, bodyStart, expression.length) - 1;
+				continue;
+			}
+			if (bodyCharacter === '(') parameterDepth += 1;
+			if (bodyCharacter === ')' && parameterDepth > 0) parameterDepth -= 1;
+			if (bodyCharacter === '{' && parameterDepth === 0) break;
+		}
+		if (expression[bodyStart] !== '{') continue;
+		const close = findMatchingDelimiter(expression, bodyStart, '{', '}');
+		ranges.push({ start: bodyStart, end: close === undefined ? expression.length : close + 1 });
+		if (close !== undefined) index = close;
+	}
+	return ranges;
+}
+
+function sourceCallbackRangeAt(ranges: readonly SourceCallbackRange[], index: number): SourceCallbackRange | undefined {
+	return ranges.find((range) => index >= range.start && index < range.end);
+}
+
 function splitCallArguments(source: string, start: number, end: number): Array<{ start: number; end: number; text: string }> {
 	const result: Array<{ start: number; end: number; text: string }> = [];
 	let argumentStart = start;
@@ -392,14 +560,172 @@ function splitCallArguments(source: string, start: number, end: number): Array<{
 	return result;
 }
 
+function parseSourceSoundMethod(expression: string, start: number, method: 's' | 'sound'): SourceSoundCall | undefined {
+	const previous = expression[start - 1] ?? '';
+	const afterMethod = expression[start + method.length] ?? '';
+	if (/[-\w$]/.test(previous) || /[-\w$]/.test(afterMethod)) return undefined;
+	let open = start + method.length;
+	while (/\s/.test(expression[open] ?? '')) open += 1;
+	if (expression[open] !== '(') return undefined;
+	const close = findMatchingCallEnd(expression, open);
+	if (close === undefined) return undefined;
+	const args = splitCallArguments(expression, open + 1, close);
+	const firstArgument = args[0];
+	if (!firstArgument || !firstArgument.text.trim()) return undefined;
+	return {
+		method,
+		callStart: start,
+		callEnd: close + 1,
+		valueStart: firstArgument.start,
+		valueEnd: firstArgument.end,
+		arguments: args.map((argument) => argument.text),
+	};
+}
+
+function parseDirectSourceSound(expression: string, start: number): SourceSoundCall | undefined {
+	let firstArgumentStart = start + 1;
+	while (/\s/.test(expression[firstArgumentStart] ?? '')) firstArgumentStart += 1;
+	if (!['"', "'", '`'].includes(expression[firstArgumentStart] ?? '')) return undefined;
+	const close = findMatchingCallEnd(expression, start);
+	if (close === undefined) return undefined;
+	const after = expression.slice(close + 1);
+	if (!/^\s*\.note\s*\(/.test(after)) return undefined;
+	return {
+		method: 'direct',
+		callStart: start,
+		callEnd: close + 1,
+		valueStart: start + 1,
+		valueEnd: close,
+		arguments: [expression.slice(start + 1, close)],
+	};
+}
+
+function sourceSoundCalls(expression: string, includeNested = false): SourceSoundCall[] {
+	const calls: SourceSoundCall[] = [];
+	const callbackRanges = sourceCallbackRanges(expression);
+	for (let index = 0; index < expression.length; index += 1) {
+		const character = expression[index];
+		const next = expression[index + 1];
+		if (character === '"' || character === "'" || character === '`') {
+			index = skipSourceString(expression, index, expression.length) - 1;
+			continue;
+		}
+		if (character === '/' && next === '/') {
+			const lineEnd = expression.indexOf('\n', index + 2);
+			index = (lineEnd === -1 ? expression.length : lineEnd) - 1;
+			continue;
+		}
+		if (character === '/' && next === '*') {
+			const commentEnd = expression.indexOf('*/', index + 2);
+			index = (commentEnd === -1 ? expression.length : commentEnd + 2) - 1;
+			continue;
+		}
+		if (!includeNested) {
+			const callbackRange = sourceCallbackRangeAt(callbackRanges, index);
+			if (callbackRange) {
+				index = callbackRange.end - 1;
+				continue;
+			}
+		}
+		if (expression.startsWith('sound', index)) {
+			const parsed = parseSourceSoundMethod(expression, index, 'sound');
+			if (parsed) {
+				calls.push(parsed);
+				index = parsed.callEnd - 1;
+				continue;
+			}
+		}
+		if (character === 's') {
+			const parsed = parseSourceSoundMethod(expression, index, 's');
+			if (parsed) {
+				calls.push(parsed);
+				index = parsed.callEnd - 1;
+				continue;
+			}
+		}
+		if (character === '(') {
+			const parsed = parseDirectSourceSound(expression, index);
+			if (parsed) {
+				calls.push(parsed);
+				index = parsed.callEnd - 1;
+				continue;
+			}
+		}
+	}
+	return calls;
+}
+
+/**
+ * Project every sound call, including calls inside callback bodies such as
+ * `.layer(x => x.sound("supersaw"), x => x.sound("sine"))`.
+ *
+ * Top-level source edits continue to use `sourceSoundCalls(expression)` so
+ * existing track-level behavior remains source-safe. Nested entries get an
+ * ordinal id that the drawer can pass back when editing a specific voice.
+ */
+function sourceSoundValues(expression: string): SourceSound[] {
+	const calls = sourceSoundCalls(expression, true);
+	const callbackRanges = sourceCallbackRanges(expression);
+	let trackOrdinal = 0;
+	let nestedOrdinal = 0;
+
+	return calls.flatMap((call, index) => {
+		const parsed = parseStrudelSoundArgument(call.arguments[0]);
+		if (!parsed) return [];
+		const depth = callbackRanges.filter((range) => call.callStart >= range.start && call.callStart < range.end).length;
+		const scope: SourceSoundScope = depth > 0 ? 'nested' : 'track';
+		const ordinal = scope === 'nested' ? nestedOrdinal++ : trackOrdinal++;
+		return [{
+			id: `sound-${index}`,
+			method: call.method,
+			scope,
+			depth,
+			label: scope === 'nested'
+				? `Nested voice ${ordinal + 1}`
+				: ordinal === 0 ? 'Main voice' : `Track voice ${ordinal + 1}`,
+			...parsed,
+		}];
+	});
+}
+
 function sliderMethodLabel(expression: string, start: number, index: number): string {
 	const prefix = expression.slice(0, start);
 	const method = prefix.match(/\.([A-Za-z_$][\w$]*)\s*\(\s*$/)?.[1];
 	return method ? method.toUpperCase() : `SLIDER ${index + 1}`;
 }
 
+function parseSourceEffectCall(expression: string, start: number): Omit<SourceEffectCall, 'ordinal' | 'enabled' | 'start' | 'end'> & { callStart: number; callEnd: number } | undefined {
+	if (expression[start] !== '.') return undefined;
+	let methodEnd = start + 1;
+	while (/[A-Za-z0-9_$]/.test(expression[methodEnd] ?? '')) methodEnd += 1;
+	const sourceMethod = expression.slice(start + 1, methodEnd);
+	if (isExcludedTrackControl(sourceMethod) || !isLikelyTrackEffectMethod(sourceMethod)) return undefined;
+	const definition = getTrackEffectDefinition(sourceMethod) ?? getUnknownTrackEffectDefinition(sourceMethod);
+	let open = methodEnd;
+	while (/\s/.test(expression[open] ?? '')) open += 1;
+	if (expression[open] !== '(') return undefined;
+	const close = findMatchingCallEnd(expression, open);
+	if (close === undefined) return undefined;
+	const args = splitCallArguments(expression, open + 1, close);
+	const firstArg = args[0];
+	// Zero-argument controls (for example `.delay()`) still belong to the
+	// chain. They cannot expose a value editor, but they must remain available
+	// for bypass, reorder, and removal instead of disappearing from the model.
+	if (!firstArg || (args.length > 1 && !firstArg.text.trim())) return undefined;
+	return {
+		method: normalizeTrackEffectMethod(sourceMethod),
+		definition,
+		callStart: start,
+		callEnd: close + 1,
+		valueStart: firstArg.start,
+		valueEnd: firstArg.end,
+		arguments: args.map((argument) => argument.text),
+	};
+}
+
 function sourceSliderCalls(expression: string): SourceSliderCall[] {
 	const calls: SourceSliderCall[] = [];
+	const callbackRanges = sourceCallbackRanges(expression);
 	let callIndex = 0;
 	for (let index = 0; index < expression.length; index += 1) {
 		const character = expression[index];
@@ -416,6 +742,11 @@ function sourceSliderCalls(expression: string): SourceSliderCall[] {
 		if (character === '/' && next === '*') {
 			const commentEnd = expression.indexOf('*/', index + 2);
 			index = (commentEnd === -1 ? expression.length : commentEnd + 2) - 1;
+			continue;
+		}
+		const callbackRange = sourceCallbackRangeAt(callbackRanges, index);
+		if (callbackRange) {
+			index = callbackRange.end - 1;
 			continue;
 		}
 		if (!expression.startsWith('slider', index) || /[\w$]/.test(expression[index - 1] ?? '') || /[\w$]/.test(expression[index + 6] ?? '')) continue;
@@ -446,6 +777,12 @@ function sourceSliderCalls(expression: string): SourceSliderCall[] {
 function sourceEffectCalls(expression: string): SourceEffectCall[] {
 	const calls: SourceEffectCall[] = [];
 	const ordinals = new Map<SourceEffectMethod, number>();
+	const callbackRanges = sourceCallbackRanges(expression);
+	const nextOrdinal = (method: SourceEffectMethod): number => {
+		const ordinal = ordinals.get(method) ?? 0;
+		ordinals.set(method, ordinal + 1);
+		return ordinal;
+	};
 	for (let index = 0; index < expression.length; index += 1) {
 		const character = expression[index];
 		const next = expression[index + 1];
@@ -460,37 +797,48 @@ function sourceEffectCalls(expression: string): SourceEffectCall[] {
 		}
 		if (character === '/' && next === '*') {
 			const commentEnd = expression.indexOf('*/', index + 2);
-			index = (commentEnd === -1 ? expression.length : commentEnd + 2) - 1;
+			if (commentEnd === -1) {
+				index = expression.length - 1;
+				continue;
+			}
+			const callbackRange = sourceCallbackRangeAt(callbackRanges, index);
+			if (!callbackRange) {
+				const commentBodyStart = index + 2;
+				const commentBody = expression.slice(commentBodyStart, commentEnd);
+				const bypassMarker = commentBody.match(/^\s*@sushi-bypass\s+/);
+				if (bypassMarker) {
+					const callStart = commentBodyStart + bypassMarker[0].length;
+					const parsed = parseSourceEffectCall(expression, callStart);
+					if (parsed && parsed.callEnd <= commentEnd && !expression.slice(parsed.callEnd, commentEnd).trim()) {
+						calls.push({
+							...parsed,
+							ordinal: nextOrdinal(parsed.method),
+							start: index,
+							end: commentEnd + 2,
+							enabled: false,
+						});
+					}
+				}
+			}
+			index = commentEnd + 1;
+			continue;
+		}
+		const callbackRange = sourceCallbackRangeAt(callbackRanges, index);
+		if (callbackRange) {
+			index = callbackRange.end - 1;
 			continue;
 		}
 		if (character !== '.') continue;
-
-		let methodEnd = index + 1;
-		while (/[A-Za-z0-9_$]/.test(expression[methodEnd] ?? '')) methodEnd += 1;
-		const method = expression.slice(index + 1, methodEnd);
-		const definition = sourceEffectDefinition(method);
-		if (!definition) continue;
-		let open = methodEnd;
-		while (/\s/.test(expression[open] ?? '')) open += 1;
-		if (expression[open] !== '(') continue;
-		const close = findMatchingCallEnd(expression, open);
-		if (close === undefined) continue;
-		const args = splitCallArguments(expression, open + 1, close);
-		const firstArg = args[0];
-		if (firstArg && firstArg.text.trim()) {
-			const ordinal = ordinals.get(definition.method) ?? 0;
-			ordinals.set(definition.method, ordinal + 1);
-			calls.push({
-				method: definition.method,
-				ordinal,
-				start: index,
-				end: close + 1,
-				valueStart: firstArg.start,
-				valueEnd: firstArg.end,
-				arguments: args.map((argument) => argument.text),
-			});
-		}
-		index = close;
+		const parsed = parseSourceEffectCall(expression, index);
+		if (!parsed) continue;
+		calls.push({
+			...parsed,
+			ordinal: nextOrdinal(parsed.method),
+			start: parsed.callStart,
+			end: parsed.callEnd,
+			enabled: true,
+		});
+		index = parsed.callEnd - 1;
 	}
 	return calls;
 }
@@ -522,31 +870,31 @@ function sourceSliders(expression: string): SourceSlider[] {
 	});
 }
 
-function sourceEffectKind(value: string, supportsRandom: boolean): SourceEffectKind {
-	return supportsRandom && value.trim() === 'rand' ? 'random' : numericSliderArgument(value) === undefined ? 'dynamic' : 'numeric';
-}
-
 function sourceEffects(expression: string): SourceEffect[] {
 	return sourceEffectCalls(expression).flatMap((call) => {
-		const definition = sourceEffectDefinition(call.method);
-		if (!definition) return [];
-		const argument = call.arguments[0] ?? '';
-		const numericValue = numericSliderArgument(argument);
-		const kind = sourceEffectKind(argument, definition.supportsRandom);
-		const min = definition.min;
-		const max = numericValue === undefined ? definition.max : Math.max(definition.max, numericValue);
+		const parameters = call.arguments.map((argument, index) => parseTrackEffectParameter(call.definition, index, argument));
+		const firstParameter = parameters[0] ?? parseTrackEffectParameter(call.definition, 0, '');
+		const numericValue = firstParameter.value;
+		const min = firstParameter.min ?? 0;
+		const max = firstParameter.max ?? Math.max(1, numericValue ?? 0);
+		const step = firstParameter.step ?? (max - min > 20 ? 1 : 0.01);
+		const defaultValue = typeof firstParameter.defaultValue === 'number' ? firstParameter.defaultValue : 0;
 		return [{
 			id: `effect-${call.method}-${call.ordinal}`,
 			method: call.method,
-			label: definition.label,
-			kind,
-			expression: argument.trim(),
+			definition: call.definition,
+			group: call.definition.group,
+			label: call.definition.label,
+			kind: firstParameter.kind,
+			expression: firstParameter.expression,
+			...(call.enabled ? {} : { enabled: false }),
 			...(numericValue === undefined ? {} : { value: Math.max(min, Math.min(max, numericValue)) }),
 			min,
 			max,
-			step: definition.step,
-			defaultValue: definition.defaultValue,
-			supportsRandom: definition.supportsRandom,
+			step,
+			defaultValue,
+			supportsRandom: firstParameter.supportsRandom,
+			parameters,
 		}];
 	});
 }
@@ -603,6 +951,8 @@ export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_
 			return {
 				...block,
 				timing: { mode: 'full', startCycle: 0, endCycle: defaultEndCycle },
+				sound: undefined,
+				sounds: [],
 				sliders: [],
 				effects: [],
 				gainEditable: false,
@@ -619,12 +969,19 @@ export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_
 		const pan = numericMethodValue(expression, 'pan');
 		const color = sourceColorValue(expression);
 		const visualizer = sourceVisualizerValue(expression);
+		const sounds = sourceSoundValues(expression);
+		// Prefer a track-level sound as the primary source summary. A layer-only
+		// expression still gets its first nested voice so it remains editable in
+		// the drawer instead of appearing to have no sound at all.
+		const sound = sounds.find((candidate) => candidate.scope === 'track') ?? sounds[0];
 		const sliders = sourceSliders(expression);
 		const effects = sourceEffects(expression);
 		return {
 			...block,
 			timing: getSourceTrackTiming(expression, defaultEndCycle),
 			...(visualizer === undefined ? {} : { visualizer }),
+			...(sound === undefined ? {} : { sound }),
+			sounds,
 			sliders,
 			effects,
 			gain,
@@ -720,8 +1077,10 @@ function wrapExpressionInSeqPLoop(expression: string, start: number, end: number
 
 function replaceNumericMethod(expression: string, method: 'gain' | 'pan', value: number): string | undefined {
 	const methodPattern = new RegExp(`(\\.${method}\\s*\\(\\s*)(${numericLiteral})(\\s*\\))`);
-	if (methodPattern.test(expression)) {
-		return expression.replace(methodPattern, `$1${formatNumber(value)}$3`);
+	const match = topLevelMethodMatch(expression, methodPattern);
+	if (match && match.index !== undefined) {
+		const replacement = `${match[1]}${formatNumber(value)}${match[3]}`;
+		return `${expression.slice(0, match.index)}${replacement}${expression.slice(match.index + match[0].length)}`;
 	}
 	if (hasMethod(expression, method)) return undefined;
 	return appendExpressionCall(expression, `.${method}(${formatNumber(value)})`);
@@ -793,52 +1152,82 @@ export function updateTrackSlider(source: string, trackId: string, sliderId: str
 }
 
 function effectIdParts(effectId: string): { method: SourceEffectMethod; ordinal: number } | undefined {
-	const match = effectId.match(/^effect-(detune|lpenv|octave|room)-(\d+)$/);
+	const match = effectId.match(/^effect-([A-Za-z_$][\w$]*)-(\d+)$/);
 	if (!match) return undefined;
 	const ordinal = Number(match[2]);
 	return Number.isInteger(ordinal) && ordinal >= 0
-		? { method: match[1] as SourceEffectMethod, ordinal }
+		? { method: normalizeTrackEffectMethod(match[1]), ordinal }
 		: undefined;
 }
 
-function effectNumericBounds(definition: SourceEffectDefinition, current: number | undefined): { min: number; max: number } {
+function effectNumericBounds(definition: TrackEffectDefinition, parameterIndex: number, current: number | undefined): { min: number; max: number } {
+	const parameter = getTrackEffectParameterDefinition(definition, parameterIndex);
+	const min = parameter.min ?? 0;
+	const max = parameter.max ?? 1;
 	return {
-		min: definition.min,
-		max: current === undefined ? definition.max : Math.max(definition.max, current),
+		min,
+		max: current === undefined ? max : Math.max(max, current),
 	};
 }
 
-/** Update one supported Strudel FX call, preserving dynamic/random modes. */
-export function updateTrackEffect(source: string, trackId: string, effectId: string, value: number | 'rand'): string {
+function formatEffectArgument(value: SourceEffectValue, definition: TrackEffectDefinition, parameterIndex: number): string {
+	if (typeof value === 'number') {
+		const parameter = getTrackEffectParameterDefinition(definition, parameterIndex);
+		return formatSliderValue(value, parameter.step);
+	}
+	if (value === 'rand') return value;
+	const parameter = getTrackEffectParameterDefinition(definition, parameterIndex);
+	if (parameter.type === 'option' && !/^['"`]/.test(value.trim())) return JSON.stringify(value);
+	return value;
+}
+
+/** Update one Strudel FX call, preserving dynamic/random modes. */
+export function updateTrackEffect(source: string, trackId: string, effectId: string, value: SourceEffectValue, parameterIndex = 0): string {
 	const parts = effectIdParts(effectId);
 	if (!parts) return source;
-	const definition = sourceEffectDefinition(parts.method);
-	if (!definition || (value === 'rand' && !definition.supportsRandom)) return source;
 
 	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
 		const call = sourceEffectCalls(expression).find((candidate) => candidate.method === parts.method && candidate.ordinal === parts.ordinal);
 		if (!call) return { label, expression };
-		if (value === 'rand') return { label, expression: replaceCallFirstArgument(expression, call, 'rand') };
-
-		const current = numericSliderArgument(call.arguments[0]);
-		const bounds = effectNumericBounds(definition, current);
-		const normalized = Math.max(bounds.min, Math.min(bounds.max, value));
+		const parameter = getTrackEffectParameterDefinition(call.definition, parameterIndex);
+		if (value === 'rand' && !parameter.supportsRandom) return { label, expression };
+		const current = numericSliderArgument(call.arguments[parameterIndex]);
+		if (typeof value === 'number') {
+			const bounds = effectNumericBounds(call.definition, parameterIndex, current);
+			const normalized = Math.max(bounds.min, Math.min(bounds.max, value));
+			const argumentRanges = splitCallArguments(expression, call.callStart + expression.slice(call.callStart, call.callEnd).indexOf('(') + 1, call.callEnd - 1);
+			const range = argumentRanges[parameterIndex];
+			if (!range) return { label, expression };
+			return {
+				label,
+				expression: replaceCallFirstArgument(expression, { ...call, arguments: [call.arguments[parameterIndex] ?? ''], valueStart: range.start, valueEnd: range.end }, formatEffectArgument(normalized, call.definition, parameterIndex)),
+			};
+		}
+		const argumentRanges = splitCallArguments(expression, call.callStart + expression.slice(call.callStart, call.callEnd).indexOf('(') + 1, call.callEnd - 1);
+		const range = argumentRanges[parameterIndex];
+		if (!range) return { label, expression };
 		return {
 			label,
-			expression: replaceCallFirstArgument(expression, call, formatSliderValue(normalized, definition.step)),
+			expression: replaceCallFirstArgument(expression, { ...call, arguments: [call.arguments[parameterIndex] ?? ''], valueStart: range.start, valueEnd: range.end }, formatEffectArgument(value, call.definition, parameterIndex)),
 		};
 	});
 }
 
-/** Add one supported Strudel effect if the track does not already use it. */
+/** Add one library effect if the track does not already use it. */
 export function addTrackEffect(source: string, trackId: string, method: SourceEffectMethod): string {
-	const definition = sourceEffectDefinition(method);
-	if (!definition) return source;
+	const definition = getTrackEffectDefinition(method);
+	if (!definition || !definition.addable) return source;
 	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
-		if (sourceEffectCalls(expression).some((call) => call.method === method)) return { label, expression };
+		if (sourceEffectCalls(expression).some((call) => call.method === definition.method)) return { label, expression };
+		const firstParameter = getTrackEffectParameterDefinition(definition, 0);
+		if (firstParameter.type === 'expression') return { label, expression };
+		const defaultValue = firstParameter.defaultValue;
+		const argument = typeof defaultValue === 'number'
+			? formatSliderValue(defaultValue, firstParameter.step)
+			: formatEffectArgument(String(defaultValue), definition, 0);
 		return {
 			label,
-			expression: appendExpressionCall(expression, `.${method}(${formatSliderValue(definition.defaultValue, definition.step)})`),
+			expression: appendExpressionCall(expression, `.${definition.method}(${argument})`),
 		};
 	});
 }
@@ -854,9 +1243,70 @@ export function removeTrackEffect(source: string, trackId: string, effectId: str
 	});
 }
 
+/** Enable or bypass one supported Strudel FX call without losing its value. */
+export function toggleTrackEffect(source: string, trackId: string, effectId: string, enabled: boolean): string {
+	const parts = effectIdParts(effectId);
+	if (!parts) return source;
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const call = sourceEffectCalls(expression).find((candidate) => candidate.method === parts.method && candidate.ordinal === parts.ordinal);
+		if (!call || call.enabled === enabled) return { label, expression };
+		const callText = expression.slice(call.callStart, call.callEnd);
+		const replacement = enabled ? callText : `/* @sushi-bypass ${callText} */`;
+		return {
+			label,
+			expression: `${expression.slice(0, call.start)}${replacement}${expression.slice(call.end)}`,
+		};
+	});
+}
+
+/** Enable or bypass every Strudel FX call in a source lane in one edit. */
+export function setTrackEffectsEnabled(source: string, trackId: string, enabled: boolean): string {
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const calls = sourceEffectCalls(expression).filter((call) => call.enabled !== enabled);
+		if (!calls.length) return { label, expression };
+
+		// Work from right to left so the source ranges collected above remain
+		// valid while each call is replaced with its enabled/bypassed form.
+		let updatedExpression = expression;
+		for (let index = calls.length - 1; index >= 0; index -= 1) {
+			const call = calls[index];
+			const callText = expression.slice(call.callStart, call.callEnd);
+			const replacement = enabled ? callText : `/* @sushi-bypass ${callText} */`;
+			updatedExpression = `${updatedExpression.slice(0, call.start)}${replacement}${updatedExpression.slice(call.end)}`;
+		}
+		return { label, expression: updatedExpression };
+	});
+}
+
+/** Move one supported Strudel FX call within its source chain. */
+export function reorderTrackEffect(source: string, trackId: string, effectId: string, direction: 'up' | 'down'): string {
+	const parts = effectIdParts(effectId);
+	if (!parts) return source;
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const calls = sourceEffectCalls(expression);
+		const targetIndex = calls.findIndex((candidate) => candidate.method === parts.method && candidate.ordinal === parts.ordinal);
+		if (targetIndex < 0) return { label, expression };
+		const neighborIndex = targetIndex + (direction === 'up' ? -1 : 1);
+		if (neighborIndex < 0 || neighborIndex >= calls.length) return { label, expression };
+		const firstIndex = Math.min(targetIndex, neighborIndex);
+		const secondIndex = Math.max(targetIndex, neighborIndex);
+		const first = calls[firstIndex];
+		const second = calls[secondIndex];
+		const firstText = expression.slice(first.start, first.end);
+		const between = expression.slice(first.end, second.start);
+		const secondText = expression.slice(second.start, second.end);
+		return {
+			label,
+			expression: `${expression.slice(0, first.start)}${secondText}${between}${firstText}${expression.slice(second.end)}`,
+		};
+	});
+}
+
 function replaceColorMethod(expression: string, color: string): string | undefined {
-	if (colorMethodPattern.test(expression)) {
-		return expression.replace(colorMethodPattern, (_match, prefix: string, quote: string, _oldColor: string, closingQuote: string, suffix: string) => `${prefix}${quote}${color}${closingQuote}${suffix}`);
+	const match = topLevelMethodMatch(expression, colorMethodPattern);
+	if (match && match.index !== undefined) {
+		const replacement = `${match[1]}${match[2]}${color}${match[4]}${match[5]}`;
+		return `${expression.slice(0, match.index)}${replacement}${expression.slice(match.index + match[0].length)}`;
 	}
 	if (hasMethod(expression, 'color')) return undefined;
 	return appendExpressionCall(expression, `.color(${JSON.stringify(color)})`);
@@ -868,6 +1318,30 @@ export function updateTrackColor(source: string, trackId: string, value: string)
 	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
 		const updatedExpression = replaceColorMethod(expression, color);
 		return updatedExpression === undefined ? { label, expression } : { label, expression: updatedExpression };
+	});
+}
+
+/**
+ * Update one source sound call while preserving custom expressions.
+ *
+ * Omitting `soundId` retains the legacy behavior of editing the first
+ * top-level call. The drawer supplies an id when a nested voice is selected.
+ */
+export function updateTrackSound(source: string, trackId: string, value: string, soundId?: string): string {
+	const normalizedValue = value.trim();
+	if (!normalizedValue || /[\r\n]/.test(normalizedValue)) return source;
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const allCalls = sourceSoundCalls(expression, true);
+		const idMatch = soundId?.match(/^sound-(\d+)$/);
+		const requestedIndex = idMatch ? Number(idMatch[1]) : undefined;
+		const call = requestedIndex !== undefined && Number.isInteger(requestedIndex)
+			? allCalls[requestedIndex] ?? sourceSoundCalls(expression)[0]
+			: sourceSoundCalls(expression)[0] ?? allCalls[0];
+		if (!call) return { label, expression: appendExpressionCall(expression, `.sound(${JSON.stringify(normalizedValue)})`) };
+		return {
+			label,
+			expression: replaceCallFirstArgument(expression, call, JSON.stringify(normalizedValue)),
+		};
 	});
 }
 

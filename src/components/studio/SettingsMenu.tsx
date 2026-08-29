@@ -1,7 +1,7 @@
 import type { ChangeEvent, RefObject } from 'react';
 import { EDITOR_PRESETS, type EditorPreset } from '../../lib/project/presets';
 import type { StoredProjectSummary } from '../../lib/project/storage';
-import type { PersistenceState } from './types';
+import type { AppearanceMode, PersistenceState } from './types';
 
 export interface SettingsMenuProps {
 	persistenceState: PersistenceState;
@@ -11,6 +11,8 @@ export interface SettingsMenuProps {
 	localProjects: readonly StoredProjectSummary[];
 	localProjectsLoading: boolean;
 	localProjectsError: string | null;
+	appearanceMode: AppearanceMode;
+	isDarkMode: boolean;
 	projectImportInputRef: RefObject<HTMLInputElement | null>;
 	onSaveProject: () => void;
 	onExportProject: () => void;
@@ -18,6 +20,7 @@ export interface SettingsMenuProps {
 	onLoadPreset: (preset: EditorPreset) => void;
 	onLoadLocalProject: (projectId: string) => void;
 	onRefreshLocalProjects: () => void;
+	onAppearanceModeChange: (mode: AppearanceMode) => void;
 }
 
 function formatSavedAt(savedAt: number): string {
@@ -34,6 +37,8 @@ export function SettingsMenu({
 	localProjects,
 	localProjectsLoading,
 	localProjectsError,
+	appearanceMode,
+	isDarkMode,
 	projectImportInputRef,
 	onSaveProject,
 	onExportProject,
@@ -41,6 +46,7 @@ export function SettingsMenu({
 	onLoadPreset,
 	onLoadLocalProject,
 	onRefreshLocalProjects,
+	onAppearanceModeChange,
 }: SettingsMenuProps) {
 	const canSave = persistenceState === 'ready' && !isBusy;
 
@@ -51,23 +57,57 @@ export function SettingsMenu({
 					<strong className="topbar-popover-title">Sushi settings</strong>
 					<span className="settings-menu-save-state"><span className="save-dot" aria-hidden="true" />{saveStateLabel}</span>
 				</div>
-				<span>Save, share, and reopen source-first projects.</span>
 			</div>
+
+			<section className="settings-menu-section settings-menu-appearance-section" aria-labelledby="settings-appearance-heading">
+				<div className="settings-menu-section-heading">
+					<h3 id="settings-appearance-heading">Appearance</h3>
+					<span className="settings-menu-appearance-mode">{appearanceMode}</span>
+				</div>
+				<div className="settings-menu-appearance">
+					<div className="settings-menu-appearance-row">
+						<span>
+							<strong>Dark mode</strong>
+							<small>{appearanceMode === 'system' ? 'Following system preference' : 'Manual override'}</small>
+						</span>
+						<button
+							className="appearance-toggle"
+							type="button"
+							role="switch"
+							aria-checked={isDarkMode}
+							aria-label="Dark mode"
+							title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+							onClick={() => onAppearanceModeChange(isDarkMode ? 'light' : 'dark')}
+						>
+							<span aria-hidden="true" />
+						</button>
+					</div>
+					<button
+						className="settings-menu-system-button"
+						type="button"
+						onClick={() => onAppearanceModeChange('system')}
+						disabled={appearanceMode === 'system'}
+					>
+						<span>Use system preference</span>
+						<small>{appearanceMode === 'system' ? 'Active' : 'Reset override'}</small>
+					</button>
+				</div>
+			</section>
 
 			<section className="settings-menu-section" aria-labelledby="settings-project-heading">
 				<h3 id="settings-project-heading">Project</h3>
-				<div className="settings-menu-actions">
+				<div className="settings-menu-list">
 					<button className="settings-menu-action" type="button" onClick={onSaveProject} disabled={!canSave}>
 						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h11l3 3v13H5z" /><path d="M8 4v6h8V4M8 20v-5h8v5" /></svg>
-						<span><strong>Save locally</strong><small>{persistenceState === 'unavailable' ? 'IndexedDB is unavailable' : isDirty ? 'Write the current draft to this browser' : 'Project is already up to date'}</small></span>
+						<span><strong>Save locally</strong><small>{persistenceState === 'unavailable' ? 'Storage unavailable' : isDirty ? 'Save current project' : 'Already up to date'}</small></span>
 					</button>
 					<button className="settings-menu-action" type="button" onClick={onImportProjectButton} disabled={isBusy}>
 						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V9" /><path d="m8 16 4 4 4-4" /><path d="M5 10V5h14v5" /></svg>
-						<span><strong>Import project</strong><small>Open a .sushi.json file</small></span>
+						<span><strong>Import project</strong><small>Open .sushi.json</small></span>
 					</button>
 					<button className="settings-menu-action" type="button" onClick={onExportProject} disabled={isBusy}>
 						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11" /><path d="m8 8 4-4 4 4" /><path d="M5 14v5h14v-5" /></svg>
-						<span><strong>Export project</strong><small>Download a portable .sushi.json</small></span>
+						<span><strong>Export project</strong><small>Download .sushi.json</small></span>
 					</button>
 				</div>
 				<input ref={projectImportInputRef} className="project-import-input" type="file" accept="application/json,.json" onChange={onImportProject} aria-label="Import Sushi project file" />

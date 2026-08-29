@@ -9,7 +9,9 @@
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "astro": "astro"
+    "astro": "astro",
+    "effects:generate": "node scripts/generate-strudel-controls.mjs",
+    "sounds:generate": "node scripts/generate-strudel-sounds.mjs"
   },
   "dependencies": {
     "@astrojs/react": "^6.0.4",

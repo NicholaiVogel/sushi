@@ -1,4 +1,4 @@
-import { useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent } from 'react';
+import { type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent } from 'react';
 import type { RuntimeState, SourceBlockSummary } from '../../lib/project/model';
 import { cyclesToSeconds, type SourceGlobals } from '../../lib/project/source-mapper';
 import {
@@ -11,8 +11,6 @@ import {
 } from './helpers';
 import type { TrackDetails } from './types';
 import { VisualizerCanvas } from './VisualizerCanvas';
-import { TrackFxControls } from './TrackFxControls';
-import type { SourceEffectMethod } from '../../lib/project/source-mapper';
 import type { StrudelVisualizer, VisualizerHap } from '../../lib/strudel/adapter';
 
 export interface TimelineCell {
@@ -38,6 +36,7 @@ export interface TrackLaneProps {
 	selected: boolean;
 	renaming: boolean;
 	renamingValue: string;
+	fxDrawerOpen: boolean;
 	onSelect: (trackId: string) => void;
 	onContextMenu: (event: MouseEvent<HTMLElement>, trackId: string) => void;
 	onLaneKeyDown: (event: KeyboardEvent<HTMLDivElement>, trackId: string) => void;
@@ -48,10 +47,8 @@ export interface TrackLaneProps {
 	onToggleMode: (trackId: string, mode: 'mute' | 'solo', active: boolean) => void;
 	onSetGain: (trackId: string, value: number) => void;
 	onSetPan: (trackId: string, value: number) => void;
-	onSetSlider: (trackId: string, sliderId: string, value: number) => void;
-	onSetEffect: (trackId: string, effectId: string, value: number | 'rand') => void;
-	onAddEffect: (trackId: string, method: SourceEffectMethod) => void;
-	onRemoveEffect: (trackId: string, effectId: string) => void;
+	onOpenFxDrawer: (trackId: string) => void;
+	onToggleEffects: (trackId: string, enabled: boolean) => void;
 	onStartTimingDrag: (event: PointerEvent<HTMLElement>, trackId: string, edge: 'start' | 'end' | 'move') => void;
 	onSetTrackRange: (trackId: string, startCycle: number, endCycle: number) => void;
 }
@@ -74,6 +71,7 @@ export function TrackLane({
 	selected,
 	renaming,
 	renamingValue,
+	fxDrawerOpen,
 	onSelect,
 	onContextMenu,
 	onLaneKeyDown,
@@ -84,22 +82,17 @@ export function TrackLane({
 	onToggleMode,
 	onSetGain,
 	onSetPan,
-	onSetSlider,
-	onSetEffect,
-	onAddEffect,
-	onRemoveEffect,
+	onOpenFxDrawer,
+	onToggleEffects,
 	onStartTimingDrag,
 	onSetTrackRange,
 }: TrackLaneProps) {
-	const [fxExpanded, setFxExpanded] = useState(false);
 	const gain = trackDetails?.gain ?? 1;
 	const pan = trackDetails?.pan ?? 0.5;
-	const sliders = trackDetails?.sliders ?? [];
 	const effects = trackDetails?.effects ?? [];
-	const fxPanelHeight = trackDetails?.expression
-		? 27 + (fxExpanded ? (sliders.length + effects.length + 1) * 27 : 0)
-		: 0;
-	const trackLaneHeight = 82 + fxPanelHeight;
+	const hasEffects = effects.length > 0;
+	const effectsEnabled = hasEffects && effects.every((effect) => effect.enabled !== false);
+	const trackLaneHeight = 82;
 	const clipStart = clamp(timing.startCycle / songEndCycle, 0, 1);
 	const clipEnd = clamp(timing.endCycle / songEndCycle, clipStart + 0.01, 1);
 	const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
@@ -111,7 +104,10 @@ export function TrackLane({
 			key={block.id}
 			tabIndex={0}
 			onClick={() => onSelect(block.id)}
-			onFocus={() => onSelect(block.id)}
+			onFocus={(event) => {
+				if (event.target instanceof HTMLElement && event.target.closest('.track-fx-button, .track-drawer-button')) return;
+				onSelect(block.id);
+			}}
 			onContextMenu={(event) => onContextMenu(event, block.id)}
 			onKeyDown={(event) => onLaneKeyDown(event, block.id)}
 			aria-current={selected ? 'true' : undefined}
@@ -157,9 +153,32 @@ export function TrackLane({
 						</div>
 						<span className="track-type">{getTrackLabel(block.type)} <span aria-hidden="true">·</span> LINE {block.line}</span>
 					</div>
-					<div className="track-mode-controls" role="group" aria-label={`${block.name} source modes`}>
-						<button className={`track-mode-button ${trackDetails?.muted ? 'track-mode-button-active' : ''}`} type="button" onClick={() => onToggleMode(block.id, 'mute', !trackDetails?.muted)} disabled={!trackDetails} aria-label={`Mute ${block.name}`} aria-pressed={trackDetails?.muted ?? false}>M</button>
-						<button className={`track-mode-button ${trackDetails?.soloed ? 'track-mode-button-active' : ''}`} type="button" onClick={() => onToggleMode(block.id, 'solo', !trackDetails?.soloed)} disabled={!trackDetails} aria-label={`Solo ${block.name}`} aria-pressed={trackDetails?.soloed ?? false}>S</button>
+					<div className="track-header-actions">
+						<button
+							className={`track-fx-button ${effectsEnabled ? 'track-fx-button-active' : ''}`}
+							type="button"
+							onClick={(event) => { event.stopPropagation(); onToggleEffects(block.id, !effectsEnabled); }}
+							aria-pressed={effectsEnabled}
+							disabled={!trackDetails || !hasEffects}
+							aria-label={`${effectsEnabled ? 'Bypass' : 'Enable'} all effects for ${block.name}`}
+							title={`${effectsEnabled ? 'Bypass' : 'Enable'} all effects for ${block.name}`}
+						>fx</button>
+						<button
+							className={`track-drawer-button ${fxDrawerOpen ? 'track-drawer-button-active' : ''}`}
+							type="button"
+							onClick={(event) => { event.stopPropagation(); onOpenFxDrawer(block.id); }}
+							aria-expanded={fxDrawerOpen}
+							aria-controls="track-fx-drawer"
+							disabled={!trackDetails}
+							aria-label={`${fxDrawerOpen ? 'Close' : 'Open'} track controls for ${block.name}`}
+							title={`${fxDrawerOpen ? 'Close' : 'Open'} track controls for ${block.name}`}
+							>
+							<span aria-hidden="true">⋮</span>
+						</button>
+						<div className="track-mode-controls" role="group" aria-label={`${block.name} source modes`}>
+							<button className={`track-mode-button ${trackDetails?.muted ? 'track-mode-button-active' : ''}`} type="button" onClick={() => onToggleMode(block.id, 'mute', !trackDetails?.muted)} disabled={!trackDetails} aria-label={`Mute ${block.name}`} aria-pressed={trackDetails?.muted ?? false}>M</button>
+							<button className={`track-mode-button ${trackDetails?.soloed ? 'track-mode-button-active' : ''}`} type="button" onClick={() => onToggleMode(block.id, 'solo', !trackDetails?.soloed)} disabled={!trackDetails} aria-label={`Solo ${block.name}`} aria-pressed={trackDetails?.soloed ?? false}>S</button>
+						</div>
 					</div>
 				</div>
 				<div className="track-mix-controls">
@@ -177,20 +196,6 @@ export function TrackLane({
 						<output className="track-pan-value" aria-label={`${block.name} pan value`}>{Math.round(clamp(pan, 0, 1) * 100)}</output>
 					</div>
 				</div>
-				{trackDetails?.expression ? (
-					<TrackFxControls
-						trackId={block.id}
-						trackName={block.name}
-						sliders={sliders}
-						effects={effects}
-						expanded={fxExpanded}
-						onSetSlider={onSetSlider}
-						onSetEffect={onSetEffect}
-						onAddEffect={onAddEffect}
-						onRemoveEffect={onRemoveEffect}
-						onToggleExpanded={() => setFxExpanded((current) => !current)}
-					/>
-				) : null}
 			</div>
 			<div className="lane-grid" style={{ ...timelineGridStyle, '--track-color': trackColor } as CSSProperties}>
 				<div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-hidden="true">{timelineCells.map((cell, cellIndex) => <span className={cell.isBarStart ? 'beat-start' : ''} key={cellIndex} />)}</div>

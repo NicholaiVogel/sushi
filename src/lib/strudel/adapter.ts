@@ -1,5 +1,6 @@
 import { DEFAULT_SONG_END_CYCLE, type AudioState, type TransportState } from '../project/model';
 import { getSourceBlockDetails, type TrackVisualizer } from '../project/source-mapper';
+import { extractStrudelSoundTokens, normalizeStrudelSoundToken } from './sounds';
 import soundfontDefinitions from '@strudel/soundfonts/gm.mjs';
 import { clearInterval as clearSchedulerInterval, setInterval as setSchedulerInterval } from 'worker-timers';
 
@@ -132,8 +133,9 @@ function collectSourceAudioAssets(source: string): SourceAudioAsset[] {
 	const notes = [...new Set(source.match(sourceNotePattern)?.map((note) => note.toLowerCase()) ?? [])];
 	const assets = new Map<string, Set<string>>();
 	for (const value of values) {
-		for (const token of value.match(/[A-Za-z][A-Za-z0-9_-]*/g) ?? []) {
-			const name = token.toLowerCase();
+		for (const token of extractStrudelSoundTokens(value)) {
+			const name = normalizeStrudelSoundToken(token);
+			if (!name) continue;
 			if (!assets.has(name)) assets.set(name, new Set());
 		}
 	}
