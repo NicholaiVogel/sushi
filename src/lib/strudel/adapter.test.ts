@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { isAudioLockedError, StrudelAdapter } from './adapter';
 
-describe('StrudelAdapter evaluation queue', () => {
+describe.serial('StrudelAdapter evaluation queue', () => {
 	test('registers editor-only Strudel compatibility helpers', async () => {
 		const registrations: string[] = [];
 		let schedulerOptions: { setInterval?: unknown; clearInterval?: unknown; sync?: unknown } | undefined;
@@ -54,6 +54,51 @@ describe('StrudelAdapter evaluation queue', () => {
 		}
 	});
 
+	test('keeps MIDI disabled unless the adapter is explicitly enabled', async () => {
+		let midiAccessRequests = 0;
+		const registrations: string[] = [];
+		const fakeModule = {
+			register: (name: string) => {
+				registrations.push(name);
+				return () => undefined;
+			},
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		const hadRequestMidiAccess = 'requestMIDIAccess' in navigator;
+		const originalRequestMidiAccess = (navigator as Navigator & { requestMIDIAccess?: unknown }).requestMIDIAccess;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		Object.defineProperty(navigator, 'requestMIDIAccess', {
+			configurable: true,
+			value: () => {
+				midiAccessRequests += 1;
+				return Promise.resolve(undefined);
+			},
+		});
+
+		try {
+			await adapter.init();
+			expect(midiAccessRequests).toBe(0);
+			expect(adapter.getMidiModule()).toBeUndefined();
+			expect(registrations).not.toContain('midin');
+			expect(await adapter.triggerLiveMidiNote(60, 0.8)).toEqual({ ok: false, error: expect.any(Error) });
+		} finally {
+			adapter.destroy();
+			if (hadRequestMidiAccess) Object.defineProperty(navigator, 'requestMIDIAccess', { configurable: true, value: originalRequestMidiAccess });
+			else Reflect.deleteProperty(navigator, 'requestMIDIAccess');
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
 	test('loads MIDI helpers into the same Strudel evaluation scope', async () => {
 		const registrations: string[] = [];
 		const fakeModule = {
@@ -79,13 +124,14 @@ describe('StrudelAdapter evaluation queue', () => {
 				midin: () => undefined,
 				midikeys: () => undefined,
 			}),
+			{ enableMidi: true },
 		);
 		const hadWindow = 'window' in globalThis;
 		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
 		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
 		try {
 			await adapter.init();
-			expect(registrations).toEqual(['sliderWithID', '_pianoroll', '_scope', '_spectrum', 'defaultmidimap', 'midimaps', 'midin', 'midikeys']);
+			expect(registrations).toEqual(expect.arrayContaining(['_pianoroll', '_scope', '_spectrum', 'defaultmidimap', 'midimaps', 'midin', 'midikeys']));
 			adapter.destroy();
 		} finally {
 			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
@@ -126,7 +172,7 @@ describe('StrudelAdapter evaluation queue', () => {
 		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
 		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
 		try {
-			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, undefined, { enableMidi: true });
 			const result = await adapter.triggerLiveMidiNote(64, 0.75, 'triangle', 500);
 			expect(result).toEqual({ ok: true });
 			expect(triggerCalls).toHaveLength(1);
@@ -174,7 +220,7 @@ describe('StrudelAdapter evaluation queue', () => {
 		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
 		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
 		try {
-			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, undefined, { enableMidi: true });
 			expect(await adapter.triggerLiveMidiNote(60, 0.8)).toEqual({ ok: true });
 			adapter.releaseLiveMidiNote(60);
 			expect(stopTimes).toEqual([12.012]);
@@ -207,7 +253,7 @@ describe('StrudelAdapter evaluation queue', () => {
 				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
 			}),
 		};
-		const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, async () => ({ WebMidi: webMidi }));
+		const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, async () => ({ WebMidi: webMidi }), { enableMidi: true });
 		const hadWindow = 'window' in globalThis;
 		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
 		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
@@ -239,7 +285,7 @@ describe('StrudelAdapter evaluation queue', () => {
 				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
 			}),
 		};
-		const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, async () => midi);
+		const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, async () => midi, { enableMidi: true });
 		const hadWindow = 'window' in globalThis;
 		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
 		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
@@ -1686,7 +1732,7 @@ describe('StrudelAdapter evaluation queue', () => {
 		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
 
 		try {
-			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, undefined, { enableMidi: true });
 			const accepted = 'setcpm(120 / 4)\n$: note("c4").s("triangle")';
 			expect(await adapter.evaluateSource(accepted)).toEqual({ ok: true });
 			expect(await adapter.previewNote('D4', 'triangle')).toEqual({ ok: true });

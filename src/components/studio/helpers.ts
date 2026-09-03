@@ -34,6 +34,13 @@ export const TRACK_NAME_MAX_LENGTH = 80;
 export const TIMELINE_LABEL_MIN_WIDTH = 270;
 export const LEGACY_DEFAULT_SONG_END_CYCLES = [187, 187.5];
 
+const DEFAULT_AUDIO_TRACK_EXPRESSION = '$: seqPLoop([0, 4, note("<c3 e3 g3 a3>").s("sine").gain(0.18)])';
+const EXPERIMENTAL_AUDIO_TRACK_EXPRESSION = '$: seqPLoop([0, 4, note("c3 e3 g3 a3").slow(4).s("sine").gain(0.18)])';
+
+export function getNewAudioTrackExpression(experimentalMidi: boolean): string {
+	return experimentalMidi ? EXPERIMENTAL_AUDIO_TRACK_EXPRESSION : DEFAULT_AUDIO_TRACK_EXPRESSION;
+}
+
 export interface KeyRootOption {
 	value: string;
 	label: string;

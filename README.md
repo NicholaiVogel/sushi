@@ -85,6 +85,14 @@ Build the application with:
 bun run build
 ```
 
+Experimental MIDI is disabled by default in every environment, including local development and production builds. Explicitly opt in only when testing the experimental surface:
+
+```sh
+VITE_EXPERIMENTAL_MIDI=true bun run dev
+```
+
+Only the exact value `true` enables MIDI. An absent, empty, malformed, or any other value disables it. Leave this variable unset for the hackathon build.
+
 ## Built with gratitude
 
 Sushi builds on the work of:

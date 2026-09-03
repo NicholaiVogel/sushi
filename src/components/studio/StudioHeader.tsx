@@ -24,6 +24,7 @@ export interface StudioHeaderProps {
 	isDirty: boolean;
 	isBusy: boolean;
 	canPlay: boolean;
+	experimentalMidi: boolean;
 	runtime: RuntimeState;
 	sourceGlobals: SourceGlobals;
 	draftGlobals: SourceGlobals;
@@ -78,6 +79,7 @@ export function StudioHeader({
 	isDirty,
 	isBusy,
 	canPlay,
+	experimentalMidi,
 	runtime,
 	sourceGlobals,
 	draftGlobals,
@@ -191,8 +193,10 @@ export function StudioHeader({
 						</div>
 					</div>
 					<div className="transport-playback" aria-label="Playback controls">
-						<button className={`transport-button transport-midi${midiPanelOpen ? ' transport-midi-active' : ''}`} type="button" onClick={onToggleMidiPanel} disabled={isBusy} aria-label="Open MIDI controls" aria-pressed={midiPanelOpen} title="Open MIDI controls">♫<span className={`transport-midi-dot${midiState.enabled ? ' transport-midi-dot-live' : ''}`} aria-hidden="true" /></button>
-						<button className={`transport-button transport-record${midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? ' transport-record-active' : ''}`} type="button" onClick={onRecordMidi} disabled={isBusy} aria-label={midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? 'Stop MIDI recording' : 'Open MIDI recording'} title={midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? 'Stop MIDI recording' : 'Open MIDI recording'}>●</button>
+						{experimentalMidi ? <>
+							<button className={`transport-button transport-midi${midiPanelOpen ? ' transport-midi-active' : ''}`} type="button" onClick={onToggleMidiPanel} disabled={isBusy} aria-label="Open MIDI controls" aria-pressed={midiPanelOpen} title="Open MIDI controls">♫<span className={`transport-midi-dot${midiState.enabled ? ' transport-midi-dot-live' : ''}`} aria-hidden="true" /></button>
+							<button className={`transport-button transport-record${midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? ' transport-record-active' : ''}`} type="button" onClick={onRecordMidi} disabled={isBusy} aria-label={midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? 'Stop MIDI recording' : 'Open MIDI recording'} title={midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? 'Stop MIDI recording' : 'Open MIDI recording'}>●</button>
+						</> : null}
 						<button className="transport-button transport-stop" type="button" onClick={onStop} disabled={!canPlay || (runtime.transport === 'stopped' && runtime.currentCycle === 0)} aria-label="Stop playback" title="Stop and return to cycle zero">■</button>
 						<button className="transport-button transport-play" type="button" onClick={onPlay} disabled={!canPlay} aria-label={runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'} title={runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'}>▶</button>
 						<button className="transport-button transport-pause" type="button" onClick={onPause} disabled={!canPlay || runtime.transport !== 'playing'} aria-label="Pause playback" title="Pause at the current cycle">Ⅱ</button>
@@ -219,7 +223,7 @@ export function StudioHeader({
 				<div className="topbar-metrics" aria-label="Project settings"><span>{formatCycle(sourceGlobals.quarterNotesPerCycle)} Q/C</span><span>{formatCycle(songEndSeconds)}s</span></div>
 				<div className="topbar-help-control">
 					<button className="topbar-help-button" type="button" onClick={() => onTogglePopover('help')} disabled={isBusy} aria-expanded={openPopover === 'help'} aria-haspopup="dialog" aria-label="Keyboard shortcuts" title="Show keyboard shortcuts">?</button>
-					{openPopover === 'help' ? <HelpPopover onOpenOnboarding={onOpenOnboarding} /> : null}
+					{openPopover === 'help' ? <HelpPopover experimentalMidi={experimentalMidi} onOpenOnboarding={onOpenOnboarding} /> : null}
 				</div>
 			</div>
 		</header>
@@ -274,12 +278,12 @@ function KeyPopover({ draftKey, onSetKey }: { draftKey: ReturnType<typeof getKey
 	);
 }
 
-function HelpPopover({ onOpenOnboarding }: { onOpenOnboarding: () => void }) {
+function HelpPopover({ experimentalMidi, onOpenOnboarding }: { experimentalMidi: boolean; onOpenOnboarding: () => void }) {
 	return (
 		<div className="topbar-help-popover" role="dialog" aria-label="Keyboard shortcuts">
 			<strong className="topbar-popover-title">Keyboard shortcuts</strong>
 			<div className="hotkey-list">
-				<div className="hotkey-item"><kbd>R</kbd><span>Open / start MIDI record</span></div>
+				{experimentalMidi ? <div className="hotkey-item"><kbd>R</kbd><span>Open / start MIDI record</span></div> : null}
 				<div className="hotkey-item"><kbd>⌘ / Ctrl + Enter</kbd><span>Validate source</span></div>
 				<div className="hotkey-item"><kbd>Backspace / Delete</kbd><span>Delete selected track</span></div>
 				<div className="hotkey-item"><kbd>Right-click</kbd><span>Track actions</span></div>

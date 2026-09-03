@@ -11,7 +11,7 @@ import {
 } from '../../lib/project/source-mapper';
 import { getTimelineCapacityForEndCycle } from '../../lib/project/timeline';
 import { isAudioLockedError, type StrudelAdapter } from '../../lib/strudel/adapter';
-import type { MidiChannel, MidiClockMode, MidiRuntimeState } from '../../lib/midi/types';
+import { createDisabledMidiRuntimeState, type MidiChannel, type MidiClockMode, type MidiRuntimeState } from '../../lib/midi/types';
 import type { MidiService } from '../../lib/midi/service';
 import {
 	applyTextEdits,
@@ -80,7 +80,7 @@ export interface UseStudioWebMcpOptions {
 	deleteTrack: (trackId: string) => Promise<CommitSourceResult>;
 	renameTrack: (trackId: string, name: string) => Promise<CommitSourceResult>;
 	loadTemplate: (preset: EditorPreset, expectedRevision?: number) => Promise<CommitSourceResult>;
-	midiService: MidiService;
+	midiService: MidiService | null;
 	startMidiRecording: (signal?: AbortSignal) => Promise<MidiRuntimeState>;
 	stopMidiRecording: () => Promise<MidiRuntimeState>;
 	commitMidiTake: (expectedRevision?: number) => Promise<CommitSourceResult>;
@@ -116,7 +116,7 @@ export function useStudioWebMcp({
 	const [webmcpStatus, setWebmcpStatus] = useState<WebMcpStatus>('connecting');
 	const getWebMcpState = useCallback((): WebMcpStateSnapshot => {
 		const current = studioRef.current;
-		const midi = midiService.getState();
+		const midi = midiService?.getState() ?? createDisabledMidiRuntimeState();
 		const reviewedTake = midi.recording.take;
 		const boundedMidi = reviewedTake ? {
 			...midi,
@@ -657,10 +657,10 @@ export function useStudioWebMcp({
 			try {
 				const previousTransport = studioRef.current.runtime.transport;
 				const wasPlaying = previousTransport === 'playing';
-				if (previousTransport !== 'stopped' || midiService.getState().clockRunning) midiService.panic();
+				if (midiService && (previousTransport !== 'stopped' || midiService.getState().clockRunning)) midiService.panic();
 				const result = await adapter.validateSource(candidate, studioRef.current.lastValid);
 				const state = getWebMcpState();
-				if (wasPlaying && state.runtime.transport === 'playing') midiService.startTransportClock();
+				if (midiService && wasPlaying && state.runtime.transport === 'playing') midiService.startTransportClock();
 				const resultRevision = state.source.revision;
 				const staleSuffix = resultRevision === revision
 					? ''
@@ -779,6 +779,7 @@ export function useStudioWebMcp({
 			async () => {
 				const current = studioRef.current;
 				const stateBefore = getWebMcpState();
+				if (!midiService) return makeMutationResult(stateBefore, 'accept_midi_take', input.transactionId, current.draft, current.revision, false, 'MIDI is disabled.', { code: 'MIDI_UNAVAILABLE', message: 'Experimental MIDI is disabled.' });
 				if (input.baseRevision !== current.revision) return {
 					ok: false,
 					action: 'accept_midi_take',
@@ -818,49 +819,52 @@ export function useStudioWebMcp({
 		[commitMidiTake, getWebMcpState, midiService, sourceTransactionsRef, studioRef],
 	);
 
-	const midiController = useMemo(() => ({
-		getState: () => midiService.getState(),
-		connect: (options: { sysex: boolean }) => midiService.connect(options),
-		disconnect: () => {
-			adapterRef.current?.releaseAllLiveMidiNotes();
-			return midiService.disconnect();
-		},
-		selectInput: (id: string | null) => midiService.setSelectedInput(id),
-		selectOutput: (id: string | null) => {
-			const before = midiService.getState();
-			if (before.clockRunning && id !== before.selectedOutputId) midiService.panic();
-			const next = midiService.setSelectedOutput(id);
-			if (id === null) midiService.stopTransportClock();
-			else if (!next.lastError && studioRef.current.runtime.transport === 'playing' && next.clockMode === 'send' && (!next.clockRunning || next.selectedOutputId !== before.selectedOutputId)) midiService.startTransportClock();
-			return midiService.getState();
-		},
-		setSettings: (settings: { inputChannel?: MidiChannel; outputChannel?: number; monitor?: boolean; clockMode?: MidiClockMode }) => {
-			if (settings.inputChannel !== undefined) midiService.setInputChannel(settings.inputChannel);
-			if (settings.outputChannel !== undefined) midiService.setOutputChannel(settings.outputChannel);
-			if (settings.monitor !== undefined) midiService.setMonitor(settings.monitor);
-			if (settings.clockMode !== undefined) midiService.setClockMode(settings.clockMode);
-			const next = midiService.getState();
-			if (next.clockMode === 'send' && next.enabled && studioRef.current.runtime.transport === 'playing' && !next.clockRunning) midiService.startTransportClock();
-			return midiService.getState();
-		},
-		learnControl: () => midiService.beginControlLearn(),
-		armRecording: (options: WebMcpMidiRecordInput) => {
-			const track = getSourceBlockDetails(studioRef.current.lastValid).find((candidate) => candidate.id === options.trackId);
-			return midiService.armRecording({
-				...options,
-				...(options.loop && track ? { loopStartCycle: track.timing.startCycle, loopEndCycle: track.timing.endCycle } : {}),
-			});
-		},
-		startRecording: startMidiRecording,
-		stopRecording: stopMidiRecording,
-		cancelRecording: () => midiService.cancelRecording(),
-		acceptTake: acceptMidiTakeForWebMcp,
-		panic: (outputId?: string | null) => {
-			adapterRef.current?.releaseAllLiveMidiNotes();
-			return midiService.panic(outputId);
-		},
-		testNote: (note?: number, durationMs?: number, velocity?: number) => midiService.testNote(note, durationMs, velocity),
-	}), [acceptMidiTakeForWebMcp, midiService, startMidiRecording, stopMidiRecording]);
+	const midiController = useMemo(() => {
+		if (!midiService) return undefined;
+		return {
+			getState: () => midiService.getState(),
+			connect: (options: { sysex: boolean }) => midiService.connect(options),
+			disconnect: () => {
+				adapterRef.current?.releaseAllLiveMidiNotes();
+				return midiService.disconnect();
+			},
+			selectInput: (id: string | null) => midiService.setSelectedInput(id),
+			selectOutput: (id: string | null) => {
+				const before = midiService.getState();
+				if (before.clockRunning && id !== before.selectedOutputId) midiService.panic();
+				const next = midiService.setSelectedOutput(id);
+				if (id === null) midiService.stopTransportClock();
+				else if (!next.lastError && studioRef.current.runtime.transport === 'playing' && next.clockMode === 'send' && (!next.clockRunning || next.selectedOutputId !== before.selectedOutputId)) midiService.startTransportClock();
+				return midiService.getState();
+			},
+			setSettings: (settings: { inputChannel?: MidiChannel; outputChannel?: number; monitor?: boolean; clockMode?: MidiClockMode }) => {
+				if (settings.inputChannel !== undefined) midiService.setInputChannel(settings.inputChannel);
+				if (settings.outputChannel !== undefined) midiService.setOutputChannel(settings.outputChannel);
+				if (settings.monitor !== undefined) midiService.setMonitor(settings.monitor);
+				if (settings.clockMode !== undefined) midiService.setClockMode(settings.clockMode);
+				const next = midiService.getState();
+				if (next.clockMode === 'send' && next.enabled && studioRef.current.runtime.transport === 'playing' && !next.clockRunning) midiService.startTransportClock();
+				return midiService.getState();
+			},
+			learnControl: () => midiService.beginControlLearn(),
+			armRecording: (options: WebMcpMidiRecordInput) => {
+				const track = getSourceBlockDetails(studioRef.current.lastValid).find((candidate) => candidate.id === options.trackId);
+				return midiService.armRecording({
+					...options,
+					...(options.loop && track ? { loopStartCycle: track.timing.startCycle, loopEndCycle: track.timing.endCycle } : {}),
+				});
+			},
+			startRecording: startMidiRecording,
+			stopRecording: stopMidiRecording,
+			cancelRecording: () => midiService.cancelRecording(),
+			acceptTake: acceptMidiTakeForWebMcp,
+			panic: (outputId?: string | null) => {
+				adapterRef.current?.releaseAllLiveMidiNotes();
+				return midiService.panic(outputId);
+			},
+			testNote: (note?: number, durationMs?: number, velocity?: number) => midiService.testNote(note, durationMs, velocity),
+		};
+	}, [acceptMidiTakeForWebMcp, midiService, startMidiRecording, stopMidiRecording]);
 
 	const webmcpController = useMemo<WebMcpController>(() => ({
 		getState: getWebMcpState,
@@ -877,9 +881,9 @@ export function useStudioWebMcp({
 		controlPlayback: controlPlaybackForWebMcp,
 		undoSourceEdit: undoSourceForWebMcp,
 		redoSourceEdit: redoSourceForWebMcp,
-		setTrackMidiRoute: setTrackMidiRouteForWebMcp,
+		setTrackMidiRoute: midiService ? setTrackMidiRouteForWebMcp : undefined,
 		midi: midiController,
-	}), [controlPlaybackForWebMcp, deleteTrackForWebMcp, extendTimelineForWebMcp, getWebMcpState, loadTemplateForWebMcp, midiController, patchSourceForWebMcp, redoSourceForWebMcp, renameTrackForWebMcp, setKeyForWebMcp, setTempoForWebMcp, setTrackMidiRouteForWebMcp, setTrackRangeForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
+	}), [controlPlaybackForWebMcp, deleteTrackForWebMcp, extendTimelineForWebMcp, getWebMcpState, loadTemplateForWebMcp, midiController, midiService, patchSourceForWebMcp, redoSourceForWebMcp, renameTrackForWebMcp, setKeyForWebMcp, setTempoForWebMcp, setTrackMidiRouteForWebMcp, setTrackRangeForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
 
 	useEffect(() => {
 		let disposed = false;

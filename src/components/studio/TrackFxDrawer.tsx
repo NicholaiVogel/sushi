@@ -21,6 +21,7 @@ export type TrackFxDrawerMode = 'effects' | 'sounds' | 'midi';
 
 export interface TrackFxDrawerProps {
 	track: SourceBlockSummary;
+	experimentalMidi: boolean;
 	trackColor: string;
 	trackDetails?: TrackDetails;
 	isBusy: boolean;
@@ -161,6 +162,7 @@ function MidiTrackControls({
 
 export function TrackFxDrawer({
 	track,
+	experimentalMidi,
 	trackColor,
 	trackDetails,
 	isBusy,
@@ -304,8 +306,8 @@ export function TrackFxDrawer({
 		setEffectPickerOpen(false);
 		setEffectQuery('');
 		setEffectGroupFilter('');
-		setMode(track.type === 'midi' ? 'midi' : 'effects');
-	}, [track.id, track.type]);
+		setMode(track.type === 'midi' && experimentalMidi ? 'midi' : 'effects');
+	}, [experimentalMidi, track.id, track.type]);
 
 	useEffect(() => {
 		if (mode !== 'sounds' || sounds.length <= 1) return;
@@ -455,7 +457,7 @@ export function TrackFxDrawer({
 			</header>
 
 			<div className="track-fx-drawer-body">
-				{mode === 'effects' ? (
+				{mode === 'effects' || !experimentalMidi ? (
 					<>
 						{sliders.length ? <section className="track-fx-drawer-section track-fx-drawer-source-section" aria-labelledby="track-fx-source-heading">
 							<div className="track-fx-drawer-section-heading">
@@ -939,9 +941,9 @@ export function TrackFxDrawer({
 				<div className="track-fx-drawer-mode-switch" role="tablist" aria-label="Track control mode">
 					<button type="button" role="tab" aria-selected={mode === 'effects'} className={mode === 'effects' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('effects')}>Effects</button>
 					<button type="button" role="tab" aria-selected={mode === 'sounds'} className={mode === 'sounds' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('sounds')}>Sounds</button>
-					<button type="button" role="tab" aria-selected={mode === 'midi'} className={mode === 'midi' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('midi')}>MIDI</button>
+					{experimentalMidi ? <button type="button" role="tab" aria-selected={mode === 'midi'} className={mode === 'midi' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('midi')}>MIDI</button> : null}
 				</div>
-				<span className="track-fx-drawer-footer-status">{mode === 'effects' ? 'SOURCE · EFFECTS' : mode === 'sounds' ? 'SOURCE · SOUNDS' : 'SOURCE · MIDI'}</span>
+				<span className="track-fx-drawer-footer-status">{mode === 'effects' || !experimentalMidi ? 'SOURCE · EFFECTS' : mode === 'sounds' ? 'SOURCE · SOUNDS' : 'SOURCE · MIDI'}</span>
 			</footer>
 		</aside>
 	);

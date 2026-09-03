@@ -659,6 +659,11 @@ export interface AdapterRuntimeUpdate {
 	currentCycle?: number;
 }
 
+export interface StrudelAdapterOptions {
+	/** Enable the experimental @strudel/midi integration for this runtime. */
+	enableMidi?: boolean;
+}
+
 export type AdapterResult =
 	| { ok: true }
 	| { ok: false; error: unknown };
@@ -704,6 +709,7 @@ function isAudioPolicyError(error: unknown): boolean {
  * source document.
  */
 export class StrudelAdapter {
+	private readonly enableMidi: boolean;
 	private destroyed = false;
 	private module: StrudelModule | undefined;
 	private midiModule: StrudelMidiModule | undefined;
@@ -744,7 +750,10 @@ export class StrudelAdapter {
 			if (typeof navigator === 'undefined' || typeof navigator.requestMIDIAccess !== 'function') return undefined;
 			return import('@strudel/midi').then((module) => module as unknown as StrudelMidiModule);
 		},
-	) {}
+		options: StrudelAdapterOptions = {},
+	) {
+		this.enableMidi = options.enableMidi === true;
+	}
 
 	private loadMidiModule(): Promise<StrudelMidiModule | undefined> {
 		if (!this.midiLoadPromise) {
@@ -809,11 +818,10 @@ export class StrudelAdapter {
 
 			const module = await this.loadModule();
 			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
-			// MIDI is an optional browser-only extension. Import it here, after the
-			// Strudel web entry is requested, so Astro never evaluates Web MIDI during
-			// SSR/build. The package is cached by the module loader, which lets
-			// MidiService use the exact same WebMidi singleton later.
-			this.midiModule = await this.loadMidiModule();
+			// MIDI is an optional browser-only extension. Import it only for an
+			// explicitly enabled experimental runtime so normal playback never
+			// loads the Web MIDI package or touches its shared singleton.
+			this.midiModule = this.enableMidi ? await this.loadMidiModule() : undefined;
 			// The editor package owns the official widget methods and transpiler
 			// registrations. Load the package entry (the same module imported by the
 			// React editor) before the runtime's prebake so production bundlers keep
@@ -855,13 +863,13 @@ export class StrudelAdapter {
 				clearInterval: clearSchedulerInterval,
 				prebake: async () => {
 					registerSushiCompatibility(module, this.sliderValues);
-					if (this.midiModule) registerSushiMidi(module, this.midiModule);
+					if (this.enableMidi && this.midiModule) registerSushiMidi(module, this.midiModule);
 					// @strudel/web only registers oscillator synths by default. Strudel.cc
 					// adds its GM soundfonts and the sample collections below before
 					// evaluating user code, so ordinary Strudel snippets resolve the same
 					// sounds in Sushi instead of silently dropping unsupported layers.
 					await registerSoundfontsOnModule(module);
-					this.registerLiveMidiSounds(module);
+					if (this.enableMidi) this.registerLiveMidiSounds(module);
 					// Fetching the optional sample maps during init made a CORS/CDN or
 					// decoder failure look like a source-evaluation failure and prevented
 					// Firefox from reaching the first user-gesture Play. Start the work in
@@ -908,8 +916,8 @@ export class StrudelAdapter {
 			// Keep editor-only and MIDI helpers available after initialization too;
 			// this is idempotent when the prebake hook already installed them.
 			registerSushiCompatibility(module, this.sliderValues);
-			if (this.midiModule) registerSushiMidi(module, this.midiModule);
-			this.registerLiveMidiSounds(module);
+			if (this.enableMidi && this.midiModule) registerSushiMidi(module, this.midiModule);
+			if (this.enableMidi) this.registerLiveMidiSounds(module);
 			if (this.destroyed) {
 				try {
 					this.repl.stop();
@@ -988,6 +996,7 @@ export class StrudelAdapter {
 	 * source and transport position are restored before this operation resolves.
 	 */
 	public async previewNote(note: string, sound = 'sine'): Promise<AdapterResult> {
+		if (!this.enableMidi) return { ok: false, error: new Error('Experimental MIDI is disabled.') };
 		return this.enqueueSerialized(async () => {
 			try {
 				return await this.previewNoteNow(note, sound);
@@ -1017,6 +1026,7 @@ export class StrudelAdapter {
 	 * duration for the eventual source commit.
 	 */
 	public async triggerLiveMidiNote(note: number, velocity: number, sound = 'sine', durationMs = LIVE_MIDI_NOTE_DURATION_MS, channel = 1): Promise<AdapterResult> {
+		if (!this.enableMidi) return { ok: false, error: new Error('Experimental MIDI is disabled.') };
 		try {
 			if (!Number.isInteger(note) || note < 0 || note > 127) return { ok: false, error: new Error('Live MIDI note must be an integer from 0 to 127.') };
 			await this.init();
@@ -1077,6 +1087,7 @@ export class StrudelAdapter {
 
 	/** Stop one sustained live input note without touching the transport. */
 	public releaseLiveMidiNote(note: number, channel = 1): void {
+		if (!this.enableMidi) return;
 		const key = `${channel}:${note}`;
 		this.liveMidiNoteGenerations.set(key, (this.liveMidiNoteGenerations.get(key) ?? 0) + 1);
 		const handle = this.liveMidiNoteHandles.get(key);
@@ -1117,6 +1128,7 @@ export class StrudelAdapter {
 
 	/** Panic all notes currently being auditioned by the local live monitor. */
 	public releaseAllLiveMidiNotes(): void {
+		if (!this.enableMidi) return;
 		const keys = new Set([...this.liveMidiNoteGenerations.keys(), ...this.liveMidiNoteHandles.keys(), ...this.liveMidiNoteVoiceIds.keys()]);
 		for (const key of keys) {
 			const [channelText, noteText] = key.split(':');
@@ -1778,6 +1790,7 @@ export class StrudelAdapter {
 
 	/** Apply an external MIDI master's cycle rate without rewriting source BPM. */
 	public setRuntimeCps(cps: number): void {
+		if (!this.enableMidi) return;
 		if (!Number.isFinite(cps) || cps <= 0) return;
 		try {
 			const scheduler = this.repl?.scheduler as unknown as { setCps?: (value: number) => void } | undefined;
