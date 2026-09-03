@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, type MutableRefObject } from 'react';
+import { useCallback, useEffect, useMemo, useState, type MutableRefObject } from 'react';
 import {
 	createInitialProject,
 	diagnosticFromError,
@@ -87,6 +87,8 @@ export interface UseStudioWebMcpOptions {
 	setTrackMidiRoute: (trackId: string, output: string | number | null | undefined, channel: number, enabled: boolean, settings?: Pick<TrackMidiRouteUpdate, 'instrument' | 'velocity' | 'gain' | 'noteOffsetMs' | 'midimap' | 'program'>, expectedRevision?: number) => Promise<CommitSourceResult>;
 }
 
+export type WebMcpStatus = 'ready' | 'connecting' | 'unavailable';
+
 export function useStudioWebMcp({
 	studioRef,
 	adapterRef,
@@ -111,6 +113,7 @@ export function useStudioWebMcp({
 	commitMidiTake,
 	setTrackMidiRoute,
 }: UseStudioWebMcpOptions) {
+	const [webmcpStatus, setWebmcpStatus] = useState<WebMcpStatus>('connecting');
 	const getWebMcpState = useCallback((): WebMcpStateSnapshot => {
 		const current = studioRef.current;
 		const midi = midiService.getState();
@@ -883,7 +886,10 @@ export function useStudioWebMcp({
 		let registration: WebMcpRegistration | null = null;
 		const waitController = new AbortController();
 		void waitForNativeModelContext({ signal: waitController.signal }).then((context) => {
-			if (!context || disposed) return null;
+			if (!context || disposed) {
+				if (!disposed) setWebmcpStatus('unavailable');
+				return null;
+			}
 			return registerWebMcpTools(webmcpController, context, { signal: waitController.signal });
 		}).then((nextRegistration) => {
 			if (!nextRegistration) return;
@@ -894,10 +900,14 @@ export function useStudioWebMcp({
 			registration = nextRegistration;
 			webmcpRegistrationRef.current = nextRegistration;
 			webmcpAvailableRef.current = nextRegistration.available;
+			setWebmcpStatus(nextRegistration.available ? 'ready' : 'unavailable');
 		}).catch(() => {
 			// Host integration is optional. A late or malformed host must not create
 			// an unhandled rejection that takes down the studio page.
-			if (!disposed) webmcpAvailableRef.current = false;
+			if (!disposed) {
+				webmcpAvailableRef.current = false;
+				setWebmcpStatus('unavailable');
+			}
 		});
 		return () => {
 			disposed = true;
@@ -908,6 +918,9 @@ export function useStudioWebMcp({
 			(registration ?? webmcpRegistrationRef.current)?.dispose();
 			webmcpRegistrationRef.current = null;
 			webmcpAvailableRef.current = false;
+			setWebmcpStatus('unavailable');
 		};
 	}, [webmcpController, webmcpAvailableRef, webmcpRegistrationRef]);
+
+	return { webmcpStatus };
 }
