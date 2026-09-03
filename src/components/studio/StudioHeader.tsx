@@ -64,6 +64,7 @@ export interface StudioHeaderProps {
 	onLoadLocalProject: (projectId: string) => void;
 	onRefreshLocalProjects: () => void;
 	onAppearanceModeChange: (mode: AppearanceMode) => void;
+	onOpenOnboarding: () => void;
 }
 
 export function StudioHeader({
@@ -116,6 +117,7 @@ export function StudioHeader({
 	onLoadLocalProject,
 	onRefreshLocalProjects,
 	onAppearanceModeChange,
+	onOpenOnboarding,
 }: StudioHeaderProps) {
 	return (
 		<header className="studio-topbar" ref={headerRef}>
@@ -214,7 +216,7 @@ export function StudioHeader({
 				<div className="topbar-metrics" aria-label="Project settings"><span>{formatCycle(sourceGlobals.quarterNotesPerCycle)} Q/C</span><span>{formatCycle(songEndSeconds)}s</span></div>
 				<div className="topbar-help-control">
 					<button className="topbar-help-button" type="button" onClick={() => onTogglePopover('help')} disabled={isBusy} aria-expanded={openPopover === 'help'} aria-haspopup="dialog" aria-label="Keyboard shortcuts" title="Show keyboard shortcuts">?</button>
-					{openPopover === 'help' ? <HelpPopover /> : null}
+					{openPopover === 'help' ? <HelpPopover onOpenOnboarding={onOpenOnboarding} /> : null}
 				</div>
 			</div>
 		</header>
@@ -269,7 +271,7 @@ function KeyPopover({ draftKey, onSetKey }: { draftKey: ReturnType<typeof getKey
 	);
 }
 
-function HelpPopover() {
+function HelpPopover({ onOpenOnboarding }: { onOpenOnboarding: () => void }) {
 	return (
 		<div className="topbar-help-popover" role="dialog" aria-label="Keyboard shortcuts">
 			<strong className="topbar-popover-title">Keyboard shortcuts</strong>
@@ -280,6 +282,7 @@ function HelpPopover() {
 				<div className="hotkey-item"><kbd>Right-click</kbd><span>Track actions</span></div>
 				<div className="hotkey-item"><kbd>← / →</kbd><span>Nudge a clip by ¼ bar</span></div>
 			</div>
+			<button className="help-popover-onboarding" type="button" onClick={onOpenOnboarding}>Welcome to Sushi</button>
 		</div>
 	);
 }

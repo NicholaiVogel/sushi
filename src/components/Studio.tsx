@@ -38,8 +38,8 @@ import {
 	type TrackMidiRouteUpdate,
 } from '../lib/project/source-mapper';
 import type { TrackEffectMethod } from '../lib/strudel/track-effects';
-import { extendNoteGridSourceRange, midiToNoteName, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
-import type { EditorPreset } from '../lib/project/presets';
+import { extendNoteGridSourceRange, midiToNoteName, normalizeNoteGridSourceRanges, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
+import { EDITOR_PRESETS, type EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
 	getTimelineZoomForVisibleCycles,
@@ -59,6 +59,8 @@ import { TrackFxDrawer } from './studio/TrackFxDrawer';
 import { NoteEditor } from './studio/NoteEditor';
 import { MidiPanel } from './studio/MidiPanel';
 import { useStudioWebMcp } from './studio/useStudioWebMcp';
+import { OnboardingModal } from './studio/OnboardingModal';
+import { hasOnboardingOverride, markOnboardingCompleted, readOnboardingCompletion } from './studio/onboarding';
 import { APPEARANCE_STORAGE_KEY, normalizeAppearanceMode, readStoredAppearanceMode, type AppearanceMode } from '../lib/project/appearance';
 import {
 	clamp,
@@ -216,6 +218,7 @@ export default function Studio() {
 	const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
 	const [editorModule, setEditorModule] = useState<StrudelCodeMirrorModule | null>(null);
 	const [editorModuleError, setEditorModuleError] = useState<string | null>(null);
+	const [onboardingOpen, setOnboardingOpen] = useState(false);
 	const studioRef = useRef(studio);
 	const studioGenerationRef = useRef(0);
 	const adapterRef = useRef<StrudelAdapter | null>(null);
@@ -243,6 +246,7 @@ export default function Studio() {
 	const contextMenuRef = useRef<HTMLDivElement | null>(null);
 	const headerPopoverScopeRef = useRef<HTMLElement | null>(null);
 	const timelineLengthRef = useRef<HTMLDivElement | null>(null);
+	const restoredProjectRef = useRef(false);
 	const sourceHistoryRef = useRef<SourceHistoryState>({
 		cursorSource: createInitialProject().source.draft,
 		undo: [],
@@ -512,9 +516,15 @@ export default function Studio() {
 			const isUntouchedLegacySeed = storedProject?.source.revision === 0
 				&& storedProject.source.draft === LEGACY_DEFAULT_SOURCE
 				&& storedProject.source.lastValid === LEGACY_DEFAULT_SOURCE;
-			const project = !storedProject
+			restoredProjectRef.current = Boolean(storedProject && !isUntouchedLegacySeed);
+			const baseProject = !storedProject
 				? fallbackProject
 				: isUntouchedLegacySeed ? { ...storedProject, source: fallbackProject.source } : storedProject;
+			const repairedDraft = normalizeNoteGridSourceRanges(baseProject.source.draft);
+			const repairedLastValid = normalizeNoteGridSourceRanges(baseProject.source.lastValid);
+			const project = repairedDraft === baseProject.source.draft && repairedLastValid === baseProject.source.lastValid
+				? baseProject
+				: { ...baseProject, source: { ...baseProject.source, draft: repairedDraft, lastValid: repairedLastValid } };
 			const activeRevision = !storedProject || isUntouchedLegacySeed
 				? fallbackProject.source.revision
 				: stored?.activeRevision ?? project.source.revision;
@@ -1705,6 +1715,61 @@ export default function Studio() {
 		void dispatch({ type: 'stop' });
 	}, [dispatch, midiState.recording.status, studio.runtime.transport]);
 
+	const completeOnboarding = useCallback(() => {
+		markOnboardingCompleted();
+		setOpenHeaderPopover(null);
+		setOnboardingOpen(false);
+	}, []);
+
+	const openOnboarding = useCallback(() => {
+		setOpenHeaderPopover(null);
+		setOnboardingOpen(true);
+	}, []);
+
+	const prepareOnboardingDemo = useCallback(async (): Promise<boolean> => {
+		const adapter = adapterRef.current;
+		const preset = EDITOR_PRESETS[0];
+		if (!adapter || !preset || studioRef.current.phase === 'booting' || studioRef.current.phase === 'validating') return false;
+
+		const unlocked = await adapter.unlockAudio();
+		if (!unlocked.ok) {
+			const current = studioRef.current;
+			patchStudio({
+				phase: 'error',
+				diagnostics: [getErrorDiagnostic(current.revision, unlocked.error, 'audio', current.draft)],
+				runtime: { ...current.runtime, audioState: isAudioLockedError(unlocked.error) ? 'locked' : 'error' },
+			});
+			return false;
+		}
+
+		// loadEditorPreset is the normal template action. Its commitSource call
+		// evaluates the bundled source before it is promoted to lastValid.
+		const loaded = await loadEditorPreset(preset);
+		return loaded.ok;
+	}, [loadEditorPreset, patchStudio]);
+
+	const playPreparedOnboardingDemo = useCallback(() => {
+		void dispatch({ type: 'play' });
+	}, [dispatch]);
+
+	const startOnboardingBlank = useCallback(async (): Promise<boolean> => {
+		// A restored project is already the user's working document. The existing
+		// project model has one persisted identity, so do not reset it underneath
+		// the user from onboarding.
+		if (restoredProjectRef.current) return false;
+		const blankProject = createInitialProject();
+		return applyProjectSnapshot({ project: blankProject, activeRevision: blankProject.source.revision });
+	}, [applyProjectSnapshot]);
+
+	const openExistingFromOnboarding = useCallback(() => {
+		setOpenHeaderPopover('settings');
+	}, []);
+
+	useEffect(() => {
+		if (studio.phase === 'booting') return;
+		if (hasOnboardingOverride() || !readOnboardingCompletion()) setOnboardingOpen(true);
+	}, [studio.phase]);
+
 	useEffect(() => {
 		const service = midiServiceRef.current;
 		const sourceCps = () => {
@@ -1973,7 +2038,7 @@ export default function Studio() {
 		return () => document.removeEventListener('keydown', handleMidiShortcut);
 	}, [toggleMidiRecord]);
 
-	useStudioWebMcp({
+	const { webmcpStatus } = useStudioWebMcp({
 		studioRef,
 		adapterRef,
 		sourceTransactionsRef,
@@ -2189,7 +2254,8 @@ export default function Studio() {
 	}, [blocks, cancelTrackRename, contextMenu, fxDrawerTrackId, noteEditorTrackId, renamingTrackId, selectedTrackId]);
 
 	return (
-		<div className="studio-shell" ref={studioShellRef}>
+		<>
+			<div className="studio-shell" ref={studioShellRef} aria-hidden={onboardingOpen ? 'true' : undefined} inert={onboardingOpen || undefined}>
 			<StudioHeader
 				headerRef={headerPopoverScopeRef}
 				transportClockRef={transportClockRef}
@@ -2240,6 +2306,7 @@ export default function Studio() {
 				onLoadLocalProject={(projectId) => { void loadLocalProject(projectId); }}
 				onRefreshLocalProjects={() => { void refreshLocalProjects(); }}
 				onAppearanceModeChange={handleAppearanceModeChange}
+				onOpenOnboarding={openOnboarding}
 			/>
 
 			<div className="studio-body" style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
@@ -2409,6 +2476,16 @@ export default function Studio() {
 				onDelete={deleteSelectedTrack}
 				onSetColor={setTrackColor}
 			/> : null}
-		</div>
+			</div>
+			{onboardingOpen ? <OnboardingModal
+				webmcpStatus={webmcpStatus}
+				restoredProjectPresent={restoredProjectRef.current}
+				onPrepareDemo={prepareOnboardingDemo}
+				onPlayPreparedDemo={playPreparedOnboardingDemo}
+				onStartBlank={startOnboardingBlank}
+				onOpenExisting={openExistingFromOnboarding}
+				onClose={completeOnboarding}
+			/> : null}
+		</>
 	);
 }
