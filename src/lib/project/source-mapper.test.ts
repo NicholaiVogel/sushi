@@ -3,6 +3,7 @@ import { DEFAULT_SOURCE, DEFAULT_SONG_END_CYCLE, EXTENDED_SONG_END_CYCLE, create
 import {
 	cyclesToSeconds,
 	deleteTrack,
+	extendTrackSourceRangeWithRest,
 	getSourceBlockDetails,
 	getSourceGlobals,
 	getTrackDisplayTiming,
@@ -487,6 +488,21 @@ $: s("sine") // ._scope()
 		expect(cyclesToSeconds(4, globals)).toBe(0);
 	});
 
+	test('preserves old source timing when appending an empty range', () => {
+		const source = `// @sushi-track {"id":"trk_complex","name":"Complex","type":"synth","schema":1}\n$: seqPLoop([0, 4, s("bd*4").fast(2)])`;
+		const extended = extendTrackSourceRangeWithRest(source, 'trk_complex', 4, 8);
+		const [track] = getSourceBlockDetails(extended);
+
+		expect(extended).toContain('seqPLoop([0, 4, s("bd*4").fast(2)], [4, 8, s("~")])');
+		expect(track.timing).toEqual({ mode: 'seqPLoop', startCycle: 0, endCycle: 8 });
+
+		const full = extendTrackSourceRangeWithRest('$: s("bd*4")', 'trk_source_01', 4, 8);
+		expect(full).toContain('seqPLoop([0, 4, s("bd*4")], [4, 8, s("~")])');
+		const shortened = updateTrackRange(extended, 'trk_complex', 0, 4);
+		expect(shortened).toContain('seqPLoop([0, 4, s("bd*4").fast(2)])');
+		expect(shortened).not.toContain('DivisionByZero');
+	});
+
 	test('writes and reads explicit seqPLoop track ranges', () => {
 		const ranged = updateTrackRange(TRACKED_SOURCE, pulseId, 1, 3.5);
 		const [pulse, glass] = getSourceBlockDetails(ranged);
@@ -503,6 +519,9 @@ $: s("sine") // ._scope()
 
 		expect(updated).toContain('seqPLoop([1, 2, s("bd")], [3, 4, s("cp")])');
 		expect(layer.timing).toEqual({ mode: 'seqPLoop', startCycle: 1, endCycle: 4 });
+
+		const moved = updateTrackRange(source, 'trk_multirange', 2, 7);
+		expect(moved).toContain('seqPLoop([2, 4, s("bd")], [5, 7, s("cp")])');
 	});
 
 	test('keeps semicolon-terminated expressions valid when adding a range', () => {

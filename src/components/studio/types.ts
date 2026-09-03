@@ -59,6 +59,7 @@ export interface CommitSourceResult {
 export interface TimingDrag {
 	trackId: string;
 	edge: 'start' | 'end' | 'move';
+	source: string;
 	lane: HTMLElement;
 	pointerStartCycle: number;
 	startCycle: number;

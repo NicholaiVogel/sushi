@@ -54,6 +54,207 @@ describe('StrudelAdapter evaluation queue', () => {
 		}
 	});
 
+	test('loads MIDI helpers into the same Strudel evaluation scope', async () => {
+		const registrations: string[] = [];
+		const fakeModule = {
+			register: (name: string) => {
+				registrations.push(name);
+				return () => undefined;
+			},
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		const adapter = new StrudelAdapter(
+			undefined,
+			async () => fakeModule,
+			undefined,
+			async () => ({
+				defaultmidimap: () => undefined,
+				midimaps: () => undefined,
+				midin: () => undefined,
+				midikeys: () => undefined,
+			}),
+		);
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		try {
+			await adapter.init();
+			expect(registrations).toEqual(['sliderWithID', '_pianoroll', '_scope', '_spectrum', 'defaultmidimap', 'midimaps', 'midin', 'midikeys']);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
+	test('triggers live MIDI input through the shared Strudel audio trigger', async () => {
+		const triggerCalls: unknown[][] = [];
+		class FakeTimeSpan {
+			public constructor(public readonly begin: number, public readonly end: number) {}
+		}
+		class FakeHap {
+			public readonly whole: { begin?: unknown; end?: unknown };
+			public readonly part: { begin?: unknown; end?: unknown };
+			public readonly context: Record<string, unknown>;
+			public constructor(whole: unknown, part: unknown, public readonly value: Record<string, unknown>, context: Record<string, unknown> = {}) {
+				this.whole = whole as { begin?: unknown; end?: unknown };
+				this.part = part as { begin?: unknown; end?: unknown };
+				this.context = context;
+			}
+		}
+		const audioContext = { state: 'running', currentTime: 12 } as unknown as AudioContext;
+		const fakeModule = {
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, cps: 0.5, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+			getAudioContext: () => audioContext,
+			getTriggerFunc: () => async (...args: unknown[]) => { triggerCalls.push(args); },
+			Hap: FakeHap,
+			TimeSpan: FakeTimeSpan,
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			const result = await adapter.triggerLiveMidiNote(64, 0.75, 'triangle', 500);
+			expect(result).toEqual({ ok: true });
+			expect(triggerCalls).toHaveLength(1);
+			const hap = triggerCalls[0]?.[0] as FakeHap;
+			expect(hap.value).toMatchObject({ note: 64, s: 'triangle', velocity: 0.75, attack: 0.005, release: 0.12 });
+			expect(triggerCalls[0]?.[2]).toBe(0.5);
+			expect(triggerCalls[0]?.[3]).toBe(0.5);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
+	test('stops a live output handle at the audio clock when a note is released', async () => {
+		const stopTimes: number[] = [];
+		const sourceStopTimes: number[] = [];
+		const source = { stop: (when?: number) => sourceStopTimes.push(when ?? -1) };
+		class FakeTimeSpan {
+			public constructor(public readonly begin: number, public readonly end: number) {}
+		}
+		class FakeHap {
+			public readonly whole: { begin?: unknown; end?: unknown };
+			public readonly part: { begin?: unknown; end?: unknown };
+			public constructor(whole: unknown, part: unknown, public readonly value: Record<string, unknown>) {
+				this.whole = whole as { begin?: unknown; end?: unknown };
+				this.part = part as { begin?: unknown; end?: unknown };
+			}
+		}
+		const audioContext = { state: 'running', currentTime: 12 } as unknown as AudioContext;
+		const fakeModule = {
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, cps: 0.5, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+			getAudioContext: () => audioContext,
+			webaudioOutput: async () => ({ stop: (when?: number) => stopTimes.push(when ?? -1), nodes: { source: [source] } }),
+			Hap: FakeHap,
+			TimeSpan: FakeTimeSpan,
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			expect(await adapter.triggerLiveMidiNote(60, 0.8)).toEqual({ ok: true });
+			adapter.releaseLiveMidiNote(60);
+			expect(stopTimes).toEqual([12.012]);
+			expect(sourceStopTimes).toEqual([12.012]);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
+	test('does not let native .midi evaluation silently request SysEx permission', async () => {
+		let enableCalls = 0;
+		const webMidi = {
+			enabled: false,
+			enable: (...args: unknown[]) => {
+				enableCalls += 1;
+				if (typeof args[0] === 'function') (args[0] as () => void)();
+				return Promise.resolve();
+			},
+			addListener: () => undefined,
+		};
+		const fakeModule = {
+			register: () => () => undefined,
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, async () => ({ WebMidi: webMidi }));
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		try {
+			await adapter.init();
+			await webMidi.enable(() => undefined, { sysex: true });
+			expect(enableCalls).toBe(0);
+			(webMidi as typeof webMidi & { __sushiMidiAllowEnable?: boolean }).__sushiMidiAllowEnable = true;
+			await webMidi.enable({ sysex: false });
+			expect(enableCalls).toBe(1);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
+	test('patches WebMidi NRPN naming differences without replacing the shared runtime', async () => {
+		const sent: unknown[] = [];
+		const output = { sendNrpnValue: (...args: unknown[]) => { sent.push(args); } };
+		const midi = { WebMidi: { outputs: [output], addListener: () => undefined } };
+		const fakeModule = {
+			register: () => () => undefined,
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		const adapter = new StrudelAdapter(undefined, async () => fakeModule, undefined, async () => midi);
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+		try {
+			await adapter.init();
+			const sendNrpn = (output as { sendNRPN?: (parameter: unknown, value: unknown, channel: unknown) => void }).sendNRPN;
+			sendNrpn?.([1, 8], 123, 2);
+			expect(sent).toEqual([[[1, 8], 123, { channels: 2 }]]);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
 	test('keeps slider patterns live when their source value changes', async () => {
 		const registered = new Map<string, (...args: unknown[]) => unknown>();
 		const fakeModule = {
@@ -328,6 +529,37 @@ describe('StrudelAdapter evaluation queue', () => {
 			} else {
 				Reflect.deleteProperty(globalThis, 'window');
 			}
+		}
+	});
+
+	test('recovers when a header-only evaluator rejects the source promise', async () => {
+		const evaluated: string[] = [];
+		const fakeModule = {
+			initStrudel: async () => ({
+				evaluate: async (code: string) => {
+					evaluated.push(code);
+					if (!code.endsWith('silence')) throw new Error('unexpected ast format without body expression');
+					return {};
+				},
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			const source = 'setcpm(150 / 4)\nconst key = "E:minor"\n';
+			expect(await adapter.evaluateSource(source)).toEqual({ ok: true });
+			expect(evaluated).toEqual([source, 'setcpm(150 / 4)\nconst key = "E:minor"\n\nsilence']);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
 		}
 	});
 
@@ -1141,6 +1373,50 @@ describe('StrudelAdapter evaluation queue', () => {
 		}
 	});
 
+	test('uses the running audio clock for the live playhead when the scheduler cursor is stale', async () => {
+		let onToggle: ((started: boolean) => void) | undefined;
+		const audioClock = { currentTime: 10, state: 'running' };
+		const audioContext = audioClock as unknown as AudioContext;
+		const scheduler = {
+			cps: 0.625,
+			now: () => 0,
+			setCycle: (_cycle: number) => undefined,
+			stop: () => undefined,
+			lastEnd: 0,
+			lastBegin: 0,
+		};
+		const fakeModule = {
+			initStrudel: async (options?: { onToggle?: (started: boolean) => void }) => {
+				onToggle = options?.onToggle;
+				return {
+					evaluate: async () => ({}),
+					start: async () => onToggle?.(true),
+					stop: () => onToggle?.(false),
+					pause: () => onToggle?.(false),
+					scheduler,
+				};
+			},
+			getAudioContext: () => audioContext,
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			expect(await adapter.evaluateSource('accepted')).toEqual({ ok: true });
+			expect(await adapter.play(8)).toEqual({ ok: true });
+			audioClock.currentTime = 12.4;
+			expect(adapter.getCurrentCycle()).toBeCloseTo(1.5, 6);
+			expect(await adapter.pause()).toEqual({ ok: true });
+			expect(adapter.getCurrentCycle()).toBeCloseTo(1.5, 6);
+			adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
+
 	test('does not treat a stale shared-worker cursor as an immediate song end', async () => {
 		let schedulerCycle = 30;
 		let pendingSchedulerCycle: number | undefined;
@@ -1376,6 +1652,54 @@ describe('StrudelAdapter evaluation queue', () => {
 			} else {
 				Reflect.deleteProperty(globalThis, 'window');
 			}
+		}
+	});
+
+	test('auditions a note through a temporary Strudel pattern and restores the accepted source', async () => {
+		const evaluated: string[] = [];
+		let starts = 0;
+		let stops = 0;
+		let currentCycle = 0;
+		let onToggle: ((started: boolean) => void) | undefined;
+		const scheduler = {
+			now: () => currentCycle,
+			cps: 20,
+			setCycle: (cycle: number) => { currentCycle = cycle; },
+			stop: () => undefined,
+			lastEnd: 0,
+			lastBegin: 0,
+		};
+		const fakeModule = {
+			initStrudel: async (options?: { onToggle?: (started: boolean) => void }) => {
+				onToggle = options?.onToggle;
+				return {
+					evaluate: async (code: string) => { evaluated.push(code); return {}; },
+					start: async () => { starts += 1; onToggle?.(true); },
+					stop: () => { stops += 1; onToggle?.(false); },
+					pause: () => undefined,
+					scheduler,
+				};
+			},
+		};
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			const accepted = 'setcpm(120 / 4)\n$: note("c4").s("triangle")';
+			expect(await adapter.evaluateSource(accepted)).toEqual({ ok: true });
+			expect(await adapter.previewNote('D4', 'triangle')).toEqual({ ok: true });
+			expect(evaluated).toHaveLength(3);
+			expect(evaluated[0]).toBe(accepted);
+			expect(evaluated[1]).toContain('$: note("D4").s("triangle")');
+			expect(evaluated[2]).toBe(accepted);
+			expect(starts).toBe(1);
+			expect(stops).toBeGreaterThan(0);
+		adapter.destroy();
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
 		}
 	});
 

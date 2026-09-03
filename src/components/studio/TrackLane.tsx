@@ -12,6 +12,7 @@ import {
 import type { TrackDetails } from './types';
 import { VisualizerCanvas } from './VisualizerCanvas';
 import type { StrudelVisualizer, VisualizerHap } from '../../lib/strudel/adapter';
+import { midiToNoteName, type NoteGrid } from '../../lib/project/note-grid';
 
 export interface TimelineCell {
 	isBarStart: boolean;
@@ -23,6 +24,7 @@ export interface TrackLaneProps {
 	index: number;
 	trackColor: string;
 	trackDetails?: TrackDetails;
+	noteGrid?: NoteGrid;
 	timing: TrackDetails['timing'];
 	songEndCycle: number;
 	sourceGlobals: SourceGlobals;
@@ -39,6 +41,7 @@ export interface TrackLaneProps {
 	fxDrawerOpen: boolean;
 	onSelect: (trackId: string) => void;
 	onContextMenu: (event: MouseEvent<HTMLElement>, trackId: string) => void;
+	onOpenNoteEditor: (trackId: string) => void;
 	onLaneKeyDown: (event: KeyboardEvent<HTMLDivElement>, trackId: string) => void;
 	onStartRename: (trackId: string) => void;
 	onRenameValueChange: (value: string) => void;
@@ -53,11 +56,36 @@ export interface TrackLaneProps {
 	onSetTrackRange: (trackId: string, startCycle: number, endCycle: number) => void;
 }
 
+interface TrackPreviewNote {
+	id: string;
+	midi: number;
+	startCycle: number;
+	durationCycles: number;
+}
+
+function getTrackPreviewNotes(noteGrid: NoteGrid, timing: TrackDetails['timing']): TrackPreviewNote[] {
+	const patternCycles = Math.max(0.001, noteGrid.patternCycles);
+	const displaySpan = Math.max(0.25, timing.endCycle - timing.startCycle);
+	const repeatCount = Math.min(128, Math.max(1, Math.ceil(displaySpan / patternCycles)));
+	const notes: TrackPreviewNote[] = [];
+	for (let repeat = 0; repeat < repeatCount; repeat += 1) {
+		for (const note of noteGrid.notes) {
+			const startCycle = timing.startCycle + repeat * patternCycles + note.startCycle;
+			if (startCycle >= timing.endCycle) continue;
+			const durationCycles = Math.min(note.durationCycles, timing.endCycle - startCycle);
+			if (durationCycles <= 0) continue;
+			notes.push({ id: `${note.id}-${repeat}`, midi: note.midi, startCycle, durationCycles });
+		}
+	}
+	return notes;
+}
+
 export function TrackLane({
 	block,
 	index,
 	trackColor,
 	trackDetails,
+	noteGrid,
 	timing,
 	songEndCycle,
 	sourceGlobals,
@@ -74,6 +102,7 @@ export function TrackLane({
 	fxDrawerOpen,
 	onSelect,
 	onContextMenu,
+	onOpenNoteEditor,
 	onLaneKeyDown,
 	onStartRename,
 	onRenameValueChange,
@@ -95,6 +124,12 @@ export function TrackLane({
 	const trackLaneHeight = 82;
 	const clipStart = clamp(timing.startCycle / songEndCycle, 0, 1);
 	const clipEnd = clamp(timing.endCycle / songEndCycle, clipStart + 0.01, 1);
+	const clipWidth = Math.max(0.01, clipEnd - clipStart);
+	const previewNotes = noteGrid ? getTrackPreviewNotes(noteGrid, timing) : [];
+	const previewMinMidi = noteGrid?.notes.length ? Math.max(0, Math.min(...noteGrid.notes.map((note) => note.midi)) - 6) : 36;
+	const previewMaxMidi = noteGrid?.notes.length ? Math.min(127, Math.max(...noteGrid.notes.map((note) => note.midi)) + 6) : 84;
+	const previewMidiRange = Math.max(12, previewMaxMidi - previewMinMidi);
+	const previewSpan = Math.max(0.25, timing.endCycle - timing.startCycle);
 	const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
 
 	return (
@@ -109,13 +144,17 @@ export function TrackLane({
 				onSelect(block.id);
 			}}
 			onContextMenu={(event) => onContextMenu(event, block.id)}
+			onDoubleClick={(event) => {
+				if (event.target instanceof HTMLElement && event.target.closest('button, input, select, textarea')) return;
+				onOpenNoteEditor(block.id);
+			}}
 			onKeyDown={(event) => onLaneKeyDown(event, block.id)}
 			aria-current={selected ? 'true' : undefined}
 			aria-label={`Track ${(index + 1).toString()}: ${block.name}`}
 		>
 			<div className="track-header" style={{ '--track-color': trackColor } as CSSProperties}>
 				<div className="track-header-top">
-					<span className="track-instrument-icon" aria-hidden="true">♩</span>
+					<span className="track-instrument-icon" aria-hidden="true">{block.type === 'midi' ? '⌁' : '♩'}</span>
 					<div className="track-title-wrap">
 						<div className="track-name-line">
 							<span className="track-number">{(index + 1).toString().padStart(2, '0')}</span>
@@ -201,7 +240,7 @@ export function TrackLane({
 				<div className="lane-grid-lines" style={{ '--timeline-cell-count': timelineCellCount } as CSSProperties} aria-hidden="true">{timelineCells.map((cell, cellIndex) => <span className={cell.isBarStart ? 'beat-start' : ''} key={cellIndex} />)}</div>
 				<div
 					className="pattern-region"
-					style={{ '--track-color': trackColor, '--clip-start': clipStart, '--clip-end': clipEnd } as CSSProperties}
+					style={{ '--track-color': trackColor, '--clip-start': `${clipStart * 100}%`, '--clip-width': `${clipWidth * 100}%` } as CSSProperties}
 					onPointerDown={(event) => onStartTimingDrag(event, block.id, 'move')}
 					onKeyDown={(event) => {
 						if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
@@ -213,7 +252,7 @@ export function TrackLane({
 					role="button"
 					tabIndex={0}
 					aria-label={`Move ${block.name} clip, currently ${timingLabel}`}
-					title={`${block.name}: drag to move in quarter-cycle steps`}
+					title={`${block.name}: drag to move in quarter-cycle steps; double-click to open the note editor`}
 				>
 					{trackDetails?.visualizer ? <VisualizerCanvas
 						trackId={block.id}
@@ -227,9 +266,23 @@ export function TrackLane({
 						getVisualizerScopeData={getVisualizerScopeData}
 						getVisualizerSpectrumData={getVisualizerSpectrumData}
 					/> : null}
-					<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => onStartTimingDrag(event, block.id, 'start')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - TIMELINE_SNAP_CYCLE), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
+					{noteGrid?.notes.length ? <div className="track-note-preview" aria-label={`${block.name} note preview`}>
+						{previewNotes.map((note) => {
+							const left = clamp((note.startCycle - timing.startCycle) / previewSpan, 0, 1) * 100;
+							const width = Math.max(0.4, Math.min(note.durationCycles / previewSpan, 1 - (note.startCycle - timing.startCycle) / previewSpan) * 100);
+							const top = clamp((previewMaxMidi - note.midi) / previewMidiRange, 0, 1) * 100;
+							return <span
+								className="track-note-preview-note"
+								key={note.id}
+								style={{ left: `${left}%`, width: `${width}%`, top: `${top}%`, '--track-color': trackColor } as CSSProperties}
+								aria-label={`${midiToNoteName(note.midi)} note, starts at ${formatCycle(note.startCycle)} cycles`}
+								title={`${midiToNoteName(note.midi)} · ${formatCycle(note.startCycle)} cycles`}
+							>{midiToNoteName(note.midi)}</span>;
+						})}
+					</div> : null}
+					<button className="clip-handle clip-handle-start" type="button" onPointerDown={(event) => { event.stopPropagation(); onStartTimingDrag(event, block.id, 'start'); }} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); event.stopPropagation(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, clamp(timing.startCycle + delta, 0, timing.endCycle - TIMELINE_SNAP_CYCLE), timing.endCycle); } }} aria-label={`Set ${block.name} start point, currently cycle ${formatCycle(timing.startCycle)}`} title={`In ${formatCycle(timing.startCycle)} cycles`} />
 					<span>{block.name.toUpperCase()}</span><small>{timingLabel}</small>
-					<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => onStartTimingDrag(event, block.id, 'end')} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, timing.startCycle, Math.max(timing.startCycle + TIMELINE_SNAP_CYCLE, timing.endCycle + delta)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
+					<button className="clip-handle clip-handle-end" type="button" onPointerDown={(event) => { event.stopPropagation(); onStartTimingDrag(event, block.id, 'end'); }} onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); event.stopPropagation(); const delta = event.key === 'ArrowLeft' ? -TIMELINE_SNAP_CYCLE : TIMELINE_SNAP_CYCLE; onSetTrackRange(block.id, timing.startCycle, Math.max(timing.startCycle + TIMELINE_SNAP_CYCLE, timing.endCycle + delta)); } }} aria-label={`Set ${block.name} end point, currently cycle ${formatCycle(timing.endCycle)}`} title={`Out ${formatCycle(timing.endCycle)} cycles`} />
 				</div>
 				<span className={`lane-playhead ${runtime.transport === 'playing' ? 'lane-playhead-live' : ''}`} aria-hidden="true" />
 			</div>

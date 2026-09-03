@@ -37,6 +37,7 @@ declare module '@strudel/core' {
 }
 
 declare module '@strudel/codemirror' {
+	import type { Compartment } from '@codemirror/state';
 	import type { EditorView } from '@codemirror/view';
 
 	export type StrudelEditorView = EditorView;
@@ -68,6 +69,7 @@ declare module '@strudel/codemirror' {
 	export function updateSliderWidgets(view: StrudelEditorView, widgets: Array<Record<string, any>>): void;
 	export function updateWidgets(view: StrudelEditorView, widgets: Array<Record<string, any>>): void;
 	export const codemirrorSettings: { get(): StrudelEditorSettings };
+	export const compartments: Record<string, Compartment>;
 }
 
 // Importing this module registers Strudel's official inline visualizer widgets

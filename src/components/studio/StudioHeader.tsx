@@ -1,5 +1,6 @@
 import type { ChangeEvent, RefObject } from 'react';
 import type { RuntimeState } from '../../lib/project/model';
+import type { MidiRuntimeState } from '../../lib/midi/types';
 import type { SourceGlobals } from '../../lib/project/source-mapper';
 import type { EditorPreset } from '../../lib/project/presets';
 import type { StoredProjectSummary } from '../../lib/project/storage';
@@ -55,6 +56,10 @@ export interface StudioHeaderProps {
 	onPlay: () => void;
 	onPause: () => void;
 	onStop: () => void;
+	onRecordMidi: () => void;
+	onToggleMidiPanel: () => void;
+	midiPanelOpen: boolean;
+	midiState: MidiRuntimeState;
 	onLoadPreset: (preset: EditorPreset) => void;
 	onLoadLocalProject: (projectId: string) => void;
 	onRefreshLocalProjects: () => void;
@@ -103,6 +108,10 @@ export function StudioHeader({
 	onPlay,
 	onPause,
 	onStop,
+	onRecordMidi,
+	onToggleMidiPanel,
+	midiPanelOpen,
+	midiState,
 	onLoadPreset,
 	onLoadLocalProject,
 	onRefreshLocalProjects,
@@ -177,6 +186,8 @@ export function StudioHeader({
 						</div>
 					</div>
 					<div className="transport-playback" aria-label="Playback controls">
+						<button className={`transport-button transport-midi${midiPanelOpen ? ' transport-midi-active' : ''}`} type="button" onClick={onToggleMidiPanel} disabled={isBusy} aria-label="Open MIDI controls" aria-pressed={midiPanelOpen} title="Open MIDI controls">♫<span className={`transport-midi-dot${midiState.enabled ? ' transport-midi-dot-live' : ''}`} aria-hidden="true" /></button>
+						<button className={`transport-button transport-record${midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? ' transport-record-active' : ''}`} type="button" onClick={onRecordMidi} disabled={isBusy} aria-label={midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? 'Stop MIDI recording' : 'Open MIDI recording'} title={midiState.recording.status === 'recording' || midiState.recording.status === 'count-in' ? 'Stop MIDI recording' : 'Open MIDI recording'}>●</button>
 						<button className="transport-button transport-stop" type="button" onClick={onStop} disabled={!canPlay || (runtime.transport === 'stopped' && runtime.currentCycle === 0)} aria-label="Stop playback" title="Stop and return to cycle zero">■</button>
 						<button className="transport-button transport-play" type="button" onClick={onPlay} disabled={!canPlay} aria-label={runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'} title={runtime.transport === 'paused' ? 'Resume playback' : 'Play accepted source'}>▶</button>
 						<button className="transport-button transport-pause" type="button" onClick={onPause} disabled={!canPlay || runtime.transport !== 'playing'} aria-label="Pause playback" title="Pause at the current cycle">Ⅱ</button>
@@ -263,6 +274,7 @@ function HelpPopover() {
 		<div className="topbar-help-popover" role="dialog" aria-label="Keyboard shortcuts">
 			<strong className="topbar-popover-title">Keyboard shortcuts</strong>
 			<div className="hotkey-list">
+				<div className="hotkey-item"><kbd>R</kbd><span>Open / start MIDI record</span></div>
 				<div className="hotkey-item"><kbd>⌘ / Ctrl + Enter</kbd><span>Validate source</span></div>
 				<div className="hotkey-item"><kbd>Backspace / Delete</kbd><span>Delete selected track</span></div>
 				<div className="hotkey-item"><kbd>Right-click</kbd><span>Track actions</span></div>

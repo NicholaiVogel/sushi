@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { SourceBlockSummary } from '../../lib/project/model';
+import type { MidiRuntimeState } from '../../lib/midi/types';
 import {
 	listTrackEffectDefinitions,
 	type TrackEffectDefinition,
@@ -12,6 +13,7 @@ import {
 import { listStrudelSounds, searchStrudelSounds, type StrudelSoundType } from '../../lib/strudel/sounds';
 import {
 	type SourceEffect,
+	type TrackMidiRouteUpdate,
 } from '../../lib/project/source-mapper';
 import type { TrackDetails } from './types';
 
@@ -30,6 +32,11 @@ export interface TrackFxDrawerProps {
 	onRemoveEffect: (trackId: string, effectId: string) => void;
 	onReorderEffect: (trackId: string, effectId: string, direction: 'up' | 'down') => void;
 	onSetSound: (trackId: string, value: string, soundId?: string) => void;
+	midiState: MidiRuntimeState;
+	onSetMidiRoute: (trackId: string, output: string | null, channel: number, enabled: boolean, settings?: Pick<TrackMidiRouteUpdate, 'velocity' | 'gain' | 'noteOffsetMs' | 'midimap' | 'program'>) => void;
+	onSetMidiInstrument: (trackId: string, instrument: string | null) => void;
+	onOpenMidiPanel: () => void;
+	onTestMidi: () => void;
 }
 
 function formatValue(value: number): string {
@@ -76,12 +83,80 @@ function humanizeLabel(value: string): string {
 	return value.replace(/[-_]+/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function sourceStringLiteral(value: string): string {
+	return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
 interface EffectPickerPosition {
 	left: number;
 	width: number;
 	maxHeight: number;
 	top?: number;
 	bottom?: number;
+}
+
+function MidiTrackControls({
+	track,
+	trackDetails,
+	midiState,
+	isBusy,
+	onSetMidiRoute,
+	onSetMidiInstrument,
+	onOpenMidiPanel,
+	onTestMidi,
+}: Pick<TrackFxDrawerProps, 'track' | 'trackDetails' | 'midiState' | 'isBusy' | 'onSetMidiRoute' | 'onSetMidiInstrument' | 'onOpenMidiPanel' | 'onTestMidi'>) {
+	const route = trackDetails?.midi;
+	const instrument = trackDetails?.instrument ?? 'sine';
+	const synthInstruments = listStrudelSounds({ type: 'synth' });
+	const soundfontInstruments = listStrudelSounds({ type: 'soundfont' });
+	const knownInstrument = [...synthInstruments, ...soundfontInstruments].some((definition) => definition.id === instrument);
+	const routeOutput = route?.output === undefined ? '' : String(route.output);
+	const routeChannel = route?.channel ?? midiState.outputChannel;
+	const outputOptions = [...midiState.outputs];
+	if (routeOutput && !outputOptions.some((output) => output.name === routeOutput)) outputOptions.unshift({ id: `route-${routeOutput}`, name: routeOutput, type: 'output', state: 'disconnected', connection: 'unknown' });
+	const enabled = route?.enabled === true;
+	const routeVelocity = route?.velocity ?? 0.9;
+	const routeGain = route?.gain ?? 1;
+	const routeNoteOffset = route?.noteOffsetMs ?? 10;
+	const routeProgram = route?.program === undefined ? '' : String(route.program);
+	const routeSettings: Pick<TrackMidiRouteUpdate, 'velocity' | 'gain' | 'noteOffsetMs' | 'midimap' | 'program'> = {
+		velocity: routeVelocity,
+		gain: routeGain,
+		noteOffsetMs: routeNoteOffset,
+		...(route?.midimap === undefined ? {} : { midimap: route.midimap }),
+		...(route?.program === undefined ? {} : { program: route.program }),
+	};
+	const setRoute = (settings: Partial<typeof routeSettings> = {}) => onSetMidiRoute(track.id, routeOutput || null, routeChannel, true, { ...routeSettings, ...settings });
+	const midiOptionPreview = [
+		`velocity: ${routeVelocity}`,
+		`gain: ${routeGain}`,
+		`noteOffsetMs: ${routeNoteOffset}`,
+		...(route?.midimap ? [`midimap: ${sourceStringLiteral(route.midimap)}`] : []),
+	].join(', ');
+	const midiCallPreview = routeOutput
+		? `.midi(${sourceStringLiteral(routeOutput)}, { ${midiOptionPreview} })`
+		: `.midi({ ${midiOptionPreview} })`;
+	return (
+		<section className="track-fx-drawer-section track-fx-drawer-midi-controls" aria-labelledby="track-fx-midi-heading">
+			<div className="track-fx-drawer-section-heading">
+				<div className="track-fx-drawer-section-heading-main"><h3 id="track-fx-midi-heading">MIDI routing</h3><span>{enabled ? 'ACTIVE' : 'AUDIO ONLY'}</span></div>
+				<span className="track-fx-midi-status-dot" aria-hidden="true" />
+			</div>
+			<p className="track-fx-midi-copy">Computer keys <code>A W S E D F T G Y H U J K</code> play immediately; hold Shift for the next octave. MIDI tracks use the shared Strudel synth. External output is optional and uses native <code>.midi()</code>.</p>
+			{track.type === 'midi' ? <label className="track-fx-midi-field track-fx-midi-instrument-field"><span>Live instrument</span><select value={knownInstrument ? instrument : instrument ? '__custom__' : ''} onChange={(event) => onSetMidiInstrument(track.id, event.target.value === '__custom__' || !event.target.value ? null : event.target.value)} disabled={isBusy || !trackDetails}><option value="">Sine fallback</option>{!knownInstrument && instrument ? <option value="__custom__">Custom: {instrument}</option> : null}<optgroup label="Synth waveforms">{synthInstruments.map((definition) => <option value={definition.id} key={`synth-${definition.id}`}>{definition.label}</option>)}</optgroup><optgroup label="GM instruments">{soundfontInstruments.map((definition) => <option value={definition.id} key={`gm-${definition.id}`}>{definition.label}</option>)}</optgroup></select></label> : null}
+			<label className="track-fx-midi-enable"><input type="checkbox" checked={enabled} onChange={(event) => onSetMidiRoute(track.id, routeOutput || null, routeChannel, event.target.checked, routeSettings)} disabled={isBusy || !trackDetails} /><span>Enable external MIDI output</span></label>
+			<label className="track-fx-midi-field"><span>Output port</span><select value={routeOutput} onChange={(event) => onSetMidiRoute(track.id, event.target.value || null, routeChannel, true, routeSettings)} disabled={isBusy || !trackDetails || !enabled}><option value="">Default connected output</option>{outputOptions.map((output) => <option value={output.name} key={output.id}>{output.name}{output.state === 'disconnected' ? ' · offline' : ''}</option>)}</select></label>
+			<label className="track-fx-midi-field"><span>Channel</span><select value={routeChannel} onChange={(event) => onSetMidiRoute(track.id, routeOutput || null, Number(event.target.value), true, routeSettings)} disabled={isBusy || !trackDetails || !enabled}>{Array.from({ length: 16 }, (_, index) => index + 1).map((channel) => <option value={channel} key={channel}>{channel}</option>)}</select></label>
+			<div className="track-fx-midi-settings-grid">
+				<label className="track-fx-midi-field"><span>Velocity default</span><input type="number" min="0" max="1" step="0.01" value={routeVelocity} onChange={(event) => setRoute({ velocity: Number(event.target.value) })} disabled={isBusy || !trackDetails || !enabled} /></label>
+				<label className="track-fx-midi-field"><span>Gain multiplier</span><input type="number" min="0" max="1" step="0.01" value={routeGain} onChange={(event) => setRoute({ gain: Number(event.target.value) })} disabled={isBusy || !trackDetails || !enabled} /></label>
+				<label className="track-fx-midi-field"><span>Note-off offset (ms)</span><input type="number" min="0" max="10000" step="1" value={routeNoteOffset} onChange={(event) => setRoute({ noteOffsetMs: Number(event.target.value) })} disabled={isBusy || !trackDetails || !enabled} /></label>
+				<label className="track-fx-midi-field"><span>Program (0–127)</span><input type="number" min="0" max="127" step="1" placeholder="—" value={routeProgram} onChange={(event) => setRoute({ program: event.target.value === '' ? null : Number(event.target.value) })} disabled={isBusy || !trackDetails || !enabled} /></label>
+			</div>
+			<div className="track-fx-midi-route-preview"><span>Source route</span><code>{enabled ? `.midichan(${routeChannel})${midiCallPreview}${routeProgram === '' ? '' : `.progNum(${routeProgram})`}` : 'No external MIDI output'}</code></div>
+			<div className="track-fx-midi-actions"><button className="track-fx-midi-connect" type="button" onClick={onOpenMidiPanel}>{midiState.enabled ? 'Open MIDI devices' : 'Connect MIDI'}</button>{enabled ? <button className="track-fx-midi-test" type="button" onClick={onTestMidi} disabled={!midiState.enabled || !midiState.selectedOutputId}>Test output</button> : null}</div>
+		</section>
+	);
 }
 
 export function TrackFxDrawer({
@@ -97,6 +172,11 @@ export function TrackFxDrawer({
 	onRemoveEffect,
 	onReorderEffect,
 	onSetSound,
+	midiState,
+	onSetMidiRoute,
+	onSetMidiInstrument,
+	onOpenMidiPanel,
+	onTestMidi,
 }: TrackFxDrawerProps) {
 	const [mode, setMode] = useState<TrackFxDrawerMode>('effects');
 	const [addSelection, setAddSelection] = useState<TrackEffectMethod | ''>('');
@@ -224,7 +304,8 @@ export function TrackFxDrawer({
 		setEffectPickerOpen(false);
 		setEffectQuery('');
 		setEffectGroupFilter('');
-	}, [track.id]);
+		setMode(track.type === 'midi' ? 'midi' : 'effects');
+	}, [track.id, track.type]);
 
 	useEffect(() => {
 		if (mode !== 'sounds' || sounds.length <= 1) return;
@@ -559,7 +640,7 @@ export function TrackFxDrawer({
 														width: effectPickerPosition.width,
 														maxHeight: effectPickerPosition.maxHeight,
 														...(effectPickerPosition.top !== undefined ? { top: effectPickerPosition.top } : { bottom: effectPickerPosition.bottom ?? 12 }),
-													} as CSSProperties}
+													} as CSSProperties & { '--track-color': string }}
 												>
 													<div className="track-fx-effect-picker-header">
 														<strong>Effects</strong>
@@ -708,7 +789,7 @@ export function TrackFxDrawer({
 									width: soundPickerPosition.width,
 									maxHeight: soundPickerPosition.maxHeight,
 									...(soundPickerPosition.top !== undefined ? { top: soundPickerPosition.top } : { bottom: soundPickerPosition.bottom ?? 12 }),
-								} as CSSProperties}
+								} as CSSProperties & { '--track-color': string }}
 							>
 								<div className="track-fx-effect-picker-header">
 									<strong>Sounds{targetSound ? ` · ${targetSound.label}` : ''}</strong>
@@ -841,11 +922,16 @@ export function TrackFxDrawer({
 						<p className="track-sound-note">Choosing a sound writes a literal <code>.sound(...)</code> value; custom expressions stay intact until replaced.</p>
 					</section>
 				) : (
-					<section className="track-fx-drawer-section track-fx-drawer-midi-placeholder" aria-labelledby="track-fx-midi-heading">
-						<span className="track-fx-drawer-placeholder-icon" aria-hidden="true">♫</span>
-						<h3 id="track-fx-midi-heading">MIDI controls</h3>
-						<p>MIDI routing and performance controls will live here in a future update.</p>
-					</section>
+					<MidiTrackControls
+						track={track}
+						trackDetails={trackDetails}
+						midiState={midiState}
+						isBusy={isBusy}
+						onSetMidiRoute={onSetMidiRoute}
+						onSetMidiInstrument={onSetMidiInstrument}
+						onOpenMidiPanel={onOpenMidiPanel}
+						onTestMidi={onTestMidi}
+					/>
 				)}
 			</div>
 
@@ -855,7 +941,7 @@ export function TrackFxDrawer({
 					<button type="button" role="tab" aria-selected={mode === 'sounds'} className={mode === 'sounds' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('sounds')}>Sounds</button>
 					<button type="button" role="tab" aria-selected={mode === 'midi'} className={mode === 'midi' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('midi')}>MIDI</button>
 				</div>
-				<span className="track-fx-drawer-footer-status">{mode === 'effects' ? 'SOURCE · EFFECTS' : mode === 'sounds' ? 'SOURCE · SOUNDS' : 'MIDI · RESERVED'}</span>
+				<span className="track-fx-drawer-footer-status">{mode === 'effects' ? 'SOURCE · EFFECTS' : mode === 'sounds' ? 'SOURCE · SOUNDS' : 'SOURCE · MIDI'}</span>
 			</footer>
 		</aside>
 	);

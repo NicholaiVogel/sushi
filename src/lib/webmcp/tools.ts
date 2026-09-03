@@ -1,7 +1,8 @@
 /// <reference types="webmcp-types" />
 
 import type { SourceDiagnostic, RuntimeState } from '../project/model';
-import type { SourceBlockDetails, TrackTiming } from '../project/source-mapper';
+import type { SourceBlockDetails, SourceMidiRoute, TrackTiming } from '../project/source-mapper';
+import { isMidiChannel, normalizeMidiChannel, normalizeMidiQuantizeGrid, type MidiChannel, type MidiClockMode, type MidiRecordMode, type MidiQuantizeGrid, type MidiRecordedTake, type MidiRecordingOptions, type MidiRuntimeState } from '../midi/types';
 import { getEditorPreset, listEditorPresets, summarizeEditorPreset, type EditorPresetSummary } from '../project/presets';
 import { lookupStrudelReference, STRUDEL_REFERENCE_VERSION, type StrudelReferenceEntry, type StrudelReferenceKind } from '../strudel/reference';
 
@@ -25,6 +26,23 @@ export const WEBMCP_TOOL_NAMES = [
 	'control_playback',
 	'undo_source_edit',
 	'redo_source_edit',
+	'get_midi_capabilities',
+	'list_midi_devices',
+	'inspect_midi_state',
+	'read_midi_take',
+	'request_midi_access',
+	'select_midi_input',
+	'select_midi_output',
+	'set_midi_settings',
+	'learn_midi_control',
+	'set_track_midi_route',
+	'arm_midi_recording',
+	'start_midi_recording',
+	'stop_midi_recording',
+	'cancel_midi_recording',
+	'accept_midi_take',
+	'panic_midi',
+	'send_midi_test_note',
 ] as const;
 
 export type WebMcpToolName = (typeof WEBMCP_TOOL_NAMES)[number];
@@ -47,8 +65,10 @@ export interface WebMcpTrackState {
 	pan: WebMcpControlState;
 	color?: string;
 	colorEditable?: boolean;
+	instrument?: string;
 	muted: boolean;
 	soloed: boolean;
+	midi?: SourceMidiRoute;
 }
 
 export interface WebMcpStateSnapshot {
@@ -76,6 +96,7 @@ export interface WebMcpStateSnapshot {
 	webmcp: {
 		available: boolean;
 	};
+	midi: MidiRuntimeState;
 }
 
 export interface SourceTextEdit {
@@ -189,10 +210,72 @@ export interface WebMcpTimelineExtensionInput {
 	transactionId: string;
 }
 
+export interface WebMcpMidiRouteInput extends WebMcpTrackMutationInput {
+	output?: string | null;
+	channel: number;
+	instrument?: string | null;
+	enabled: boolean;
+	velocity?: number | null;
+	gain?: number | null;
+	noteOffsetMs?: number | null;
+	midimap?: string | null;
+	program?: number | null;
+}
+
+export interface WebMcpMidiAccessInput {
+	sysex: boolean;
+}
+
+export interface WebMcpMidiSelectionInput {
+	id: string | null;
+}
+
+export interface WebMcpMidiSettingsInput {
+	inputChannel?: MidiChannel;
+	outputChannel?: number;
+	monitor?: boolean;
+	clockMode?: MidiClockMode;
+}
+
+export interface WebMcpMidiRecordInput {
+	trackId: string;
+	inputId?: string;
+	channel?: MidiChannel;
+	mode?: MidiRecordMode;
+	quantize?: MidiQuantizeGrid;
+	quantizeStrength?: number;
+	swing?: number;
+	countInBars?: 0 | 1 | 2;
+	loop?: boolean;
+	captureAutomation?: boolean;
+}
+
+export interface WebMcpMidiTakeAcceptInput {
+	baseRevision: number;
+	transactionId: string;
+}
+
 export interface SourcePatchInput {
 	edits: SourceTextEdit[];
 	baseRevision: number;
 	transactionId: string;
+}
+
+export interface WebMcpMidiController {
+	getState: () => MidiRuntimeState;
+	connect: (options: WebMcpMidiAccessInput) => Promise<MidiRuntimeState>;
+	disconnect: () => Promise<MidiRuntimeState>;
+	selectInput: (id: string | null) => MidiRuntimeState;
+	selectOutput: (id: string | null) => MidiRuntimeState;
+	setSettings: (settings: WebMcpMidiSettingsInput) => MidiRuntimeState;
+	learnControl: () => MidiRuntimeState;
+	armRecording: (options: WebMcpMidiRecordInput) => MidiRuntimeState;
+	startRecording: (signal?: AbortSignal) => Promise<MidiRuntimeState>;
+	stopRecording: () => Promise<MidiRuntimeState>;
+	cancelRecording: () => MidiRuntimeState;
+	acceptTake: (input: WebMcpMidiTakeAcceptInput) => Promise<WebMcpMutationResult>;
+	panic: (outputId?: string | null) => MidiRuntimeState;
+	testNote: (note?: number, durationMs?: number, velocity?: number) => Promise<MidiRuntimeState>;
 }
 
 export interface WebMcpController {
@@ -210,6 +293,8 @@ export interface WebMcpController {
 	controlPlayback: (input: { action: WebMcpPlaybackAction; cycle?: number }) => Promise<WebMcpPlaybackResult>;
 	undoSourceEdit: (input: Omit<SourceMutationInput, 'source'>) => Promise<WebMcpMutationResult>;
 	redoSourceEdit: (input: Omit<SourceMutationInput, 'source'>) => Promise<WebMcpMutationResult>;
+	setTrackMidiRoute?: (input: WebMcpMidiRouteInput) => Promise<WebMcpMutationResult>;
+	midi?: WebMcpMidiController;
 }
 
 export interface WebMcpRegistration {
@@ -341,6 +426,8 @@ const MAX_TRANSACTION_LENGTH = 128;
 const MAX_TRACK_NAME_LENGTH = 120;
 const MAX_KEY_LENGTH = 64;
 const MAX_TEMPLATE_QUERY_LENGTH = 120;
+const MAX_MIDI_PORT_ID_LENGTH = 256;
+const MAX_MIDI_TAKE_NOTES = 2048;
 
 const EMPTY_SCHEMA = {
 	type: 'object',
@@ -524,6 +611,110 @@ function readRevisionTransactionInput(value: unknown): { ok: true; input: Omit<S
 	return { ok: true, input: { baseRevision: revision.revision, transactionId: transaction.transactionId } };
 }
 
+function readMidiAccessInput(value: unknown): { ok: true; input: WebMcpMidiAccessInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	if (value.sysex !== undefined && typeof value.sysex !== 'boolean') return { ok: false, result: invalidInput('sysex must be a boolean.') };
+	return { ok: true, input: { sysex: value.sysex === true } };
+}
+
+function readMidiSelectionInput(value: unknown, field: 'inputId' | 'outputId'): { ok: true; id: string | null } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	const raw = value[field];
+	if (raw === undefined) return { ok: false, result: invalidInput(`${field} is required.`) };
+	if (raw !== null && (typeof raw !== 'string' || raw.length > MAX_MIDI_PORT_ID_LENGTH)) return { ok: false, result: invalidInput(`${field} must be null or a string of at most ${MAX_MIDI_PORT_ID_LENGTH} characters.`) };
+	return { ok: true, id: typeof raw === 'string' && raw.trim() ? raw.trim() : null };
+}
+
+function readMidiSettingsInput(value: unknown): { ok: true; input: WebMcpMidiSettingsInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	if (value.inputChannel !== undefined && value.inputChannel !== 'all' && !isMidiChannel(value.inputChannel)) return { ok: false, result: invalidInput('inputChannel must be all or an integer from 1 to 16.') };
+	if (value.outputChannel !== undefined && (!isInteger(value.outputChannel) || value.outputChannel < 1 || value.outputChannel > 16)) return { ok: false, result: invalidInput('outputChannel must be an integer from 1 to 16.') };
+	if (value.monitor !== undefined && typeof value.monitor !== 'boolean') return { ok: false, result: invalidInput('monitor must be a boolean.') };
+	if (value.clockMode !== undefined && value.clockMode !== 'off' && value.clockMode !== 'send' && value.clockMode !== 'receive') return { ok: false, result: invalidInput('clockMode must be off, send, or receive.') };
+	return {
+		ok: true,
+		input: {
+			...(value.inputChannel === undefined ? {} : { inputChannel: normalizeMidiChannel(value.inputChannel) }),
+			...(value.outputChannel === undefined ? {} : { outputChannel: value.outputChannel as number }),
+			...(value.monitor === undefined ? {} : { monitor: value.monitor as boolean }),
+			...(value.clockMode === undefined ? {} : { clockMode: value.clockMode as MidiClockMode }),
+		},
+	};
+}
+
+function readMidiRecordInput(value: unknown): { ok: true; input: WebMcpMidiRecordInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	if (typeof value.trackId !== 'string' || !value.trackId.trim() || value.trackId.length > MAX_TRANSACTION_LENGTH) return { ok: false, result: invalidInput('trackId must be a non-empty string.') };
+	if (value.inputId !== undefined && (typeof value.inputId !== 'string' || value.inputId.length > MAX_MIDI_PORT_ID_LENGTH)) return { ok: false, result: invalidInput(`inputId must be a string of at most ${MAX_MIDI_PORT_ID_LENGTH} characters.`) };
+	if (value.channel !== undefined && value.channel !== 'all' && !isMidiChannel(value.channel)) return { ok: false, result: invalidInput('channel must be all or an integer from 1 to 16.') };
+	if (value.mode !== undefined && value.mode !== 'replace' && value.mode !== 'overdub') return { ok: false, result: invalidInput('mode must be replace or overdub.') };
+	if (value.quantize !== undefined && !['off', '1/4', '1/8', '1/16', '1/32', '1/8T', '1/16T', '1/32T'].includes(String(value.quantize))) return { ok: false, result: invalidInput('quantize must be off, 1/4, 1/8, 1/16, 1/32, 1/8T, 1/16T, or 1/32T.') };
+	if (value.quantizeStrength !== undefined && (!isFiniteNumber(value.quantizeStrength) || value.quantizeStrength < 0 || value.quantizeStrength > 1)) return { ok: false, result: invalidInput('quantizeStrength must be between 0 and 1.') };
+	if (value.swing !== undefined && (!isFiniteNumber(value.swing) || value.swing < 0 || value.swing > 0.5)) return { ok: false, result: invalidInput('swing must be between 0 and 0.5.') };
+	if (value.countInBars !== undefined && value.countInBars !== 0 && value.countInBars !== 1 && value.countInBars !== 2) return { ok: false, result: invalidInput('countInBars must be 0, 1, or 2.') };
+	if (value.loop !== undefined && typeof value.loop !== 'boolean') return { ok: false, result: invalidInput('loop must be a boolean.') };
+	if (value.captureAutomation !== undefined && typeof value.captureAutomation !== 'boolean') return { ok: false, result: invalidInput('captureAutomation must be a boolean.') };
+	return {
+		ok: true,
+		input: {
+			trackId: value.trackId.trim(),
+			...(value.inputId === undefined ? {} : { inputId: (value.inputId as string).trim() }),
+			...(value.channel === undefined ? {} : { channel: normalizeMidiChannel(value.channel) }),
+			...(value.mode === undefined ? {} : { mode: value.mode as MidiRecordMode }),
+			...(value.quantize === undefined ? {} : { quantize: normalizeMidiQuantizeGrid(value.quantize) }),
+			...(value.quantizeStrength === undefined ? {} : { quantizeStrength: value.quantizeStrength as number }),
+			...(value.swing === undefined ? {} : { swing: value.swing as number }),
+			...(value.countInBars === undefined ? {} : { countInBars: value.countInBars as 0 | 1 | 2 }),
+			...(value.loop === undefined ? {} : { loop: value.loop as boolean }),
+			...(value.captureAutomation === undefined ? {} : { captureAutomation: value.captureAutomation as boolean }),
+		},
+	};
+}
+
+function readMidiRouteInput(value: unknown): { ok: true; input: WebMcpMidiRouteInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	const mutation = readTrackMutationInput(value);
+	if (!mutation.ok) return mutation;
+	if (value.output !== undefined && value.output !== null && (typeof value.output !== 'string' || value.output.length > MAX_MIDI_PORT_ID_LENGTH)) return { ok: false, result: invalidInput(`output must be null or a string of at most ${MAX_MIDI_PORT_ID_LENGTH} characters.`) };
+	if (value.instrument !== undefined && value.instrument !== null && (typeof value.instrument !== 'string' || value.instrument.length > MAX_MIDI_PORT_ID_LENGTH || /[\r\n]/.test(value.instrument))) return { ok: false, result: invalidInput(`instrument must be null or a single-line string of at most ${MAX_MIDI_PORT_ID_LENGTH} characters.`) };
+	if (!isInteger(value.channel) || value.channel < 1 || value.channel > 16) return { ok: false, result: invalidInput('channel must be an integer from 1 to 16.') };
+	if (typeof value.enabled !== 'boolean') return { ok: false, result: invalidInput('enabled must be a boolean.') };
+	if (value.velocity !== undefined && value.velocity !== null && (!isFiniteNumber(value.velocity) || value.velocity < 0 || value.velocity > 1)) return { ok: false, result: invalidInput('velocity must be null or a number from 0 to 1.') };
+	if (value.gain !== undefined && value.gain !== null && (!isFiniteNumber(value.gain) || value.gain < 0 || value.gain > 1)) return { ok: false, result: invalidInput('gain must be null or a number from 0 to 1.') };
+	if (value.noteOffsetMs !== undefined && value.noteOffsetMs !== null && (!isFiniteNumber(value.noteOffsetMs) || value.noteOffsetMs < 0 || value.noteOffsetMs > 10_000)) return { ok: false, result: invalidInput('noteOffsetMs must be null or a number from 0 to 10000.') };
+	if (value.midimap !== undefined && value.midimap !== null && (typeof value.midimap !== 'string' || value.midimap.length > MAX_MIDI_PORT_ID_LENGTH)) return { ok: false, result: invalidInput(`midimap must be null or a string of at most ${MAX_MIDI_PORT_ID_LENGTH} characters.`) };
+	if (value.program !== undefined && value.program !== null && (!isInteger(value.program) || value.program < 0 || value.program > 127)) return { ok: false, result: invalidInput('program must be null or an integer from 0 to 127.') };
+	return {
+		ok: true,
+		input: {
+			...mutation.input,
+			...(value.output === undefined ? {} : { output: typeof value.output === 'string' && value.output.trim() ? value.output.trim() : null }),
+			...(value.instrument === undefined ? {} : { instrument: typeof value.instrument === 'string' && value.instrument.trim() ? value.instrument.trim() : null }),
+			channel: value.channel,
+			enabled: value.enabled,
+			...(value.velocity === undefined ? {} : { velocity: value.velocity as number | null }),
+			...(value.gain === undefined ? {} : { gain: value.gain as number | null }),
+			...(value.noteOffsetMs === undefined ? {} : { noteOffsetMs: value.noteOffsetMs as number | null }),
+			...(value.midimap === undefined ? {} : { midimap: typeof value.midimap === 'string' ? value.midimap.trim() || null : null }),
+			...(value.program === undefined ? {} : { program: value.program as number | null }),
+		},
+	};
+}
+
+function readMidiTakeAcceptInput(value: unknown): { ok: true; input: WebMcpMidiTakeAcceptInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	const parsed = readRevisionTransactionInput(value);
+	if (!parsed.ok) return parsed;
+	return { ok: true, input: { baseRevision: parsed.input.baseRevision, transactionId: parsed.input.transactionId } };
+}
+
+function readMidiTestNoteInput(value: unknown): { ok: true; note?: number; velocity?: number; durationMs?: number } | { ok: false; result: ReturnType<typeof invalidInput> } {
+	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
+	if (value.note !== undefined && (!isInteger(value.note) || value.note < 0 || value.note > 127)) return { ok: false, result: invalidInput('note must be an integer from 0 to 127.') };
+	if (value.velocity !== undefined && (!isFiniteNumber(value.velocity) || value.velocity < 0 || value.velocity > 1)) return { ok: false, result: invalidInput('velocity must be between 0 and 1.') };
+	if (value.durationMs !== undefined && (!isFiniteNumber(value.durationMs) || value.durationMs < 1 || value.durationMs > 10_000)) return { ok: false, result: invalidInput('durationMs must be between 1 and 10000.') };
+	return { ok: true, ...(value.note === undefined ? {} : { note: value.note as number }), ...(value.velocity === undefined ? {} : { velocity: value.velocity as number }), ...(value.durationMs === undefined ? {} : { durationMs: value.durationMs as number }) };
+}
+
 function readPatchInput(value: unknown): { ok: true; input: SourcePatchInput } | { ok: false; result: ReturnType<typeof invalidInput> } {
 	if (!isRecord(value)) return { ok: false, result: invalidInput('Tool input must be an object.') };
 	const revision = readRevisionInput(value.baseRevision);
@@ -615,6 +806,50 @@ function createTool<T extends Record<string, unknown>>(
 		...definition,
 		execute: (input, options) => execute((input ?? {}) as T, options),
 	};
+}
+
+function midiUnavailable(controller: WebMcpController): { ok: false; error: WebMcpError } {
+	const state = controller.getState();
+	return failed({ code: 'MIDI_UNAVAILABLE', message: state.midi.supported ? 'MIDI is not connected or the MIDI controller is not ready.' : 'This browser does not expose Web MIDI.' });
+}
+
+function midiUserGestureRequired(): { ok: false; error: WebMcpError } | undefined {
+	if (typeof navigator === 'undefined') return undefined;
+	const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } }).userActivation;
+	return activation && activation.isActive !== true
+		? failed({ code: 'MIDI_USER_GESTURE_REQUIRED', message: 'The browser requires a user gesture. Press Connect MIDI or the hardware action button in Sushi before asking an agent to continue.' })
+		: undefined;
+}
+
+function boundedMidiTake(take: MidiRecordedTake, limit: number): MidiRecordedTake {
+	const notes = take.notes.slice(0, limit);
+	const automation = take.automation.slice(0, limit).map((event) => ({ ...event, data: event.data.slice(0, 256) }));
+	const dataTruncated = take.automation.slice(0, limit).some((event) => event.data.length > 256);
+	return {
+		...take,
+		notes,
+		automation,
+		truncated: take.truncated === true || notes.length < take.notes.length || automation.length < take.automation.length || dataTruncated,
+	};
+}
+
+function boundedMidiState(state: MidiRuntimeState, limit = 256): MidiRuntimeState {
+	if (!state.recording.take) return state;
+	return { ...state, recording: { ...state.recording, take: boundedMidiTake(state.recording.take, limit) } };
+}
+
+function midiStateResult(action: string, state: MidiRuntimeState): Record<string, unknown> {
+	const boundedState = boundedMidiState(state);
+	const stateError = state.lastError;
+	const lifecycleError = action === 'arm_midi_recording' && state.recording.status !== 'armed'
+		? { code: 'MIDI_RECORD_ARM_FAILED', message: 'MIDI recording was not armed.' }
+		: action === 'start_midi_recording' && state.recording.status !== 'recording'
+			? { code: 'MIDI_RECORD_START_FAILED', message: 'MIDI recording could not start; a user gesture and an armed input may be required.' }
+			: action === 'stop_midi_recording' && state.recording.status !== 'review'
+				? { code: 'MIDI_RECORD_STOP_FAILED', message: 'There is no active MIDI recording to stop.' }
+				: undefined;
+	const error = stateError ?? lifecycleError;
+	return { ok: !error, action, midi: boundedState, ...(error ? { error } : {}) };
 }
 
 export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelContextTool[] {
@@ -946,6 +1181,269 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			const parsed = readRevisionTransactionInput(input);
 			if (!parsed.ok) return parsed.result;
 			return executeSafely(() => controller.redoSourceEdit(parsed.input));
+		}),
+
+		createTool({
+			name: 'get_midi_capabilities',
+			title: 'Get MIDI capabilities',
+			description: 'Report Web MIDI support, secure-context status, permission state, SysEx capability, and current connection status. This is read-only and never requests permission.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: READ_ONLY_REFERENCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			return executeSafely(() => {
+				const midi = controller.getState().midi;
+				const limitations = [
+					...(midi.supported ? [] : ['The current browser does not expose Web MIDI.']),
+					...(midi.secureContext ? [] : ['Web MIDI requires HTTPS or localhost.']),
+					...(midi.permission === 'denied' ? ['The browser denied MIDI permission.'] : []),
+					...(midi.permission === 'unsupported' ? ['The browser does not support MIDI permissions.'] : []),
+				];
+				return { ok: true, action: 'get_midi_capabilities', capabilities: { supported: midi.supported, secureContext: midi.secureContext, permission: midi.permission, enabled: midi.enabled, sysexEnabled: midi.sysexEnabled, limitations } };
+			});
+		}),
+
+		createTool({
+			name: 'list_midi_devices',
+			title: 'List MIDI devices',
+			description: 'List the currently connected MIDI input and output ports visible to Sushi. Device IDs are session-scoped and should not be treated as permanent hardware identities.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			return executeSafely(() => {
+				const midi = controller.getState().midi;
+				return { ok: true, action: 'list_midi_devices', inputs: midi.inputs, outputs: midi.outputs, permission: midi.permission, enabled: midi.enabled };
+			});
+		}),
+
+		createTool({
+			name: 'inspect_midi_state',
+			title: 'Inspect MIDI state',
+			description: 'Inspect selected MIDI ports, channels, monitor/clock settings, recording state, recent activity, and the last MIDI error.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			return executeSafely(() => ({ ok: true, action: 'inspect_midi_state', midi: boundedMidiState(controller.getState().midi) }));
+		}),
+
+		createTool({
+			name: 'read_midi_take',
+			title: 'Read MIDI take',
+			description: 'Read a bounded summary of the MIDI take currently in review. This does not commit or alter the source.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: READ_ONLY_SOURCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			return executeSafely(() => {
+				const state = controller.getState().midi;
+				const take = state.recording.take;
+				if (!take) return failed({ code: 'MIDI_TAKE_NOT_AVAILABLE', message: 'There is no MIDI take in review.' });
+				return { ok: true, action: 'read_midi_take', take: boundedMidiTake(take, MAX_MIDI_TAKE_NOTES) };
+			});
+		}),
+
+		createTool({
+			name: 'request_midi_access',
+			title: 'Request MIDI access',
+			description: 'Request browser MIDI permission after explicit user intent. WebMCP cannot bypass a browser permission prompt; the result reports the required user action when permission is unavailable.',
+			inputSchema: schema({ sysex: { type: 'boolean', default: false } }),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiAccessInput(input);
+			if (!parsed.ok) return parsed.result;
+			const gestureRequired = midiUserGestureRequired();
+			if (gestureRequired) return gestureRequired;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(async () => {
+				const state = await controller.midi?.connect(parsed.input);
+				if (!state) return midiUnavailable(controller);
+				return midiStateResult('request_midi_access', state);
+			});
+		}),
+
+		createTool({
+			name: 'select_midi_input',
+			title: 'Select MIDI input',
+			description: 'Select a connected MIDI input by session-scoped ID or exact port name, or pass null to clear the selection.',
+			inputSchema: schema({ inputId: { oneOf: [{ type: 'string', maxLength: MAX_MIDI_PORT_ID_LENGTH }, { type: 'null' }] } }, ['inputId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiSelectionInput(input, 'inputId');
+			if (!parsed.ok) return parsed.result;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => midiStateResult('select_midi_input', controller.midi?.selectInput(parsed.id) ?? controller.getState().midi));
+		}),
+
+		createTool({
+			name: 'select_midi_output',
+			title: 'Select MIDI output',
+			description: 'Select a connected MIDI output by session-scoped ID or exact port name, or pass null to clear the selection.',
+			inputSchema: schema({ outputId: { oneOf: [{ type: 'string', maxLength: MAX_MIDI_PORT_ID_LENGTH }, { type: 'null' }] } }, ['outputId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiSelectionInput(input, 'outputId');
+			if (!parsed.ok) return parsed.result;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => midiStateResult('select_midi_output', controller.midi?.selectOutput(parsed.id) ?? controller.getState().midi));
+		}),
+
+		createTool({
+			name: 'set_midi_settings',
+			title: 'Set MIDI settings',
+			description: 'Set MIDI input channel, output channel, monitor/thru, or clock mode. This changes runtime settings, not source revision.',
+			inputSchema: schema({ inputChannel: { oneOf: [{ type: 'integer', minimum: 1, maximum: 16 }, { type: 'string', enum: ['all'] }] }, outputChannel: { type: 'integer', minimum: 1, maximum: 16 }, monitor: { type: 'boolean' }, clockMode: { type: 'string', enum: ['off', 'send', 'receive'] } }),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiSettingsInput(input);
+			if (!parsed.ok) return parsed.result;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => midiStateResult('set_midi_settings', controller.midi?.setSettings(parsed.input) ?? controller.getState().midi));
+		}),
+
+		createTool({
+			name: 'learn_midi_control',
+			title: 'Learn MIDI controller',
+			description: 'Arm the shared MIDI service to capture the next incoming CC message for UI/source mapping. This does not change source revision or send hardware output.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => midiStateResult('learn_midi_control', controller.midi?.learnControl() ?? controller.getState().midi));
+		}),
+
+		createTool({
+			name: 'set_track_midi_route',
+			title: 'Set track MIDI route',
+			description: 'Write a track’s native Strudel .midichan()/.midi() route, optional local instrument, and velocity/gain/note-off/program settings. Requires a current source revision and idempotency transaction ID; the change affects external hardware when playback runs.',
+			inputSchema: schema({ ...TRACK_TARGET_SCHEMA, output: { oneOf: [{ type: 'string', maxLength: MAX_MIDI_PORT_ID_LENGTH }, { type: 'null' }] }, instrument: { oneOf: [{ type: 'string', maxLength: MAX_MIDI_PORT_ID_LENGTH }, { type: 'null' }] }, channel: { type: 'integer', minimum: 1, maximum: 16 }, enabled: { type: 'boolean' }, velocity: { oneOf: [{ type: 'number', minimum: 0, maximum: 1 }, { type: 'null' }] }, gain: { oneOf: [{ type: 'number', minimum: 0, maximum: 1 }, { type: 'null' }] }, noteOffsetMs: { oneOf: [{ type: 'number', minimum: 0, maximum: 10000 }, { type: 'null' }] }, midimap: { oneOf: [{ type: 'string', maxLength: MAX_MIDI_PORT_ID_LENGTH }, { type: 'null' }] }, program: { oneOf: [{ type: 'integer', minimum: 0, maximum: 127 }, { type: 'null' }] }, baseRevision: { type: 'integer', minimum: 0 }, transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH } }, ['channel', 'enabled', 'baseRevision', 'transactionId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiRouteInput(input);
+			if (!parsed.ok) return parsed.result;
+			if (!controller.setTrackMidiRoute) return midiUnavailable(controller);
+			return executeSafely(() => controller.setTrackMidiRoute?.(parsed.input));
+		}),
+
+		createTool({
+			name: 'arm_midi_recording',
+			title: 'Arm MIDI recording',
+			description: 'Arm a source track for MIDI note/automation recording with optional input ID/name, quantization, count-in, loop, and overdub settings. Arming does not change source revision.',
+			inputSchema: schema({ trackId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH }, inputId: { type: 'string', maxLength: MAX_MIDI_PORT_ID_LENGTH }, channel: { oneOf: [{ type: 'integer', minimum: 1, maximum: 16 }, { type: 'string', enum: ['all'] }] }, mode: { type: 'string', enum: ['replace', 'overdub'] }, quantize: { type: 'string', enum: ['off', '1/4', '1/8', '1/16', '1/32', '1/8T', '1/16T', '1/32T'] }, quantizeStrength: { type: 'number', minimum: 0, maximum: 1 }, swing: { type: 'number', minimum: 0, maximum: 0.5 }, countInBars: { type: 'integer', enum: [0, 1, 2] }, loop: { type: 'boolean' }, captureAutomation: { type: 'boolean' } }, ['trackId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiRecordInput(input);
+			if (!parsed.ok) return parsed.result;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => midiStateResult('arm_midi_recording', controller.midi?.armRecording(parsed.input) ?? controller.getState().midi));
+		}),
+
+		createTool({
+			name: 'start_midi_recording',
+			title: 'Start MIDI recording',
+			description: 'Start the armed MIDI recording using Sushi’s transport clock. Browser audio/MIDI user-gesture restrictions may require the user to press Start in the page.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const gestureRequired = midiUserGestureRequired();
+			if (gestureRequired) return gestureRequired;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(async () => midiStateResult('start_midi_recording', await controller.midi!.startRecording(options?.signal)));
+		}),
+
+		createTool({
+			name: 'stop_midi_recording',
+			title: 'Stop MIDI recording',
+			description: 'Stop the active MIDI recording and leave the bounded take in review; it does not write source until accept_midi_take is called.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(async () => midiStateResult('stop_midi_recording', await controller.midi!.stopRecording()));
+		}),
+
+		createTool({
+			name: 'cancel_midi_recording',
+			title: 'Cancel MIDI recording',
+			description: 'Cancel an armed, counting-in, active, or reviewed MIDI take without changing source.',
+			inputSchema: EMPTY_SCHEMA,
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (_input, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => midiStateResult('cancel_midi_recording', controller.midi?.cancelRecording() ?? controller.getState().midi));
+		}),
+
+		createTool({
+			name: 'accept_midi_take',
+			title: 'Accept MIDI take',
+			description: 'Serialize the reviewed MIDI take as native Strudel source and commit it as one revision-safe source transaction.',
+			inputSchema: schema({ baseRevision: { type: 'integer', minimum: 0 }, transactionId: { type: 'string', minLength: 1, maxLength: MAX_TRANSACTION_LENGTH } }, ['baseRevision', 'transactionId']),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiTakeAcceptInput(input);
+			if (!parsed.ok) return parsed.result;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => controller.midi!.acceptTake(parsed.input));
+		}),
+
+		createTool({
+			name: 'panic_midi',
+			title: 'Panic MIDI outputs',
+			description: 'Send stop, all sound off, all notes off, and reset controllers to selected or all connected MIDI outputs. An optional output ID or exact name targets one port. This affects external hardware immediately.',
+			inputSchema: schema({ outputId: { oneOf: [{ type: 'string', maxLength: MAX_MIDI_PORT_ID_LENGTH }, { type: 'null' }] } }),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			if (input.outputId !== undefined && input.outputId !== null && (typeof input.outputId !== 'string' || input.outputId.length > MAX_MIDI_PORT_ID_LENGTH)) return invalidInput('outputId must be null or a string of at most 256 characters.');
+			const gestureRequired = midiUserGestureRequired();
+			if (gestureRequired) return gestureRequired;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(() => midiStateResult('panic_midi', controller.midi?.panic(input.outputId as string | null | undefined) ?? controller.getState().midi));
+		}),
+
+		createTool({
+			name: 'send_midi_test_note',
+			title: 'Send MIDI test note',
+			description: 'Send one short test note to the selected MIDI output. This is an explicit external-hardware action.',
+			inputSchema: schema({ note: { type: 'integer', minimum: 0, maximum: 127 }, velocity: { type: 'number', minimum: 0, maximum: 1 }, durationMs: { type: 'number', minimum: 1, maximum: 10000 } }),
+			annotations: MUTATING_SOURCE_ANNOTATIONS,
+		}, (input: Record<string, unknown>, options) => {
+			const stopped = cancelled(options);
+			if (stopped) return stopped;
+			const parsed = readMidiTestNoteInput(input);
+			if (!parsed.ok) return parsed.result;
+			const gestureRequired = midiUserGestureRequired();
+			if (gestureRequired) return gestureRequired;
+			if (!controller.midi) return midiUnavailable(controller);
+			return executeSafely(async () => midiStateResult('send_midi_test_note', await controller.midi!.testNote(parsed.note, parsed.durationMs, parsed.velocity)));
 		}),
 	];
 }
