@@ -1158,6 +1158,13 @@ function splitTrailingComment(expression: string): { body: string; suffix: strin
 			suffix: `${lineComment[2]}${lineComment[3]}`,
 		};
 	}
+	const generatedRegion = expression.match(/^(\s*\/\*\s*@sushi-midi-generated:start\s*\*\/[\s\S]*?\/\*\s*@sushi-midi-generated:end\s*\*\/)(\s*)$/);
+	if (generatedRegion) {
+		return {
+			body: generatedRegion[1],
+			suffix: generatedRegion[2],
+		};
+	}
 	const blockComment = expression.match(/(\s*)(\/\*[\s\S]*?\*\/)(\s*)$/);
 	if (blockComment) {
 		return {

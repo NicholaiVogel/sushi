@@ -1954,7 +1954,7 @@ export default function Studio() {
 			if (!trackId) return;
 			const midi = service.getState();
 			const inputId = midi.enabled && midi.selectedInputId ? midi.selectedInputId : COMPUTER_KEYBOARD_INPUT_ID;
-			const armed = service.armRecording({ trackId, inputId, channel: midi.enabled ? midi.inputChannel : 1, mode: 'replace', quantize: '1/16', quantizeStrength: 1, swing: 0, countInBars: 0, loop: false, captureAutomation: true });
+			const armed = service.armRecording({ trackId, inputId, channel: midi.enabled ? midi.inputChannel : 1, mode: 'replace', quantize: '1/16', quantizeStrength: 1, swing: 0, countInBars: 0, loop: false, captureAutomation: false });
 			if (armed.recording.status === 'armed') await startMidiRecording();
 		})();
 	}, [createTrack, finishMidiRecording, startMidiRecording]);
