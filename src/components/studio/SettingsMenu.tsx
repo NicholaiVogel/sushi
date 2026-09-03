@@ -2,6 +2,7 @@ import type { ChangeEvent, RefObject } from 'react';
 import { EDITOR_PRESETS, type EditorPreset } from '../../lib/project/presets';
 import type { StoredProjectSummary } from '../../lib/project/storage';
 import type { AppearanceMode, PersistenceState } from './types';
+import { AboutCredits } from './AboutCredits';
 
 export interface SettingsMenuProps {
 	persistenceState: PersistenceState;
@@ -59,6 +60,7 @@ export function SettingsMenu({
 				</div>
 			</div>
 
+			<div className="settings-menu-content">
 			<section className="settings-menu-section settings-menu-appearance-section" aria-labelledby="settings-appearance-heading">
 				<div className="settings-menu-section-heading">
 					<h3 id="settings-appearance-heading">Appearance</h3>
@@ -146,6 +148,8 @@ export function SettingsMenu({
 					))}
 				</div>
 			</section>
+			</div>
+			<AboutCredits />
 		</div>
 	);
 

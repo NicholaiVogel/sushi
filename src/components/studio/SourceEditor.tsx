@@ -4,7 +4,6 @@ import type { SourceDiagnostic, TransportState } from '../../lib/project/model';
 import { dedentSourceSelection, indentSourceSelection, insertSourceDelimiterPair, insertSourceNewline, replaceSourceSelection, skipSourceClosingDelimiter } from '../../lib/project/editor';
 import type { StrudelHap } from '../../lib/strudel/adapter';
 import { getDiagnosticLabel, getDiagnosticLocation, formatRevision } from './helpers';
-import { AboutCredits } from './AboutCredits';
 
 export type StrudelCodeMirrorModule = typeof import('@strudel/codemirror');
 
@@ -252,7 +251,6 @@ export function SourceEditor({
 				) : null}
 			</div>
 			{diagnostics.length ? <SourceDiagnosticBanner diagnostic={diagnostics[0]} location="sidebar" /> : null}
-			<AboutCredits />
 		</aside>
 	);
 }
