@@ -64,7 +64,9 @@ import { hasOnboardingOverride, markOnboardingCompleted, readOnboardingCompletio
 import { APPEARANCE_STORAGE_KEY, normalizeAppearanceMode, readStoredAppearanceMode, type AppearanceMode } from '../lib/project/appearance';
 import {
 	clamp,
+	createBlankProjectSnapshot,
 	createInitialStudioState,
+	rebaseProjectSnapshotRevision,
 	EDITOR_WIDTH_MAX,
 	EDITOR_WIDTH_MIN,
 	getErrorDiagnostic,
@@ -193,6 +195,13 @@ async function waitForMidiBoundary(clock: () => MidiClockSnapshot, targetCycle: 
 		};
 		poll();
 	});
+}
+
+function createProjectId(): string {
+	const randomUuid = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+		? crypto.randomUUID().replaceAll('-', '').toUpperCase()
+		: `${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 12).toUpperCase()}`;
+	return `prj_${randomUuid}`;
 }
 
 export default function Studio() {
@@ -455,10 +464,20 @@ export default function Studio() {
 		const editor = sourceEditorViewRef.current;
 		const editorModule = editorModuleRef.current;
 		if (!editor || !editorModule) return;
+		// Strudel evaluates asynchronously while React updates the editor
+		// document separately. Never apply ranges from one source to another;
+		// CodeMirror throws when a stale range exceeds the current document.
+		if (editor.state.doc.toString() !== update.code) return;
 		const widgets = update.meta?.widgets ?? [];
-		editorModule.updateSliderWidgets(editor, widgets.filter((widget) => widget.type === 'slider'));
-		editorModule.updateWidgets(editor, widgets.filter((widget) => widget.type !== 'slider'));
-		editorModule.updateMiniLocations(editor, update.meta?.miniLocations ?? []);
+		try {
+			editorModule.updateSliderWidgets(editor, widgets.filter((widget) => widget.type === 'slider'));
+			editorModule.updateWidgets(editor, widgets.filter((widget) => widget.type !== 'slider'));
+			editorModule.updateMiniLocations(editor, update.meta?.miniLocations ?? []);
+		} catch (error) {
+			// Editor decorations are auxiliary UI. A malformed third-party range
+			// must not tear down the studio or the source editor.
+			console.warn('[sushi] could not apply Strudel editor metadata', error);
+		}
 	}, []);
 
 	const handleEditorReady = useCallback(() => {
@@ -651,6 +670,37 @@ export default function Studio() {
 			if (mountedRef.current && studioGenerationRef.current === generation && studioRef.current.persistenceState === 'ready') {
 				patchStudio({ persistenceState: 'unavailable' });
 			}
+		}
+	}, [patchStudio]);
+
+	const preserveCurrentProjectBeforeBlank = useCallback(async (): Promise<boolean> => {
+		const current = studioRef.current;
+		if (current.persistenceState !== 'ready') return false;
+		const generation = studioGenerationRef.current;
+		const snapshot = snapshotFromStudio(current);
+		const preservedProjectId = createProjectId();
+		const preservedSnapshot: StoredProjectSnapshot = {
+			...snapshot,
+			project: {
+				...snapshot.project,
+				id: preservedProjectId,
+				name: `${snapshot.project.name.trim() || 'Sushi project'} (before blank)`,
+			},
+		};
+
+		try {
+			await persistenceQueueRef.current;
+			if (!mountedRef.current || studioGenerationRef.current !== generation) return false;
+			await saveProjectSnapshot(preservedProjectId, preservedSnapshot);
+			return true;
+		} catch (error) {
+			if (mountedRef.current && studioGenerationRef.current === generation) {
+				patchStudio({
+					persistenceState: 'unavailable',
+					diagnostics: [getErrorDiagnostic(current.revision, error, 'commit', current.draft)],
+				});
+			}
+			return false;
 		}
 	}, [patchStudio]);
 
@@ -1301,7 +1351,7 @@ export default function Studio() {
 
 	const applyProjectSnapshot = useCallback(async (snapshot: StoredProjectSnapshot): Promise<boolean> => {
 		const generation = studioGenerationRef.current;
-		const imported = normalizeImportedSnapshot(snapshot);
+		const imported = rebaseProjectSnapshotRevision(normalizeImportedSnapshot(snapshot), studioRef.current.revision);
 		const identityDiagnostics = getSourceIdentityDiagnostics(imported.project.source.revision, imported.project.source.lastValid);
 		if (identityDiagnostics.length) {
 			patchStudio({ phase: 'error', diagnostics: identityDiagnostics });
@@ -1747,14 +1797,36 @@ export default function Studio() {
 		void dispatch({ type: 'play' });
 	}, [dispatch]);
 
-	const startOnboardingBlank = useCallback(async (): Promise<boolean> => {
-		// A restored project is already the user's working document. The existing
-		// project model has one persisted identity, so do not reset it underneath
-		// the user from onboarding.
-		if (restoredProjectRef.current) return false;
-		const blankProject = createInitialProject();
-		return applyProjectSnapshot({ project: blankProject, activeRevision: blankProject.source.revision });
-	}, [applyProjectSnapshot]);
+	const startNewBlankProject = useCallback(async (confirmed = false): Promise<boolean> => {
+		const current = studioRef.current;
+		const blankSnapshot = createBlankProjectSnapshot(current);
+		const blankProject = blankSnapshot.project;
+		const hasCurrentWork = restoredProjectRef.current
+			|| current.projectName !== blankProject.name
+			|| current.draft !== blankProject.source.draft
+			|| current.lastValid !== blankProject.source.lastValid
+			|| current.songEndCycle !== blankProject.timeline.songEndCycle
+			|| current.assets.length > 0;
+
+		if (hasCurrentWork && !confirmed) {
+			const accepted = typeof window !== 'undefined' && window.confirm('Start a new blank project? Your current project will be saved locally first and remain available under Saved locally.');
+			if (!accepted) return false;
+		}
+		if (hasCurrentWork && !(await preserveCurrentProjectBeforeBlank())) return false;
+
+		const started = await applyProjectSnapshot(blankSnapshot);
+		if (started) {
+			restoredProjectRef.current = false;
+			setSelectedTrackId(null);
+			setFxDrawerTrackId(null);
+			setNoteEditorTrackId(null);
+			setContextMenu(null);
+			cancelTrackRename();
+		}
+		return started;
+	}, [applyProjectSnapshot, cancelTrackRename, preserveCurrentProjectBeforeBlank]);
+
+	const startOnboardingBlank = useCallback((confirmed = false): Promise<boolean> => startNewBlankProject(confirmed), [startNewBlankProject]);
 
 	const openExistingFromOnboarding = useCallback(() => {
 		setOpenHeaderPopover('settings');
@@ -2277,6 +2349,7 @@ export default function Studio() {
 				appearanceMode={appearanceMode}
 				isDarkMode={isDarkMode}
 				projectImportInputRef={projectImportInputRef}
+				onNewProject={() => { void startNewBlankProject(); }}
 				onTogglePopover={(popover) => setOpenHeaderPopover((current) => current === popover ? null : popover)}
 				onProjectNameChange={(name) => patchStudio({ projectName: name })}
 				onPersistProject={() => { void persistStudioSnapshot(); }}
@@ -2324,6 +2397,7 @@ export default function Studio() {
 					onValidate={() => { void dispatch({ type: 'writeSource', source: studioRef.current.draft, expectedRevision: studioRef.current.revision }); }}
 					onStop={() => { void dispatch({ type: 'stop' }); }}
 					onReady={handleEditorReady}
+					onDocumentSynced={handleEditorReady}
 					onRetryEditor={loadEditorModule}
 				/>
 				<div className="editor-resize-divider">

@@ -9,7 +9,7 @@ interface OnboardingModalProps {
 	restoredProjectPresent: boolean;
 	onPrepareDemo: () => Promise<boolean>;
 	onPlayPreparedDemo: () => void;
-	onStartBlank: () => Promise<boolean>;
+	onStartBlank: (confirmed?: boolean) => Promise<boolean>;
 	onOpenExisting?: () => void;
 	onClose: () => void;
 }
@@ -67,6 +67,7 @@ export function OnboardingModal({
 	const mountedRef = useRef(true);
 	const [busyAction, setBusyAction] = useState<'demo' | 'blank' | null>(null);
 	const [actionError, setActionError] = useState<string | null>(null);
+	const [blankConfirmationOpen, setBlankConfirmationOpen] = useState(false);
 	const [copyState, setCopyState] = useState<'idle' | 'copied' | 'unavailable'>('idle');
 
 	useEffect(() => {
@@ -137,12 +138,18 @@ export function OnboardingModal({
 		}
 	}, [busyAction, onClose, onPlayPreparedDemo, onPrepareDemo]);
 
-	const runBlank = useCallback(async () => {
+	const runBlank = useCallback(async (confirmed = false) => {
 		if (busyAction) return;
+		if (restoredProjectPresent && !confirmed) {
+			setActionError(null);
+			setBlankConfirmationOpen(true);
+			return;
+		}
 		setBusyAction('blank');
 		setActionError(null);
+		setBlankConfirmationOpen(false);
 		try {
-			const started = await onStartBlank();
+			const started = await onStartBlank(confirmed);
 			if (started) onClose();
 			else if (mountedRef.current) {
 				setActionError(restoredProjectPresent
@@ -250,6 +257,15 @@ export function OnboardingModal({
 					</button>
 					{onOpenExisting ? <button className="onboarding-action onboarding-action-tertiary" type="button" onClick={() => { onClose(); onOpenExisting(); }} disabled={busyAction !== null}>Open an existing project</button> : null}
 				</div>
+				{blankConfirmationOpen ? (
+					<div className="onboarding-blank-confirm" role="alert">
+						<p>This project was restored from local storage. Keep it and continue editing, or save it and open a new blank canvas?</p>
+						<div className="onboarding-blank-confirm-actions">
+							<button className="onboarding-action onboarding-action-confirm" type="button" onClick={() => { void runBlank(true); }} disabled={busyAction !== null}>Replace with blank</button>
+							<button className="onboarding-action onboarding-action-cancel" type="button" onClick={() => setBlankConfirmationOpen(false)} disabled={busyAction !== null}>Keep current project</button>
+						</div>
+					</div>
+				) : null}
 				{actionError ? <p className="onboarding-action-error" role="alert">{actionError}</p> : null}
 
 				<div className="onboarding-divider onboarding-divider-agent" aria-hidden="true"><span />TRY WITH AN AGENT<span /></div>

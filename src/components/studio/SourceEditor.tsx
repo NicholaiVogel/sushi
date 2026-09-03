@@ -21,6 +21,7 @@ export interface SourceEditorProps {
 	onValidate: () => void;
 	onStop: () => void;
 	onReady?: () => void;
+	onDocumentSynced?: () => void;
 	onRetryEditor?: () => void;
 }
 
@@ -30,6 +31,7 @@ interface EditorCallbacks {
 	onValidate: SourceEditorProps['onValidate'];
 	onStop: SourceEditorProps['onStop'];
 	onReady?: SourceEditorProps['onReady'];
+	onDocumentSynced?: SourceEditorProps['onDocumentSynced'];
 }
 
 export function SourceEditor({
@@ -46,6 +48,7 @@ export function SourceEditor({
 	onValidate,
 	onStop,
 	onReady,
+	onDocumentSynced,
 	onRetryEditor,
 }: SourceEditorProps) {
 	const rootRef = useRef<HTMLDivElement | null>(null);
@@ -56,8 +59,8 @@ export function SourceEditor({
 	const previousTransportRef = useRef<TransportState>(runtimeTransport);
 	const initialDraftRef = useRef(draft);
 	initialDraftRef.current = draft;
-	const callbacksRef = useRef<EditorCallbacks>({ onPaste, onChange, onValidate, onStop, onReady });
-	callbacksRef.current = { onPaste, onChange, onValidate, onStop, onReady };
+	const callbacksRef = useRef<EditorCallbacks>({ onPaste, onChange, onValidate, onStop, onReady, onDocumentSynced });
+	callbacksRef.current = { onPaste, onChange, onValidate, onStop, onReady, onDocumentSynced };
 
 	useEffect(() => {
 		setEditorReady(false);
@@ -186,10 +189,16 @@ export function SourceEditor({
 
 	useEffect(() => {
 		const editor = viewRef.current;
-		if (!editor || editor.state.doc.toString() === draft) return;
+		if (!editor || !editorModule || editor.state.doc.toString() === draft) return;
 		const selection = editor.state.selection.main;
 		syncingRef.current = true;
 		try {
+			// Strudel decorations contain source ranges. Clear them while the
+			// editor still has the old document; otherwise CodeMirror maps stale
+			// positions through the replacement changeset and can throw.
+			editorModule.updateSliderWidgets(editor, []);
+			editorModule.updateWidgets(editor, []);
+			editorModule.updateMiniLocations(editor, []);
 			editor.dispatch({
 				changes: { from: 0, to: editor.state.doc.length, insert: draft },
 				selection: {
@@ -197,10 +206,11 @@ export function SourceEditor({
 					head: Math.min(selection.head, draft.length),
 				},
 			});
+		callbacksRef.current.onDocumentSynced?.();
 		} finally {
 			syncingRef.current = false;
 		}
-	}, [draft]);
+	}, [draft, editorModule]);
 
 	useEffect(() => {
 		const editor = viewRef.current;

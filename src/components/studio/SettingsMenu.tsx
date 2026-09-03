@@ -15,6 +15,7 @@ export interface SettingsMenuProps {
 	appearanceMode: AppearanceMode;
 	isDarkMode: boolean;
 	projectImportInputRef: RefObject<HTMLInputElement | null>;
+	onNewProject: () => void;
 	onSaveProject: () => void;
 	onExportProject: () => void;
 	onImportProject: (event: ChangeEvent<HTMLInputElement>) => void;
@@ -41,6 +42,7 @@ export function SettingsMenu({
 	appearanceMode,
 	isDarkMode,
 	projectImportInputRef,
+	onNewProject,
 	onSaveProject,
 	onExportProject,
 	onImportProject,
@@ -99,6 +101,10 @@ export function SettingsMenu({
 			<section className="settings-menu-section" aria-labelledby="settings-project-heading">
 				<h3 id="settings-project-heading">Project</h3>
 				<div className="settings-menu-list">
+					<button className="settings-menu-action" type="button" onClick={onNewProject} disabled={isBusy}>
+						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+						<span><strong>New blank project</strong><small>Start with an empty canvas</small></span>
+					</button>
 					<button className="settings-menu-action" type="button" onClick={onSaveProject} disabled={!canSave}>
 						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h11l3 3v13H5z" /><path d="M8 4v6h8V4M8 20v-5h8v5" /></svg>
 						<span><strong>Save locally</strong><small>{persistenceState === 'unavailable' ? 'Storage unavailable' : isDirty ? 'Save current project' : 'Already up to date'}</small></span>
