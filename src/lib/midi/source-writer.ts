@@ -1,7 +1,10 @@
-import { getSourceBlockDetails, getSourceGlobals, replaceSourceTrackExpression, type SourceGlobals } from '../project/source-mapper';
-import { midiToNoteName, parseNoteGrid, type NoteGridNote } from '../project/note-grid';
+import { getSourceBlockDetails, getSourceGlobals, type SourceBlockDetails } from '../project/source-mapper';
+import { midiToNoteName } from '../project/note-grid';
 import { midiGridCycles, normalizeMidiNotes, quantizeMidiNotes } from './quantize';
 import type { MidiQuantizeGrid, MidiRecordedAutomation, MidiRecordedNote, MidiRecordedTake } from './types';
+
+export const MIDI_GENERATED_REGION_START = '/* @sushi-midi-generated:start */';
+export const MIDI_GENERATED_REGION_END = '/* @sushi-midi-generated:end */';
 
 const NUMBER_PRECISION = 1_000_000;
 const MIN_NOTE_CYCLES = 1 / 4096;
@@ -31,8 +34,11 @@ export interface MidiSourceWriteResult {
 	endCycle: number;
 }
 
+export type MidiSourceWriteErrorCode = 'EMPTY_TAKE' | 'MISSING_TRACK' | 'UNOWNED_TRACK' | 'UNSUPPORTED_AUTOMATION' | 'UNSUPPORTED_OVERDUB' | 'INVALID_NOTE' | 'MISSING_GENERATED_REGION' | 'WRITE_FAILED';
+
 export interface MidiSourceWriteError {
 	ok: false;
+	code: MidiSourceWriteErrorCode;
 	error: string;
 }
 
@@ -60,50 +66,11 @@ function quoteStringLiteral(value: string): string {
 		.replace(/\u2029/g, '\\u2029')}'`;
 }
 
-function noteExpression(note: MidiRecordedNote, channel?: number): string {
-	const calls = [`note(${quote(midiToNoteName(note.note))})`, `.velocity(${formatNumber(clamp(note.velocity, 0, 1))})`];
-	if (channel !== undefined) calls.push(`.midichan(${channel})`);
+function noteExpression(note: MidiRecordedNote): string {
+	const calls = [`note(${quote(midiToNoteName(note.note))})`, `.velocity(${formatNumber(note.velocity)})`, `.midichan(${note.channel})`];
 	return calls.join('');
 }
 
-function automationExpression(event: MidiRecordedAutomation): string {
-	const calls = ['note("~")'];
-	if (event.channel !== undefined) calls.push(`.midichan(${event.channel})`);
-	switch (event.kind) {
-		case 'controlchange':
-			if (event.data[1] !== undefined) calls.push(`.ccn(${event.data[1]}).ccv(${formatNumber(clamp((event.data[2] ?? 0) / 127, 0, 1))})`);
-			break;
-		case 'pitchbend': {
-			const raw = ((event.data[2] ?? 64) << 7) | (event.data[1] ?? 0);
-			calls.push(`.midibend(${formatNumber(clamp((raw - 8192) / 8192, -1, 1))})`);
-			break;
-		}
-		case 'channelaftertouch':
-		case 'keyaftertouch':
-			calls.push(`.miditouch(${formatNumber(clamp((event.data[2] ?? event.data[1] ?? 0) / 127, 0, 1))})`);
-			break;
-		case 'programchange':
-			calls.push(`.progNum(${Math.round(clamp(event.data[1] ?? 0, 0, 127))})`);
-			break;
-		case 'sysex': {
-			const payload = event.data.slice(1, event.data[event.data.length - 1] === 0xf7 ? -1 : undefined);
-			const manufacturer = payload.length > 3 && payload[0] === 0 && payload[1] !== undefined && payload[2] !== undefined
-				? `[${payload.slice(0, 3).join(', ')}]`
-				: String(payload.shift() ?? 0);
-			calls.push(`.sysexid(${manufacturer}).sysexdata([${payload.join(', ')}])`);
-			break;
-		}
-		case 'start':
-		case 'continue':
-		case 'stop':
-		case 'clock':
-			calls.push(`.midicmd(${quoteStringLiteral(event.kind)})`);
-			break;
-		default:
-			break;
-	}
-	return calls.join('');
-}
 
 function midiRoute(options: Pick<MidiSourceWriteOptions, 'instrument' | 'outputName' | 'velocity' | 'gain' | 'noteOffsetMs' | 'midimap' | 'program'>, includeRoute: boolean): string {
 	const instrument = options.instrument?.trim() ? `.s(${quote(options.instrument.trim())})` : '';
@@ -141,35 +108,63 @@ function serializeStaticGrid(
 	const stepCycle = totalCycles / steps;
 	const tokens = Array.from({ length: steps }, () => '');
 	const durations = Array.from({ length: steps }, () => stepCycle);
+	const noteDurations: number[][] = Array.from({ length: steps }, () => []);
 	const velocities: number[][] = Array.from({ length: steps }, () => []);
-	const noteChannel = channel ?? notes[0].channel;
+	const noteChannel = notes[0]?.channel;
+	if (noteChannel === undefined || notes.some((note) => note.channel !== noteChannel)) return undefined;
+	if (channel !== undefined && notes.some((note) => note.channel !== channel)) return undefined;
 	for (const note of notes) {
 		const index = Math.round((note.startCycle - startCycle) / stepCycle);
 		if (index < 0 || index >= steps) return undefined;
 		if (Math.abs(note.startCycle - (startCycle + index * stepCycle)) > Math.max(spacing * 0.5, MIN_NOTE_CYCLES * 2)) return undefined;
-		if (channel === undefined && note.channel !== noteChannel) return undefined;
 		if (tokens[index]) tokens[index] += `,${midiToNoteName(note.note)}`;
 		else tokens[index] = midiToNoteName(note.note);
-		durations[index] = Math.max(durations[index], Math.min(endCycle - (startCycle + index * stepCycle), Math.max(MIN_NOTE_CYCLES, note.endCycle - note.startCycle)));
-		velocities[index].push(clamp(note.velocity, 0, 1));
+		const duration = Math.min(endCycle - (startCycle + index * stepCycle), Math.max(MIN_NOTE_CYCLES, note.endCycle - note.startCycle));
+		const existingDuration = noteDurations[index][0];
+		if (existingDuration !== undefined && Math.abs(existingDuration - duration) > 0.000001) return undefined;
+		noteDurations[index].push(duration);
+		durations[index] = duration;
+		velocities[index].push(note.velocity);
 	}
 	const safeTokens = tokens.map((token) => token || '~').join(' ');
 	const allVelocities = velocities.flat();
-	const velocity = allVelocities.length ? allVelocities.reduce((total, value) => total + value, 0) / allVelocities.length : 0.8;
+	if (!allVelocities.length) return undefined;
+	const velocity = allVelocities[0];
+	if (allVelocities.some((value) => Math.abs(value - velocity) > 0.000001)) return undefined;
 	const durationValues = durations.map((duration) => formatNumber(duration / totalCycles)).join(' ');
 	const durationCall = durations.some((duration) => Math.abs(duration - stepCycle) > 0.000001) ? `.dur(${quote(durationValues)})` : '';
-	const pattern = `note(${quote(safeTokens)}).slow(${formatNumber(totalCycles)})${durationCall}.velocity(${formatNumber(clamp(velocity, 0, 1))}).midichan(${noteChannel})`;
+	const pattern = `note(${quote(safeTokens)}).slow(${formatNumber(totalCycles)})${durationCall}.velocity(${formatNumber(velocity)}).midichan(${noteChannel})`;
 	return `seqPLoop([${formatNumber(startCycle)}, ${formatNumber(endCycle)}, ${pattern}])${midiRoute(routeOptions, includeRoute)}`;
 }
 
-/** Serialize captured note and automation messages as native timed Strudel sections. */
+function validRecordedNote(note: MidiRecordedNote): boolean {
+	return Number.isInteger(note.note) && note.note >= 0 && note.note <= 127
+		&& Number.isFinite(note.velocity) && note.velocity >= 0 && note.velocity <= 1
+		&& Number.isFinite(note.channel) && Number.isInteger(note.channel) && note.channel >= 1 && note.channel <= 16
+		&& Number.isFinite(note.startCycle) && Number.isFinite(note.endCycle) && note.endCycle > note.startCycle;
+}
+
+export type MidiSourceSerializationResult = {
+	ok: true;
+	expression: string;
+	startCycle: number;
+	endCycle: number;
+	notes: MidiRecordedNote[];
+	automation: MidiRecordedAutomation[];
+} | MidiSourceWriteError;
+
+/** Serialize captured notes as native timed Strudel sections. Automation is intentionally review-only until its event semantics are proven. */
 export function serializeMidiNotes(
 	notes: readonly MidiRecordedNote[],
 	options: MidiSourceWriteOptions = {},
 	automation: readonly MidiRecordedAutomation[] = [],
-): { expression: string; startCycle: number; endCycle: number; notes: MidiRecordedNote[]; automation: MidiRecordedAutomation[] } {
-	const startCycle = Math.max(0, Number.isFinite(options.startCycle) ? options.startCycle as number : [...notes, ...automation].length ? Math.min(...notes.map((note) => note.startCycle), ...automation.map((event) => event.cycle)) : 0);
-	const inferredEnd = notes.length ? Math.max(...notes.map((note) => note.endCycle)) : startCycle + 1;
+): MidiSourceSerializationResult {
+	if (!notes.length) return { ok: false, code: 'EMPTY_TAKE', error: 'Nothing was recorded; the project source was not changed.' };
+	if (automation.length) return { ok: false, code: 'UNSUPPORTED_AUTOMATION', error: 'MIDI automation capture is not supported for source commit yet; the project source was not changed.' };
+	if (notes.some((note) => !validRecordedNote(note))) return { ok: false, code: 'INVALID_NOTE', error: 'The MIDI take contains a note with invalid pitch, velocity, channel, or timing data; the project source was not changed.' };
+
+	const startCycle = Math.max(0, Number.isFinite(options.startCycle) ? options.startCycle as number : Math.min(...notes.map((note) => note.startCycle)));
+	const inferredEnd = Math.max(...notes.map((note) => note.endCycle));
 	const endCycle = Math.max(startCycle + MIN_NOTE_CYCLES, Number.isFinite(options.endCycle) ? options.endCycle as number : inferredEnd);
 	const normalizedNotes = notes
 		.map((note) => {
@@ -180,59 +175,67 @@ export function serializeMidiNotes(
 		})
 		.filter((note): note is MidiRecordedNote => note !== undefined)
 		.sort((left, right) => left.startCycle - right.startCycle || left.note - right.note || left.id.localeCompare(right.id));
-	const normalizedAutomation = automation
-		.map((event) => ({ ...event, cycle: clamp(event.cycle, startCycle, Math.max(startCycle, endCycle - MIN_NOTE_CYCLES)) }))
-		.sort((left, right) => left.cycle - right.cycle || left.id.localeCompare(right.id));
-	const staticExpression = normalizedAutomation.length === 0
+	if (!normalizedNotes.length) return { ok: false, code: 'EMPTY_TAKE', error: 'Nothing was recorded in the selected source range; the project source was not changed.' };
+
+	const staticExpression = options.staticGrid
 		? serializeStaticGrid(normalizedNotes, startCycle, endCycle, options.staticGrid, options.channel, options, options.includeRoute !== false)
 		: undefined;
-	const parts = [
-		...normalizedNotes.map((note) => ({ cycle: note.startCycle, text: `[${formatNumber(note.startCycle)}, ${formatNumber(note.endCycle)}, ${noteExpression(note, options.channel === undefined ? note.channel : options.channel)}]` })),
-		...normalizedAutomation.map((event) => {
-			const eventEnd = Math.min(endCycle, event.cycle + MIN_NOTE_CYCLES);
-			return { cycle: event.cycle, text: `[${formatNumber(event.cycle)}, ${formatNumber(eventEnd)}, ${automationExpression(event)}]` };
-		}),
-	].sort((left, right) => left.cycle - right.cycle || left.text.localeCompare(right.text)).map((part) => part.text);
-	const body = staticExpression ?? (parts.length
-		? `seqPLoop(${parts.join(', ')})${midiRoute(options, options.includeRoute !== false)}`
-		: `seqPLoop([${formatNumber(startCycle)}, ${formatNumber(endCycle)}, note("~")])${midiRoute(options, options.includeRoute !== false)}`);
+	const parts = normalizedNotes
+		.map((note) => `[${formatNumber(note.startCycle)}, ${formatNumber(note.endCycle)}, ${noteExpression(note)}]`)
+		.join(', ');
+	const body = staticExpression ?? `seqPLoop(${parts})${midiRoute(options, options.includeRoute !== false)}`;
 	return {
+		ok: true,
 		expression: body,
 		startCycle,
 		endCycle,
 		notes: normalizedNotes,
-		automation: normalizedAutomation,
+		automation: [],
 	};
 }
 
-function existingGridNotes(source: string, trackId: string, globals: SourceGlobals): MidiRecordedNote[] | undefined {
-	const parsed = parseNoteGrid(source, trackId, globals);
-	if (!parsed.ok) return undefined;
-	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === trackId);
-	if (!block) return undefined;
-	return parsed.grid.notes.map((note: NoteGridNote) => ({
-		id: `existing-${note.id}`,
-		note: note.midi,
-		velocity: 0.9,
-		channel: 1,
-		startCycle: block.timing.startCycle + note.startCycle,
-		endCycle: block.timing.startCycle + note.startCycle + Math.max(MIN_NOTE_CYCLES, note.durationCycles),
-	}));
+function replaceGeneratedMidiRegion(source: string, block: SourceBlockDetails, replacement: string): string | undefined {
+	if (!block.expression || !block.expressionRange || block.generated !== 'midi-recording') return undefined;
+	const blockText = source.slice(block.expressionRange.start, block.expressionRange.end);
+	const start = blockText.indexOf(MIDI_GENERATED_REGION_START);
+	const end = blockText.indexOf(MIDI_GENERATED_REGION_END, start + MIDI_GENERATED_REGION_START.length);
+	if (start < 0 || end < 0 || end <= start) return undefined;
+	if (blockText.indexOf(MIDI_GENERATED_REGION_START, start + MIDI_GENERATED_REGION_START.length) >= 0) return undefined;
+	if (blockText.indexOf(MIDI_GENERATED_REGION_END, end + MIDI_GENERATED_REGION_END.length) >= 0) return undefined;
+
+	const regionStart = block.expressionRange.start + start + MIDI_GENERATED_REGION_START.length;
+	const regionEnd = block.expressionRange.start + end;
+	const currentRegion = source.slice(regionStart, regionEnd);
+	const leadingWhitespace = currentRegion.match(/^\s*/)?.[0] ?? '';
+	const trailingWhitespace = currentRegion.match(/\s*$/)?.[0] ?? '';
+	if (leadingWhitespace.length + trailingWhitespace.length > currentRegion.length) return undefined;
+	return `${source.slice(0, regionStart)}${leadingWhitespace}${replacement}${trailingWhitespace}${source.slice(regionEnd)}`;
 }
 
-/**
- * Turn a reviewed MIDI take into one ordinary Sushi source transaction. In
- * overdub mode, static note-grid lanes are merged before serialization; source
- * that is procedural is replaced rather than guessed at or silently rewritten.
- */
+/** Turn a reviewed replace-mode MIDI take into a transaction for an explicitly owned generated region. */
 export function writeMidiTakeToSource(
 	source: string,
 	take: MidiRecordedTake,
 	globals = getSourceGlobals(source),
 	options: MidiSourceWriteOptions = {},
 ): MidiSourceWriteResult | MidiSourceWriteError {
+	if (!take.notes.length && !take.automation.length) return { ok: false, code: 'EMPTY_TAKE', error: 'Nothing was recorded; the project source was not changed.' };
+	if (take.automation.length) return { ok: false, code: 'UNSUPPORTED_AUTOMATION', error: 'MIDI automation capture is not supported for source commit yet; the project source was not changed.' };
+	if (take.options.mode === 'overdub') return { ok: false, code: 'UNSUPPORTED_OVERDUB', error: 'MIDI overdub cannot safely preserve the existing source notes yet; the project source was not changed.' };
+
 	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === take.trackId);
-	if (!block) return { ok: false, error: `The recorded track "${take.trackId}" no longer exists in the source.` };
+	if (!block) return { ok: false, code: 'MISSING_TRACK', error: `The recorded track "${take.trackId}" no longer exists in the source.` };
+	if (block.type !== 'midi' || block.generated !== 'midi-recording') return {
+		ok: false,
+		code: 'UNOWNED_TRACK',
+		error: 'The selected track is not an explicitly generated MIDI recording lane, so it cannot be safely rewritten; the project source was not changed.',
+	};
+	if (!replaceGeneratedMidiRegion(source, block, '')) return {
+		ok: false,
+		code: 'MISSING_GENERATED_REGION',
+		error: 'The selected MIDI lane has no valid generated recording region, so it cannot be safely rewritten; the project source was not changed.',
+	};
+
 	const inheritedRoute = block.midi;
 	const routeOptions: MidiSourceWriteOptions = {
 		...options,
@@ -246,28 +249,23 @@ export function writeMidiTakeToSource(
 		...(options.program === undefined && inheritedRoute?.program !== undefined ? { program: inheritedRoute.program } : {}),
 	};
 	const requestedStartCycle = Number.isFinite(options.startCycle) ? options.startCycle as number : Math.max(0, take.startedAtCycle);
-	const startCycle = take.options.mode === 'overdub' ? Math.min(block.timing.startCycle, requestedStartCycle) : requestedStartCycle;
+	const startCycle = requestedStartCycle;
 	const requestedEndCycle = Number.isFinite(options.endCycle) ? options.endCycle as number : Math.max(requestedStartCycle + 1, take.endedAtCycle);
-	const endCycle = take.options.mode === 'overdub'
-		? Math.max(startCycle + MIN_NOTE_CYCLES, block.timing.endCycle, requestedEndCycle)
-		: Math.max(startCycle + MIN_NOTE_CYCLES, requestedEndCycle);
+	const endCycle = Math.max(startCycle + MIN_NOTE_CYCLES, requestedEndCycle);
 	let notes = normalizeMidiNotes(take.notes, startCycle, endCycle);
 	if (take.options.quantize !== 'off') {
 		notes = quantizeMidiNotes(notes, globals.quarterNotesPerCycle, take.options.quantize, take.options.quantizeStrength, take.options.swing, startCycle, endCycle);
 	}
-
-	if (take.options.mode === 'overdub') {
-		const existing = existingGridNotes(source, take.trackId, globals);
-		if (existing) notes = normalizeMidiNotes([...existing, ...notes], startCycle, endCycle);
-	}
+	if (!notes.length) return { ok: false, code: 'EMPTY_TAKE', error: 'Nothing was recorded in the selected source range; the project source was not changed.' };
 
 	const serialized = serializeMidiNotes(notes, {
 		...routeOptions,
 		startCycle,
 		endCycle,
 		...(take.options.quantize === 'off' ? {} : { staticGrid: { quarterNotesPerCycle: globals.quarterNotesPerCycle, grid: take.options.quantize } }),
-	}, take.automation);
-	const nextSource = replaceSourceTrackExpression(source, take.trackId, ({ label }) => ({ label, expression: serialized.expression }));
-	if (nextSource === source) return { ok: false, error: 'The recorded track source could not be updated.' };
+	});
+	if (!serialized.ok) return serialized;
+	const nextSource = replaceGeneratedMidiRegion(source, block, serialized.expression);
+	if (nextSource === undefined || nextSource === source) return { ok: false, code: 'WRITE_FAILED', error: 'The generated MIDI recording region could not be updated; the project source was not changed.' };
 	return { ok: true, source: nextSource, notes: serialized.notes, automation: serialized.automation, startCycle: serialized.startCycle, endCycle: serialized.endCycle };
 }

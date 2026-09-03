@@ -4,7 +4,6 @@ import {
 	getSourceBlockDetails,
 	getSourceGlobals,
 	replaceSourceTrackExpression,
-	updateTrackRange,
 	type SourceGlobals,
 } from './source-mapper';
 
@@ -297,8 +296,9 @@ function findMatchingBracket(source: string, open: number): number | undefined {
 }
 
 function seqPLoopRange(expression: string): { start: number; end: number } | undefined {
-	if (!/^\s*seqPLoop\s*\(/.test(expression)) return undefined;
-	const seqOpen = expression.indexOf('(');
+	const prefix = expression.match(/^\s*\/\*\s*@sushi-midi-generated:start\s*\*\/\s*/)?.[0].length ?? 0;
+	if (!/^\s*seqPLoop\s*\(/.test(expression.slice(prefix))) return undefined;
+	const seqOpen = expression.indexOf('(', prefix);
 	for (let index = seqOpen + 1; index < expression.length; index += 1) {
 		const character = expression[index];
 		const next = expression[index + 1];
@@ -321,166 +321,6 @@ function seqPLoopRange(expression: string): { start: number; end: number } | und
 		return end === undefined ? undefined : { start: index, end };
 	}
 	return undefined;
-}
-
-interface SeqPLoopPart {
-	start: number;
-	end: number;
-	bodyStart: number;
-	bodyEnd: number;
-	body: string;
-}
-
-interface SeqPLoopParts {
-	open: number;
-	close: number;
-	parts: SeqPLoopPart[];
-}
-
-function findBalancedCallEnd(source: string, open: number): number | undefined {
-	let depth = 1;
-	for (let index = open + 1; index < source.length; index += 1) {
-		const character = source[index];
-		const next = source[index + 1];
-		if (character === '"' || character === "'" || character === '`') {
-			index = skipString(source, index) - 1;
-			continue;
-		}
-		if (character === '/' && next === '/') {
-			const lineEnd = source.indexOf('\n', index + 2);
-			index = (lineEnd === -1 ? source.length : lineEnd) - 1;
-			continue;
-		}
-		if (character === '/' && next === '*') {
-			const commentEnd = source.indexOf('*/', index + 2);
-			index = (commentEnd === -1 ? source.length : commentEnd + 2) - 1;
-			continue;
-		}
-		if (character === '(') depth += 1;
-		if (character === ')' && --depth === 0) return index;
-	}
-	return undefined;
-}
-
-function seqPLoopParts(expression: string): SeqPLoopParts | undefined {
-	const prefix = /^\s*seqPLoop\s*\(/.exec(expression);
-	if (!prefix) return undefined;
-	const open = expression.indexOf('(', prefix.index);
-	const close = open < 0 ? undefined : findBalancedCallEnd(expression, open);
-	if (close === undefined) return undefined;
-	const parts: SeqPLoopPart[] = [];
-	const rangePattern = new RegExp(`^\\[\\s*(${NUMERIC_LITERAL_SOURCE})\\s*,\\s*(${NUMERIC_LITERAL_SOURCE})\\s*,`);
-	for (let index = open + 1; index < close;) {
-		while (index < close && (/[\s,]/.test(expression[index] ?? ''))) index += 1;
-		if (index >= close) break;
-		if (expression[index] !== '[') {
-			index += 1;
-			continue;
-		}
-		const bracketEnd = findMatchingBracket(expression, index);
-		if (bracketEnd === undefined || bracketEnd > close) return undefined;
-		const partText = expression.slice(index, bracketEnd + 1);
-		const match = partText.match(rangePattern);
-		if (match) {
-			const bodyStart = index + match[0].length;
-			parts.push({
-				start: Number(match[1]),
-				end: Number(match[2]),
-				bodyStart,
-				bodyEnd: bracketEnd,
-				body: expression.slice(bodyStart, bracketEnd),
-			});
-		}
-		index = bracketEnd + 1;
-	}
-	return { open, close, parts };
-}
-
-function isEmptySeqPLoopPart(body: string): boolean {
-	return /^\s*(?:s|sound)\s*\(\s*["'`]~["'`]\s*\)\s*$/.test(body);
-}
-
-function canonicalizeLegacyNoteGridSource(source: string, trackId: string): string | undefined {
-	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === trackId);
-	if (!block?.marker || !block.expression) return undefined;
-	const expression = block.expression;
-	const loop = seqPLoopParts(expression);
-	if (!loop || loop.parts.length < 2) return undefined;
-	const notePart = loop.parts[0];
-	if (notePart.start !== block.timing.startCycle) return undefined;
-	const noteExpression = expression.slice(notePart.bodyStart, notePart.bodyEnd).trim();
-	const noteCall = parseNoteCall(noteExpression);
-	if (!noteCall || parseDurationCall(noteExpression) !== undefined || parseDurationCall(expression) !== undefined) return undefined;
-	const parsedTokens = parseTokens(noteCall);
-	if (!parsedTokens || !parsedTokens.raw.length) return undefined;
-	const slowCall = parseStaticSlowCall(noteExpression);
-	if (slowCall === 'unsupported') return undefined;
-	const authoredTokens = [...parsedTokens.raw];
-	// Older range edits appended rests to the note section and then moved its
-	// boundary again. They are extension cells, not part of the authored grid.
-	while (authoredTokens.length > 1 && (authoredTokens.at(-1) === '~' || authoredTokens.at(-1) === '-')) authoredTokens.pop();
-	const nominalPatternCycles = slowCall ? slowCall.factor : authoredTokens.length;
-	const outerSpan = block.timing.endCycle - block.timing.startCycle;
-	if (!Number.isFinite(nominalPatternCycles) || nominalPatternCycles <= 0 || !Number.isFinite(outerSpan) || outerSpan <= nominalPatternCycles) return undefined;
-	const stepCycle = nominalPatternCycles / authoredTokens.length;
-	const extraSteps = Math.round((outerSpan - nominalPatternCycles) / stepCycle);
-	if (extraSteps <= 0 || Math.abs(extraSteps * stepCycle - (outerSpan - nominalPatternCycles)) > 0.000001) return undefined;
-	const tailParts = loop.parts.slice(1);
-	if (tailParts.some((part) => !isEmptySeqPLoopPart(part.body) && part.body.trim() !== noteExpression.trim())) return undefined;
-	const nextTokens = [...authoredTokens, ...Array(extraSteps).fill('~')];
-	const expandedNoteExpression = replaceRange(noteExpression, noteCall.literalStart, noteCall.literalEnd, escapeString(nextTokens.join(' '), noteCall.quote));
-	const outerSuffix = expression.slice(loop.close + 1);
-	const canonicalExpression = `seqPLoop([${formatNumber(block.timing.startCycle)}, ${formatNumber(block.timing.endCycle)}, ${expandedNoteExpression}])${outerSuffix}`;
-	return replaceSourceTrackExpression(source, trackId, ({ label }) => ({ label, expression: canonicalExpression }));
-}
-
-/** Normalize source-generated static note timing and repair legacy range tails. */
-export function normalizeNoteGridSourceRanges(source: string): string {
-	let normalized = source;
-	for (const block of getSourceBlockDetails(source)) {
-		const currentBlock = getSourceBlockDetails(normalized).find((candidate) => candidate.id === block.id);
-		const loop = currentBlock?.expression ? seqPLoopParts(currentBlock.expression) : undefined;
-		if (currentBlock?.marker && loop?.parts.some((part) => part.end <= part.start)) {
-			const validParts = loop.parts.filter((part) => part.end > part.start);
-			if (validParts.length) {
-				const start = Math.min(...validParts.map((part) => part.start));
-				const end = Math.max(...validParts.map((part) => part.end));
-				normalized = updateTrackRange(normalized, block.id, start, end);
-			}
-		}
-		const canonical = canonicalizeLegacyNoteGridSource(normalized, block.id);
-		if (canonical && canonical !== normalized) normalized = canonical;
-		const stretched = normalizeStaticNoteGridSourceRange(normalized, block.id);
-		if (stretched && stretched !== normalized) normalized = stretched;
-	}
-	return normalized;
-}
-
-function normalizeStaticNoteGridSourceRange(source: string, trackId: string): string | undefined {
-	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === trackId);
-	if (!block?.marker || !block.expression) return undefined;
-	const loop = seqPLoopParts(block.expression);
-	if (!loop || loop.parts.length !== 1) return undefined;
-	const part = loop.parts[0];
-	const noteExpression = block.expression.slice(part.bodyStart, part.bodyEnd).trim();
-	const noteCall = parseNoteCall(noteExpression);
-	if (!noteCall || !parseTokens(noteCall) || hasUnsupportedExpression(block.expression)) return undefined;
-	const bodySlow = parseStaticSlowCall(noteExpression);
-	if (bodySlow === 'unsupported') return undefined;
-	const expressionSlow = parseStaticSlowCall(block.expression);
-	if (expressionSlow === 'unsupported' || (expressionSlow && !bodySlow)) return undefined;
-	const targetPatternCycles = block.timing.endCycle - block.timing.startCycle;
-	if (!Number.isFinite(targetPatternCycles) || targetPatternCycles <= 0) return undefined;
-
-	let nextNoteExpression = noteExpression;
-	if (bodySlow) {
-		if (Math.abs(bodySlow.factor - targetPatternCycles) < 0.000001) return undefined;
-		nextNoteExpression = replaceRange(noteExpression, bodySlow.argumentStart, bodySlow.argumentEnd, formatNumber(targetPatternCycles));
-	} else {
-		nextNoteExpression = appendSourceExpressionCall(noteExpression, `.slow(${formatNumber(targetPatternCycles)})`);
-	}
-	const nextExpression = replaceRange(block.expression, part.bodyStart, part.bodyEnd, ` ${nextNoteExpression}`);
-	return replaceSourceTrackExpression(source, trackId, ({ label }) => ({ label, expression: nextExpression }));
 }
 
 function isInsideSeqPLoopPart(expression: string, index: number): boolean {
@@ -761,10 +601,6 @@ export function midiToNoteName(midi: number): string {
 export function parseNoteGrid(source: string, trackId: string, globals = getSourceGlobals(source)): NoteGridResult {
 	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === trackId);
 	if (!block?.expression) return { ok: false, reason: 'This source block has no editable Strudel expression.' };
-	const canonicalSource = canonicalizeLegacyNoteGridSource(source, trackId);
-	if (canonicalSource && canonicalSource !== source) return parseNoteGrid(canonicalSource, trackId, globals);
-	const stretchedSource = normalizeStaticNoteGridSourceRange(source, trackId);
-	if (stretchedSource && stretchedSource !== source) return parseNoteGrid(stretchedSource, trackId, globals);
 	const expression = block.expression;
 	if (hasUnsupportedExpression(expression)) return { ok: false, reason: 'This pattern changes pitch or timing procedurally, so it stays source-editable but is read-only in the note editor.' };
 	const noteCall = parseNoteCall(expression);
@@ -785,7 +621,7 @@ export function parseNoteGrid(source: string, trackId: string, globals = getSour
 	if (octaveShift === undefined) return { ok: false, reason: 'The note grid needs a static numeric .octave(...) value.' };
 	const durationCall = parseDurationCall(expression);
 	if (durationCall === 'unsupported') return { ok: false, reason: 'Use one static .dur(...), .duration(...), or .legato(...) value for note lengths.' };
-	const durationInsidePattern = /^\s*seqPLoop\s*\(/.test(expression) && (!durationCall || durationCall.insidePattern);
+	const durationInsidePattern = seqPLoopRange(expression) !== undefined && (!durationCall || durationCall.insidePattern);
 	const durationScale = durationInsidePattern ? patternCycles : 1;
 	const parsedDurations = parseDurationValues(
 		durationCall,
@@ -855,10 +691,6 @@ export function snapMidiToNoteGrid(grid: NoteGrid, midi: number): number {
  */
 export function extendNoteGridSourceRange(source: string, trackId: string, previousEndCycle: number, nextEndCycle: number): string {
 	if (!Number.isFinite(previousEndCycle) || !Number.isFinite(nextEndCycle) || nextEndCycle <= previousEndCycle) return source;
-	const canonicalSource = canonicalizeLegacyNoteGridSource(source, trackId);
-	if (canonicalSource && canonicalSource !== source) return extendNoteGridSourceRange(canonicalSource, trackId, previousEndCycle, nextEndCycle);
-	const stretchedSource = normalizeStaticNoteGridSourceRange(source, trackId);
-	if (stretchedSource && stretchedSource !== source) return extendNoteGridSourceRange(stretchedSource, trackId, previousEndCycle, nextEndCycle);
 	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === trackId);
 	if (!block) return source;
 	const parsed = parseNoteGrid(source, trackId);
@@ -936,10 +768,6 @@ export function extendNoteGridSourceRange(source: string, trackId: string, previ
  */
 export function trimNoteGridSourceRange(source: string, trackId: string, nextEndCycle: number): string {
 	if (!Number.isFinite(nextEndCycle)) return source;
-	const canonicalSource = canonicalizeLegacyNoteGridSource(source, trackId);
-	if (canonicalSource && canonicalSource !== source) return trimNoteGridSourceRange(canonicalSource, trackId, nextEndCycle);
-	const stretchedSource = normalizeStaticNoteGridSourceRange(source, trackId);
-	if (stretchedSource && stretchedSource !== source) return trimNoteGridSourceRange(stretchedSource, trackId, nextEndCycle);
 	const parsed = parseNoteGrid(source, trackId);
 	if (!parsed.ok) return source;
 	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === trackId);
@@ -996,9 +824,7 @@ export function trimNoteGridSourceRange(source: string, trackId: string, nextEnd
 }
 
 export function updateNoteGridSource(source: string, trackId: string, edit: NoteGridEdit): string {
-	const canonicalSource = canonicalizeLegacyNoteGridSource(source, trackId) ?? source;
-	const stretchedSource = normalizeStaticNoteGridSourceRange(canonicalSource, trackId) ?? canonicalSource;
-	const parsed = parseNoteGrid(stretchedSource, trackId);
+	const parsed = parseNoteGrid(source, trackId);
 	if (!parsed.ok) return source;
 	if (!Number.isInteger(edit.slot) || edit.slot < 0 || edit.slot >= parsed.grid.steps) return source;
 	const grid = parsed.grid;
@@ -1071,7 +897,7 @@ export function updateNoteGridSource(source: string, trackId: string, edit: Note
 		needsDurationControl = true;
 	}
 
-	return replaceSourceTrackExpression(stretchedSource, trackId, ({ label, expression }) => {
+	return replaceSourceTrackExpression(source, trackId, ({ label, expression }) => {
 		const noteCall = parseNoteCall(expression);
 		if (!noteCall) return { label, expression };
 		const durationCall = parseDurationCall(expression);
@@ -1092,7 +918,7 @@ export function updateNoteGridSource(source: string, trackId: string, edit: Note
 				});
 			} else if (needsDurationControl) {
 				const durationCallText = `.dur(${JSON.stringify(durationValues.join(' '))})`;
-				const insidePattern = /^\s*seqPLoop\s*\(/.test(expression) && isInsideSeqPLoopPart(expression, noteCall.callStart);
+				const insidePattern = seqPLoopRange(expression) !== undefined && isInsideSeqPLoopPart(expression, noteCall.callStart);
 				if (insidePattern) {
 					replacements.push({ start: noteCall.callEnd, end: noteCall.callEnd, value: durationCallText });
 				} else {

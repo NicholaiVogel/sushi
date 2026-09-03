@@ -885,7 +885,6 @@ export class StrudelAdapter {
 					if (started) this.startVisualTransportClock(this.pendingSchedulerStart?.cycle ?? this.runtime.currentCycle ?? 0);
 					else {
 						this.pendingSchedulerStart = undefined;
-						this.notifyMidiStop();
 						this.stopVisualTransportClock();
 					}
 					this.setRuntime({
@@ -1156,7 +1155,6 @@ export class StrudelAdapter {
 				repl.pause();
 			} else {
 				repl.stop();
-				this.notifyMidiStop();
 				this.module?.hush?.();
 				this.stopCycleTimer();
 			}
@@ -1246,7 +1244,6 @@ export class StrudelAdapter {
 		const pausedCycle = this.runtime.currentCycle ?? 0;
 		const boundaryCycle = wasPlaying ? await this.waitForNextCycleBoundary() : pausedCycle;
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
-		if (wasPlaying || wasPaused) this.notifyMidiStop();
 		const result = await this.evaluateRaw(source, options.autoplay ?? false);
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 		// The caller normally supplies the accepted source explicitly, but keeping
@@ -1294,7 +1291,6 @@ export class StrudelAdapter {
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 		const previousTransport = this.runtime.transport ?? 'stopped';
 		const previousCycle = this.runtime.currentCycle ?? 0;
-		if (previousTransport === 'playing' || previousTransport === 'paused') this.notifyMidiStop();
 		const result = await this.evaluateRaw(source, false);
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 
@@ -1379,19 +1375,6 @@ export class StrudelAdapter {
 		return error instanceof Error ? error.message : String(error);
 	}
 
-	/** Notify the MIDI extension whenever Strudel tears down the active pattern. */
-	private notifyMidiStop(): void {
-		if (typeof window === 'undefined' || typeof window.postMessage !== 'function') return;
-		try {
-			// @strudel/midi listens for this native Strudel stop notification. It
-			// sends MIDI stop to every output; MidiService additionally provides the
-			// stronger all-notes-off panic for explicit teardown/user actions.
-			window.postMessage('strudel-stop', '*');
-		} catch {
-			// Browser teardown and restrictive embedded hosts can reject postMessage.
-		}
-	}
-
 	/**
 	 * A failed restore is different from a rejected candidate: the accepted
 	 * pattern is no longer guaranteed to be resident in the REPL. Stop and hush
@@ -1401,7 +1384,6 @@ export class StrudelAdapter {
 		this.pendingSchedulerStart = undefined;
 		this.stopCycleTimer();
 		this.stopVisualTransportClock();
-		this.notifyMidiStop();
 		try {
 			this.repl?.stop();
 		} catch {
@@ -1443,7 +1425,6 @@ export class StrudelAdapter {
 		} else {
 			if (this.destroyed) return;
 			repl.stop();
-			this.notifyMidiStop();
 			this.module?.hush?.();
 			this.stopCycleTimer();
 		}
@@ -1741,7 +1722,6 @@ export class StrudelAdapter {
 			const currentCycle = this.readCurrentCycle();
 			pauseAttempted = true;
 			this.repl.pause();
-			this.notifyMidiStop();
 			this.stopVisualTransportClock();
 			this.stopCycleTimer();
 			this.setRuntime({ transport: 'paused', currentCycle });
@@ -1777,7 +1757,6 @@ export class StrudelAdapter {
 				// considered stopped; their own stop implementation remains the
 				// fallback for resetting any internal cursor.
 			}
-			this.notifyMidiStop();
 			this.module?.hush?.();
 			this.stopCycleTimer();
 			this.setRuntime({ transport: 'stopped', currentCycle: 0 });
@@ -1904,7 +1883,6 @@ export class StrudelAdapter {
 			if (wasPlaying) {
 				transportTouched = true;
 				this.repl.pause();
-				this.notifyMidiStop();
 				this.stopVisualTransportClock();
 			}
 
@@ -1949,7 +1927,6 @@ export class StrudelAdapter {
 		this.stopVisualTransportClock();
 		try {
 			repl?.stop();
-			this.notifyMidiStop();
 			module?.hush?.();
 		} catch {
 			// Destruction should never turn a route change or HMR update into an

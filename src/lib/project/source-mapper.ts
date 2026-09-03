@@ -260,7 +260,10 @@ export function updateSourceBpm(source: string, bpm: number): string {
 }
 
 export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAULT_TRACK_END_CYCLE): TrackTiming {
-	const trimmed = expression.trim();
+	// MIDI recording lanes keep their ownership sentinel in the expression so
+	// the writer can replace only the generated region. Ignore that sentinel
+	// when projecting the lane's source-defined timing.
+	const trimmed = expression.replace(/^\s*\/\*\s*@sushi-midi-generated:start\s*\*\/\s*/, '').trim();
 	if (/^seqPLoop\s*\(/.test(trimmed)) {
 		const pairs = Array.from(trimmed.matchAll(new RegExp(`\\[\\s*(${numericLiteral})\\s*,\\s*(${numericLiteral})\\s*,`, 'g')))
 			.map((match) => ({ start: Number(match[1]), end: Number(match[2]) }))

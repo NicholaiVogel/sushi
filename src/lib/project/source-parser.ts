@@ -22,6 +22,7 @@ interface MarkerMetadata {
 	name?: string;
 	type?: SourceBlockSummary['type'];
 	instrument?: string;
+	generated?: 'midi-recording';
 }
 
 interface SourceLine {
@@ -77,7 +78,8 @@ function parseMarker(line: string): MarkerMetadata | undefined {
 		const instrument = typeof record.instrument === 'string' && record.instrument.trim() && !/[\r\n]/.test(record.instrument)
 			? record.instrument.trim()
 			: undefined;
-		return { ...(id ? { id } : {}), ...(name ? { name } : {}), ...(type ? { type } : {}), ...(instrument ? { instrument } : {}) };
+		const generated = record.generated === 'midi-recording' ? record.generated : undefined;
+		return { ...(id ? { id } : {}), ...(name ? { name } : {}), ...(type ? { type } : {}), ...(instrument ? { instrument } : {}), ...(generated ? { generated } : {}) };
 	} catch {
 		return undefined;
 	}
@@ -235,6 +237,7 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 				name: candidate.marker.name ?? `Source block ${index + 1}`,
 				type: candidate.marker.type ?? 'unknown',
 				...(candidate.marker.instrument ? { instrument: candidate.marker.instrument } : {}),
+				...(candidate.marker.generated ? { generated: candidate.marker.generated } : {}),
 				line: candidate.line.index + 1,
 				sourceRange,
 				...(candidate.marker.id ? { markerId: candidate.marker.id } : {}),
