@@ -38,7 +38,7 @@ import {
 	type TrackMidiRouteUpdate,
 } from '../lib/project/source-mapper';
 import type { TrackEffectMethod } from '../lib/strudel/track-effects';
-import { extendNoteGridSourceRange, midiToNoteName, normalizeNoteGridSourceRanges, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
+import { extendNoteGridSourceRange, midiToNoteName, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
 import { EDITOR_PRESETS, type EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
@@ -517,14 +517,9 @@ export default function Studio() {
 				&& storedProject.source.draft === LEGACY_DEFAULT_SOURCE
 				&& storedProject.source.lastValid === LEGACY_DEFAULT_SOURCE;
 			restoredProjectRef.current = Boolean(storedProject && !isUntouchedLegacySeed);
-			const baseProject = !storedProject
+			const project = !storedProject
 				? fallbackProject
 				: isUntouchedLegacySeed ? { ...storedProject, source: fallbackProject.source } : storedProject;
-			const repairedDraft = normalizeNoteGridSourceRanges(baseProject.source.draft);
-			const repairedLastValid = normalizeNoteGridSourceRanges(baseProject.source.lastValid);
-			const project = repairedDraft === baseProject.source.draft && repairedLastValid === baseProject.source.lastValid
-				? baseProject
-				: { ...baseProject, source: { ...baseProject.source, draft: repairedDraft, lastValid: repairedLastValid } };
 			const activeRevision = !storedProject || isUntouchedLegacySeed
 				? fallbackProject.source.revision
 				: stored?.activeRevision ?? project.source.revision;
