@@ -16,7 +16,7 @@ Try it live at [sushidaw.com](https://sushidaw.com/).
 
 <p align="center">
   <picture>
-    <img alt="Screenshot of Sushi Workspace" src="./public/workspace-screenshot.png" width="420">
+    <img alt="Screenshot of Sushi Workspace" src="./public/workspace-screenshot.png">
   </picture>
 </p>
 
