@@ -40,6 +40,7 @@ export interface StudioHeaderProps {
 	appearanceMode: AppearanceMode;
 	isDarkMode: boolean;
 	projectImportInputRef: RefObject<HTMLInputElement | null>;
+	onNewProject: () => void;
 	onTogglePopover: (popover: HeaderPopover) => void;
 	onProjectNameChange: (name: string) => void;
 	onPersistProject: () => void;
@@ -93,6 +94,7 @@ export function StudioHeader({
 	appearanceMode,
 	isDarkMode,
 	projectImportInputRef,
+	onNewProject,
 	onTogglePopover,
 	onProjectNameChange,
 	onPersistProject,
@@ -137,6 +139,7 @@ export function StudioHeader({
 						appearanceMode={appearanceMode}
 						isDarkMode={isDarkMode}
 						projectImportInputRef={projectImportInputRef}
+						onNewProject={onNewProject}
 						onSaveProject={onSaveProject}
 						onExportProject={onExportProject}
 						onImportProject={onImportProject}

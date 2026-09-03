@@ -99,6 +99,28 @@ export function snapshotFromStudio(studio: StudioState): StoredProjectSnapshot {
 	};
 }
 
+export function createBlankProjectSnapshot(current: StudioState): StoredProjectSnapshot {
+	const project = createInitialProject();
+	const revision = Math.max(project.source.revision, current.revision + 1);
+	project.source.revision = revision;
+	return { project, activeRevision: revision };
+}
+
+export function rebaseProjectSnapshotRevision(snapshot: StoredProjectSnapshot, currentRevision: number): StoredProjectSnapshot {
+	const incomingRevision = snapshot.project.source.revision;
+	if (incomingRevision > currentRevision) return snapshot;
+	const revision = currentRevision + 1;
+	const delta = revision - incomingRevision;
+	return {
+		...snapshot,
+		project: {
+			...snapshot.project,
+			source: { ...snapshot.project.source, revision },
+		},
+		activeRevision: snapshot.activeRevision === null ? null : snapshot.activeRevision + delta,
+	};
+}
+
 export function getDiagnosticLabel(diagnostic: SourceDiagnostic): string {
 	return `${diagnostic.phase.toUpperCase()} / ${diagnostic.code}`;
 }
