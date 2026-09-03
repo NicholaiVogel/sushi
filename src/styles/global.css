@@ -248,11 +248,11 @@ a { color: inherit; }
 	left: 0;
 	z-index: 30;
 	display: grid;
-	gap: 12px;
+	grid-template-rows: auto minmax(0, 1fr) auto;
 	width: min(320px, calc(100vw - 28px));
 	max-height: calc(100svh - 96px);
 	padding: 14px 12px 12px;
-	overflow-y: auto;
+	overflow: hidden;
 	border: 1px solid var(--line);
 	border-radius: 5px;
 	background: var(--popover-bg);
@@ -261,6 +261,14 @@ a { color: inherit; }
 	letter-spacing: normal;
 	text-align: left;
 	text-transform: none;
+}
+
+.settings-menu-content {
+	display: grid;
+	gap: 12px;
+	min-height: 0;
+	padding-top: 12px;
+	overflow-y: auto;
 }
 
 .topbar-settings-menu::before {
@@ -1216,45 +1224,44 @@ a { color: inherit; }
 
 .sidebar-diagnostic-revision { color: var(--ink-muted); }
 
-.about-credits {
+.settings-menu-about {
 	display: grid;
-	flex: 0 0 auto;
 	gap: 5px;
-	padding: 10px 14px 0;
-	border-top: 1px solid var(--line);
-	background: var(--editor-sidebar-bg);
+	margin-top: 12px;
+	padding-top: 10px;
+	border-top: 1px solid var(--line-soft);
 	color: var(--ink-muted);
 	font-family: var(--mono);
 	font-size: 8px;
 	line-height: 1.35;
 }
 
-.about-credits-heading {
+.settings-menu-about-heading {
 	color: var(--accent);
 	font-size: 8px;
 	letter-spacing: 0.09em;
 }
 
-.about-credits-links {
+.settings-menu-about-links {
 	display: flex;
 	align-items: center;
 	flex-wrap: wrap;
 	gap: 5px;
 }
 
-.about-credits a {
+.settings-menu-about a {
 	color: var(--ink-soft);
 	text-decoration: underline;
 	text-decoration-color: var(--line);
 	text-underline-offset: 2px;
 }
 
-.about-credits a:hover,
-.about-credits a:focus-visible { color: var(--accent); text-decoration-color: currentColor; }
+.settings-menu-about a:hover,
+.settings-menu-about a:focus-visible { color: var(--accent); text-decoration-color: currentColor; }
 
-.about-credits-notice,
-.about-credits-license { margin: 0; }
-.about-credits-license a { color: var(--accent); }
+.settings-menu-about-notice,
+.settings-menu-about-license { margin: 0; }
+.settings-menu-about-license a { color: var(--accent); }
 
 .daw-canvas {
 	min-width: 0;
