@@ -1748,4 +1748,30 @@ describe('StrudelAdapter evaluation queue', () => {
 			}
 		}
 	});
+
+	test('runtime teardown does not broadcast an implicit MIDI stop', async () => {
+		const messages: unknown[] = [];
+		const hadWindow = 'window' in globalThis;
+		const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+		Object.defineProperty(globalThis, 'window', { configurable: true, value: { postMessage: (message: unknown) => messages.push(message) } });
+		const fakeModule = {
+			register: () => () => undefined,
+			initStrudel: async () => ({
+				evaluate: async () => ({}),
+				start: async () => undefined,
+				stop: () => undefined,
+				pause: () => undefined,
+				scheduler: { now: () => 0, stop: () => undefined, lastEnd: 0, lastBegin: 0 },
+			}),
+		};
+		try {
+			const adapter = new StrudelAdapter(undefined, async () => fakeModule);
+			await adapter.init();
+			adapter.destroy();
+			expect(messages).not.toContain('strudel-stop');
+		} finally {
+			if (hadWindow) Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+			else Reflect.deleteProperty(globalThis, 'window');
+		}
+	});
 });

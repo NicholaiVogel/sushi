@@ -32,7 +32,7 @@ function fakeMidi() {
 		removeListener: (event?: string) => { if (event) webMidiListeners.delete(event); },
 	};
 	const loader: MidiModuleLoader = async () => ({ WebMidi: webMidi });
-	return { loader, inputListeners, outputMessages, webMidi };
+	return { loader, inputListeners, outputMessages, webMidiListeners, webMidi };
 }
 
 describe('MidiService', () => {
@@ -126,6 +126,44 @@ describe('MidiService', () => {
 			expect(take?.notes[0].endCycle).toBe(0.5);
 		} finally {
 			service.destroy();
+		}
+	});
+
+	test('panic and device disconnect never emit MIDI transport stop', async () => {
+		const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+		const previousSecureContext = Object.getOwnPropertyDescriptor(globalThis, 'isSecureContext');
+		Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { requestMIDIAccess: () => Promise.resolve() } });
+		Object.defineProperty(globalThis, 'isSecureContext', { configurable: true, value: true });
+		const fake = fakeMidi();
+		const service = new MidiService({ loadModule: fake.loader, now: () => 1_000 });
+		try {
+			await service.connect();
+			service.setSelectedOutput('Test Synth');
+			service.setClockMode('send');
+			service.startTransportClock();
+			fake.outputMessages.length = 0;
+			service.panic();
+			expect(fake.outputMessages.some((message) => message[0] === 0xfc)).toBe(false);
+
+			service.startTransportClock();
+			fake.outputMessages.length = 0;
+			await service.disconnect();
+			expect(fake.outputMessages.some((message) => message[0] === 0xfc)).toBe(false);
+
+			await service.connect();
+			service.setSelectedOutput('Test Synth');
+			service.setClockMode('send');
+			service.startTransportClock();
+			fake.outputMessages.length = 0;
+			fake.webMidiListeners.get('disconnected')?.({});
+			expect(fake.outputMessages.some((message) => message[0] === 0xfc)).toBe(false);
+			expect(service.getState().clockRunning).toBe(false);
+		} finally {
+			service.destroy();
+			if (previousNavigator) Object.defineProperty(globalThis, 'navigator', previousNavigator);
+			else Reflect.deleteProperty(globalThis, 'navigator');
+			if (previousSecureContext) Object.defineProperty(globalThis, 'isSecureContext', previousSecureContext);
+			else Reflect.deleteProperty(globalThis, 'isSecureContext');
 		}
 	});
 });

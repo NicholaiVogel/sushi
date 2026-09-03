@@ -46,7 +46,6 @@ interface MidiOutputLike {
 	sendAllNotesOff?: (options?: Record<string, unknown>) => unknown;
 	sendAllSoundOff?: (options?: Record<string, unknown>) => unknown;
 	sendResetAllControllers?: (options?: Record<string, unknown>) => unknown;
-	sendStop?: (options?: Record<string, unknown>) => unknown;
 }
 
 interface WebMidiLike {
@@ -310,7 +309,7 @@ export class MidiService {
 	public async disconnect(): Promise<MidiRuntimeState> {
 		const preserveReview = this.state.recording.status === 'review' && this.state.recording.take !== null;
 		if (!preserveReview) this.cancelRecording();
-		this.stopTransportClock();
+		this.stopTransportClock(false);
 		this.stopExternalClockWatch();
 		this.panic();
 		this.detachInputListeners();
@@ -528,7 +527,6 @@ export class MidiService {
 	}
 
 	public panic(outputId?: string | null): MidiRuntimeState {
-		this.stopTransportClock(false);
 		this.patchState({ lastError: undefined });
 		for (const timer of this.testNoteTimers) clearTimeout(timer);
 		this.testNoteTimers.clear();
@@ -541,7 +539,6 @@ export class MidiService {
 				output.sendAllSoundOff?.(options);
 				output.sendAllNotesOff?.(options);
 				output.sendResetAllControllers?.(options);
-				output.sendStop?.();
 				if (!output.sendAllNotesOff && output.send) {
 					for (const channel of MIDI_CHANNELS) {
 						output.send([0xb0 + channel - 1, 120, 0]);
@@ -568,7 +565,7 @@ export class MidiService {
 
 	public destroy(): void {
 		this.cancelRecording();
-		this.stopTransportClock();
+		this.stopTransportClock(false);
 		this.stopExternalClockWatch();
 		this.panic();
 		this.detachInputListeners();
@@ -636,7 +633,10 @@ export class MidiService {
 		this.detachWebMidiListeners();
 		for (const eventName of MIDI_EVENT_NAMES) {
 			const handler = () => {
-				if (eventName === 'disconnected') this.panic();
+				if (eventName === 'disconnected') {
+					this.stopTransportClock(false);
+					this.panic();
+				}
 				this.refreshPorts();
 			};
 			webMidi.addListener(eventName, handler);

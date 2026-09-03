@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { extendNoteGridSourceRange, midiToNoteName, normalizeNoteGridSourceRanges, parseNoteGrid, snapMidiToNoteGrid, trimNoteGridSourceRange, updateNoteGridSource } from './note-grid';
+import { extendNoteGridSourceRange, midiToNoteName, parseNoteGrid, snapMidiToNoteGrid, trimNoteGridSourceRange, updateNoteGridSource } from './note-grid';
 import { updateTrackRange } from './source-mapper';
 
 const NOTE_SOURCE = `setcpm(120 / 4)
@@ -76,14 +76,14 @@ describe('note grid source mapping', () => {
 		expect(inner.ok).toBe(true);
 		if (inner.ok) expect(inner.grid.notes[0]?.durationCycles).toBe(1);
 		const innerResized = updateNoteGridSource(innerSource, 'trk_notes', { type: 'resize', slot: 0, durationCycles: 2 });
-		expect(innerResized).toContain('.dur("0.5 0.5 0.25 0.25").slow(4)');
+		expect(innerResized).toContain('.dur("0.5 0.5 0.25 0.25")');
 
 		const outerSource = NOTE_SOURCE.replace('note("c4 ~ eb4 g4")', 'seqPLoop([0, 4, note("c4 ~ eb4 g4")]).s("triangle").dur("1 1 1 1")').replace('.s("triangle")', '');
 		const outer = parseNoteGrid(outerSource, 'trk_notes');
 		expect(outer.ok).toBe(true);
 		if (outer.ok) expect(outer.grid.notes[0]?.durationCycles).toBe(1);
 		const outerResized = updateNoteGridSource(outerSource, 'trk_notes', { type: 'resize', slot: 0, durationCycles: 2 });
-		expect(outerResized).toContain('.slow(4)]).dur("2 1 1 1").s("triangle")');
+		expect(outerResized).toContain('seqPLoop([0, 4, note("c4 ~ eb4 g4")]).dur("2 1 1 1").s("triangle")');
 	});
 
 	test('maps scale-degree grids and snaps chromatic placement to the scale', () => {
@@ -109,8 +109,6 @@ describe('note grid source mapping', () => {
 		}
 
 		const source = NOTE_SOURCE.replace('note("c4 ~ eb4 g4")', 'seqPLoop([0, 4, note("c4 ~ eb4 g4")])');
-		const normalized = normalizeNoteGridSourceRanges(source);
-		expect(normalized).toContain('seqPLoop([0, 4, note("c4 ~ eb4 g4").slow(4)])');
 		const result = parseNoteGrid(source, 'trk_notes');
 		expect(result.ok).toBe(true);
 		if (result.ok) {
@@ -119,9 +117,9 @@ describe('note grid source mapping', () => {
 			expect(result.grid.notes[0]?.durationCycles).toBe(1);
 		}
 		const resized = updateNoteGridSource(source, 'trk_notes', { type: 'resize', slot: 0, durationCycles: 2 });
-		expect(resized).toContain('seqPLoop([0, 4, note("c4 ~ eb4 g4").dur("0.5 0.25 0.25 0.25").slow(4)]).s("triangle")');
+		expect(resized).toContain('seqPLoop([0, 4, note("c4 ~ eb4 g4").dur("0.5 0.25 0.25 0.25")]).s("triangle")');
 		const trimmed = updateNoteGridSource(source, 'trk_notes', { type: 'trim-start', slot: 0, startCycle: .5 });
-		expect(trimmed).toContain('note("[~ ~ c4 ~] ~ eb4 g4").dur("0.125 0.25 0.25 0.25").slow(4)');
+		expect(trimmed).toContain('note("[~ ~ c4 ~] ~ eb4 g4").dur("0.125 0.25 0.25 0.25")');
 		const trimmedResult = parseNoteGrid(trimmed, 'trk_notes');
 		expect(trimmedResult.ok).toBe(true);
 		if (trimmedResult.ok) {
@@ -130,16 +128,16 @@ describe('note grid source mapping', () => {
 		}
 
 		const extended6 = updateTrackRange(extendNoteGridSourceRange(source, 'trk_notes', 4, 6), 'trk_notes', 0, 6);
-		expect(extended6).toContain('seqPLoop([0, 6, note("c4 ~ eb4 g4 ~ ~").slow(6)])');
+		expect(extended6).toContain('seqPLoop([0, 6, note("c4 ~ eb4 g4 ~ ~")])');
 		const extended6Result = parseNoteGrid(extended6, 'trk_notes');
 		expect(extended6Result.ok).toBe(true);
 		if (extended6Result.ok) {
 			expect(extended6Result.grid.notes.map((note) => note.startCycle)).toEqual([0, 2, 3]);
 		}
 		const extended8From6 = updateTrackRange(extendNoteGridSourceRange(extended6, 'trk_notes', 6, 8), 'trk_notes', 0, 8);
-		expect(extended8From6).toContain('seqPLoop([0, 8, note("c4 ~ eb4 g4 ~ ~ ~ ~").slow(8)])');
+		expect(extended8From6).toContain('seqPLoop([0, 8, note("c4 ~ eb4 g4 ~ ~ ~ ~")])');
 		const extended = updateTrackRange(extendNoteGridSourceRange(source, 'trk_notes', 4, 8), 'trk_notes', 0, 8);
-		expect(extended).toContain('seqPLoop([0, 8, note("c4 ~ eb4 g4 ~ ~ ~ ~").slow(8)])');
+		expect(extended).toContain('seqPLoop([0, 8, note("c4 ~ eb4 g4 ~ ~ ~ ~")])');
 		const extendedResult = parseNoteGrid(extended, 'trk_notes');
 		expect(extendedResult.ok).toBe(true);
 		if (extendedResult.ok) {
@@ -161,20 +159,6 @@ describe('note grid source mapping', () => {
 			expect(movedRangeResult.grid.patternCycles).toBe(8);
 			expect(movedRangeResult.grid.notes.map((note) => note.startCycle)).toEqual([0, 2, 3]);
 		}
-
-		const legacyDuplicate = source.replace('seqPLoop([0, 4, note("c4 ~ eb4 g4")])', 'seqPLoop([0, 4, note("c4 ~ eb4 g4")], [4, 8, note("c4 ~ eb4 g4")])');
-		const repairedLegacy = normalizeNoteGridSourceRanges(legacyDuplicate);
-		expect(repairedLegacy).toContain('seqPLoop([0, 8, note("c4 ~ eb4 g4 ~ ~ ~ ~").slow(8)])');
-		const repairedLegacyGrid = parseNoteGrid(repairedLegacy, 'trk_notes');
-		expect(repairedLegacyGrid.ok && repairedLegacyGrid.grid.steps).toBe(8);
-		const zeroWidthLegacy = legacyDuplicate.replace('[4, 8, note', '[4, 4, note');
-		const repairedZeroWidth = normalizeNoteGridSourceRanges(zeroWidthLegacy);
-		expect(repairedZeroWidth).not.toContain('[4, 4');
-		expect(parseNoteGrid(repairedZeroWidth, 'trk_notes').ok).toBe(true);
-		const malformedRestTail = source.replace('seqPLoop([0, 4, note("c4 ~ eb4 g4")])', 'seqPLoop([0, 3.75, note("c4 ~ eb4 g4")], [3.75, 6, s("~")])');
-		const repairedRestTail = normalizeNoteGridSourceRanges(malformedRestTail);
-		expect(repairedRestTail).toContain('seqPLoop([0, 6, note("c4 ~ eb4 g4 ~ ~").slow(6)])');
-		expect(parseNoteGrid(repairedRestTail, 'trk_notes').ok).toBe(true);
 
 		const procedural = source.replace('note("c4 ~ eb4 g4")', 'note("<c4 eb4 g4>").fast(2)');
 		const preservedProcedural = extendNoteGridSourceRange(procedural, 'trk_notes', 4, 8);

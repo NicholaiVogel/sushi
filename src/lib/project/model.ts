@@ -67,6 +67,8 @@ export interface SourceBlockSummary {
 	type: 'drum' | 'synth' | 'sample' | 'midi' | 'unknown';
 	/** Instrument used for live MIDI input and newly accepted MIDI takes. */
 	instrument?: string;
+	/** Marks the narrowly-owned source region generated for MIDI recording. */
+	generated?: 'midi-recording';
 	line: number;
 }
 
@@ -109,7 +111,7 @@ export function createInitialProject(): ProjectDocumentV1 {
 }
 
 export function getSourceBlocks(source: string): SourceBlockSummary[] {
-	return getParsedSourceBlocks(source).map(({ id, name, type, instrument, line }) => ({ id, name, type, ...(instrument === undefined ? {} : { instrument }), line }));
+	return getParsedSourceBlocks(source).map(({ id, name, type, instrument, generated, line }) => ({ id, name, type, ...(instrument === undefined ? {} : { instrument }), ...(generated === undefined ? {} : { generated }), line }));
 }
 
 /**

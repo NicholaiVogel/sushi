@@ -38,7 +38,7 @@ import {
 	type TrackMidiRouteUpdate,
 } from '../lib/project/source-mapper';
 import type { TrackEffectMethod } from '../lib/strudel/track-effects';
-import { extendNoteGridSourceRange, midiToNoteName, normalizeNoteGridSourceRanges, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
+import { extendNoteGridSourceRange, midiToNoteName, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
 import type { EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
@@ -50,7 +50,7 @@ import type { WebMcpMutationResult, WebMcpRegistration } from '../lib/webmcp/too
 import { TransactionCache } from '../lib/webmcp/transaction-cache';
 import { COMPUTER_KEYBOARD_INPUT_ID, MidiService } from '../lib/midi/service';
 import type { MidiChannel, MidiClockSnapshot, MidiClockMode, MidiRecordedTake, MidiRecordingOptions, MidiRuntimeState } from '../lib/midi/types';
-import { writeMidiTakeToSource } from '../lib/midi/source-writer';
+import { MIDI_GENERATED_REGION_END, MIDI_GENERATED_REGION_START, writeMidiTakeToSource } from '../lib/midi/source-writer';
 import { StudioHeader } from './studio/StudioHeader';
 import { SourceEditor, CanvasDiagnostic, type StrudelCodeMirrorModule } from './studio/SourceEditor';
 import { Timeline } from './studio/Timeline';
@@ -512,14 +512,9 @@ export default function Studio() {
 			const isUntouchedLegacySeed = storedProject?.source.revision === 0
 				&& storedProject.source.draft === LEGACY_DEFAULT_SOURCE
 				&& storedProject.source.lastValid === LEGACY_DEFAULT_SOURCE;
-			const baseProject = !storedProject
+			const project = !storedProject
 				? fallbackProject
 				: isUntouchedLegacySeed ? { ...storedProject, source: fallbackProject.source } : storedProject;
-			const repairedDraft = normalizeNoteGridSourceRanges(baseProject.source.draft);
-			const repairedLastValid = normalizeNoteGridSourceRanges(baseProject.source.lastValid);
-			const project = repairedDraft === baseProject.source.draft && repairedLastValid === baseProject.source.lastValid
-				? baseProject
-				: { ...baseProject, source: { ...baseProject.source, draft: repairedDraft, lastValid: repairedLastValid } };
 			const activeRevision = !storedProject || isUntouchedLegacySeed
 				? fallbackProject.source.revision
 				: stored?.activeRevision ?? project.source.revision;
@@ -687,9 +682,6 @@ export default function Studio() {
 				if (options.expectedRevision !== undefined && current.revision !== options.expectedRevision) {
 					return { ok: false, changed: false, previousSource, source, revision: current.revision, conflict: { expectedRevision: options.expectedRevision, actualRevision: current.revision } };
 				}
-				// Normalize source-generated static note lanes before validation so the
-				// source sent to Strudel has the same bar spacing the timeline displays.
-				source = normalizeNoteGridSourceRanges(source);
 				const hasSourceDiagnostics = current.diagnostics.some((diagnostic) => diagnostic.phase !== 'audio');
 				if (source === current.lastValid && source === current.draft && !hasSourceDiagnostics) {
 					sourceHistoryRef.current.cursorSource = source;
@@ -846,10 +838,10 @@ export default function Studio() {
 			trackId = `trk_${randomUuid}`;
 		}
 		const marker = kind === 'midi'
-			? JSON.stringify({ id: trackId, name: 'MIDI Track', type: 'midi', instrument: 'sine', schema: 1 })
+			? JSON.stringify({ id: trackId, name: 'MIDI Track', type: 'midi', instrument: 'sine', generated: 'midi-recording', schema: 1 })
 			: JSON.stringify({ id: trackId, name: 'untitled', type: 'synth', schema: 1 });
 		const expression = kind === 'midi'
-			? '$: silence'
+			? `$: ${MIDI_GENERATED_REGION_START} silence ${MIDI_GENERATED_REGION_END}`
 			: '$: seqPLoop([0, 4, note("c3 e3 g3 a3").slow(4).s("sine").gain(0.18)])';
 		const nextSource = `${currentSource}\n\n// @sushi-track ${marker}\n${expression}\n`;
 		const result = await commitSource(nextSource, { expectedRevision: baseRevision });
@@ -1876,6 +1868,18 @@ export default function Studio() {
 		const current = studioRef.current;
 		if (expectedRevision !== undefined && expectedRevision !== current.revision) return { ok: false, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision, conflict: { expectedRevision, actualRevision: current.revision } };
 		if (!take) return { ok: false, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision, error: diagnosticFromError(current.revision, new Error('There is no MIDI take waiting for review.'), current.draft) };
+		if (!take.notes.length && !take.automation.length) {
+			service.acceptRecording();
+			const notice: SourceDiagnostic = {
+				revision: current.revision,
+				phase: 'audio',
+				severity: 'info',
+				code: 'MIDI_EMPTY_TAKE',
+				message: 'Nothing was recorded; the project source and revision were not changed.',
+			};
+			patchStudio({ diagnostics: [...current.diagnostics, notice], phase: current.phase === 'error' ? 'error' : 'ready' });
+			return { ok: true, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision };
+		}
 		const source = sourceForTrackMutation(current);
 		const midiSnapshot = service.getState();
 		const existingTrack = getSourceBlockDetails(source).find((track) => track.id === take.trackId);
@@ -1897,6 +1901,18 @@ export default function Studio() {
 			endCycle: Math.max(take.endedAtCycle, take.startedAtCycle + getSourceCycleStep(source)),
 		});
 		if (!written.ok) {
+			if (written.code === 'EMPTY_TAKE') {
+				service.acceptRecording();
+				const notice: SourceDiagnostic = {
+					revision: current.revision,
+					phase: 'audio',
+					severity: 'info',
+					code: 'MIDI_EMPTY_TAKE',
+					message: written.error,
+				};
+				patchStudio({ diagnostics: [...current.diagnostics, notice], phase: current.phase === 'error' ? 'error' : 'ready' });
+				return { ok: true, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision };
+			}
 			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(current.revision, new Error(written.error), 'commit', source)] });
 			return { ok: false, changed: false, previousSource: source, source, revision: current.revision, error: diagnosticFromError(current.revision, new Error(written.error), source) };
 		}
@@ -1938,7 +1954,7 @@ export default function Studio() {
 			if (!trackId) return;
 			const midi = service.getState();
 			const inputId = midi.enabled && midi.selectedInputId ? midi.selectedInputId : COMPUTER_KEYBOARD_INPUT_ID;
-			const armed = service.armRecording({ trackId, inputId, channel: midi.enabled ? midi.inputChannel : 1, mode: 'replace', quantize: '1/16', quantizeStrength: 1, swing: 0, countInBars: 0, loop: false, captureAutomation: true });
+			const armed = service.armRecording({ trackId, inputId, channel: midi.enabled ? midi.inputChannel : 1, mode: 'replace', quantize: '1/16', quantizeStrength: 1, swing: 0, countInBars: 0, loop: false, captureAutomation: false });
 			if (armed.recording.status === 'armed') await startMidiRecording();
 		})();
 	}, [createTrack, finishMidiRecording, startMidiRecording]);
