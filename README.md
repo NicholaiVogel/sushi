@@ -46,7 +46,9 @@ Open the live application in ChatGPT’s in-app browser, or in Chrome 149+ with 
 
 Ask the agent:
 
-> Open the current Sushi studio session. Inspect the current revision, list the available editor templates, load one, set the tempo to 128 BPM, validate the Strudel source, and start playback. Report the resulting revision and any diagnostics.
+```
+Open the current Sushi studio session. Inspect the current revision, list the available editor templates, load one, set the tempo to 128 BPM, validate the Strudel source, and start playback. Report the resulting revision and any diagnostics.
+```
 
 Expected result:
 
