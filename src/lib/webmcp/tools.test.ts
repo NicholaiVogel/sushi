@@ -272,6 +272,7 @@ describe('WebMCP tool adapter', () => {
 
 		const tools = createWebMcpTools(controller);
 
+		expect(tools.some((tool) => tool.name === 'open_studio_session')).toBe(true);
 		expect(tools.some((tool) => tool.name.startsWith('midi') || tool.name.includes('_midi'))).toBe(false);
 		expect(tools.some((tool) => tool.name === 'set_track_midi_route')).toBe(false);
 	});
