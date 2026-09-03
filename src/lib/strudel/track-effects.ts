@@ -294,7 +294,7 @@ const NON_EFFECT_METHODS = new Set([
 	'pan', 'color', 'colour', 'scale', 'add', 'sub', 'mul', 'div', 'fast', 'slow', 'early', 'late',
 	'struct', 'mask', 'degrade', 'sometimes', 'rarely', 'often', 'every', 'palindrome', 'rev',
 	'fit', 'accelerate', 'begin', 'end', 'loop', 'loopBegin', 'loopEnd', 'clip', 'legato', 'speed', 'stretch', 'unit', 'octaves',
-	'chunk', 'slice', 'segment', 'seqPLoop', 'arrange', 'stack', 'cat', 'silence', 'hush',
+	'chunk', 'slice', 'segment', 'seqPLoop', 'arrange', 'stack', 'cat', 'silence', 'hush', 'midi',
 	'_pianoroll', '_scope', '_spectrum', 'analyze', 'fft', 'label', 'activeLabel', 'orbit', 'bus',
 	'busgain', 'bgain', 'channel', 'channels', 'ch', 'midichan', 'midimap', 'midiport', 'midicmd',
 	'control', 'ccn', 'ccv', 'progNum', 'sysex', 'sysexid', 'sysexdata', 'midibend', 'miditouch',

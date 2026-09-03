@@ -64,7 +64,9 @@ export interface ProjectDocumentV1 {
 export interface SourceBlockSummary {
 	id: string;
 	name: string;
-	type: 'drum' | 'synth' | 'sample' | 'unknown';
+	type: 'drum' | 'synth' | 'sample' | 'midi' | 'unknown';
+	/** Instrument used for live MIDI input and newly accepted MIDI takes. */
+	instrument?: string;
 	line: number;
 }
 
@@ -107,7 +109,7 @@ export function createInitialProject(): ProjectDocumentV1 {
 }
 
 export function getSourceBlocks(source: string): SourceBlockSummary[] {
-	return getParsedSourceBlocks(source).map(({ id, name, type, line }) => ({ id, name, type, line }));
+	return getParsedSourceBlocks(source).map(({ id, name, type, instrument, line }) => ({ id, name, type, ...(instrument === undefined ? {} : { instrument }), line }));
 }
 
 /**

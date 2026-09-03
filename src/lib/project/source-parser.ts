@@ -21,6 +21,7 @@ interface MarkerMetadata {
 	id?: string;
 	name?: string;
 	type?: SourceBlockSummary['type'];
+	instrument?: string;
 }
 
 interface SourceLine {
@@ -70,10 +71,13 @@ function parseMarker(line: string): MarkerMetadata | undefined {
 		const record = value as Record<string, unknown>;
 		const id = typeof record.id === 'string' && record.id.trim() ? record.id : undefined;
 		const name = typeof record.name === 'string' && record.name.trim() ? record.name : undefined;
-		const type = record.type === 'drum' || record.type === 'synth' || record.type === 'sample' || record.type === 'unknown'
+		const type = record.type === 'drum' || record.type === 'synth' || record.type === 'sample' || record.type === 'midi' || record.type === 'unknown'
 			? record.type
 			: undefined;
-		return { ...(id ? { id } : {}), ...(name ? { name } : {}), ...(type ? { type } : {}) };
+		const instrument = typeof record.instrument === 'string' && record.instrument.trim() && !/[\r\n]/.test(record.instrument)
+			? record.instrument.trim()
+			: undefined;
+		return { ...(id ? { id } : {}), ...(name ? { name } : {}), ...(type ? { type } : {}), ...(instrument ? { instrument } : {}) };
 	} catch {
 		return undefined;
 	}
@@ -230,6 +234,7 @@ export function getParsedSourceBlocks(source: string): ParsedSourceBlock[] {
 				id: candidate.marker.id ?? generatedId(`unmanaged-${index + 1}`),
 				name: candidate.marker.name ?? `Source block ${index + 1}`,
 				type: candidate.marker.type ?? 'unknown',
+				...(candidate.marker.instrument ? { instrument: candidate.marker.instrument } : {}),
 				line: candidate.line.index + 1,
 				sourceRange,
 				...(candidate.marker.id ? { markerId: candidate.marker.id } : {}),

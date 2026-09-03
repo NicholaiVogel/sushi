@@ -4,6 +4,19 @@ import { extractStrudelSoundTokens, normalizeStrudelSoundToken } from './sounds'
 import soundfontDefinitions from '@strudel/soundfonts/gm.mjs';
 import { clearInterval as clearSchedulerInterval, setInterval as setSchedulerInterval } from 'worker-timers';
 
+export interface StrudelMidiModule {
+	WebMidi?: {
+		outputs?: Array<Record<string, any>>;
+		enabled?: boolean;
+		enable?: (...args: any[]) => unknown;
+		addListener?: (event: string, callback: (...args: any[]) => void) => unknown;
+	};
+	defaultmidimap?: (...args: any[]) => unknown;
+	midimaps?: (...args: any[]) => unknown;
+	midin?: (...args: any[]) => unknown;
+	midikeys?: (...args: any[]) => unknown;
+}
+
 interface StrudelModule {
 	initStrudel(options?: {
 		onEvalError?: (error: unknown) => void;
@@ -18,6 +31,12 @@ interface StrudelModule {
 	register?: (name: string, func: (...args: any[]) => unknown, patternify?: boolean) => unknown;
 	ref?: (accessor: () => unknown) => unknown;
 	Pattern?: { prototype: Record<string, unknown> };
+	/** Core exports used to trigger a live input note through the same Web Audio output. */
+	note?: (value: number) => StrudelPattern;
+	Hap?: new (whole: unknown, part: unknown, value: Record<string, unknown>, context?: Record<string, unknown>) => StrudelHap;
+	TimeSpan?: new (begin: number, end: number) => unknown;
+	getTriggerFunc?: () => ((hap: StrudelHap, deadline: number, duration: number, cps: number, time: number) => void | Promise<void>) | undefined;
+	webaudioOutput?: (hap: StrudelHap, deadline: number, duration: number, cps: number, time: number) => unknown | Promise<unknown>;
 	initAudio?: (options?: Record<string, unknown>) => Promise<void>;
 	hush?: () => void;
 	aliasBank?: (path: string) => Promise<void>;
@@ -37,7 +56,133 @@ interface StrudelModule {
 	releaseAudioNode?: (source: AudioNode) => void;
 }
 
+const NOTE_PITCHES: Record<string, number> = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+
+function midiNoteValue(value: unknown): number {
+	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	if (typeof value === 'string') {
+		const match = value.trim().match(/^([A-Ga-g])([#b]?)(-?\\d+)$/);
+		if (match) {
+			const pitch = NOTE_PITCHES[match[1].toUpperCase()] + (match[2] === '#' ? 1 : match[2] === 'b' ? -1 : 0);
+			const octave = Number(match[3]);
+			if (Number.isFinite(pitch) && Number.isFinite(octave)) return (octave + 1) * 12 + pitch;
+		}
+	}
+	return 60;
+}
+
+function midiFrequency(note: number): number {
+	return 440 * 2 ** ((note - 69) / 12);
+}
+
+function liveStopTime(context: AudioContext, when?: number): number {
+	const now = Number.isFinite(context.currentTime) ? context.currentTime : 0;
+	return Math.max(now, typeof when === 'number' && Number.isFinite(when) ? when : now);
+}
+
+function createLiveSynthVoice(module: StrudelModule, time: number, value: Record<string, any>, onended: () => void): LiveMidiAudioHandle {
+	const context = module.getAudioContext?.();
+	if (!context) throw new Error('The Strudel audio context is unavailable.');
+	const oscillator = context.createOscillator();
+	const gain = context.createGain();
+	const requestedWave = String(value.sushiLiveInstrument ?? value.s ?? 'sine').toLowerCase();
+	const wave = requestedWave === 'triangle' || requestedWave === 'square' || requestedWave === 'sawtooth' || requestedWave === 'sine' ? requestedWave : 'sine';
+	const note = midiNoteValue(value.note);
+	const velocity = Math.max(0.02, Math.min(1, Number.isFinite(Number(value.velocity)) ? Number(value.velocity) : 0.78));
+	const attack = 0.005;
+	const release = 0.025;
+	const duration = Math.max(1, Number.isFinite(Number(value.duration)) ? Number(value.duration) : LIVE_MIDI_NOTE_SAFETY_DURATION_SECONDS);
+	oscillator.type = wave;
+	oscillator.frequency.setValueAtTime(midiFrequency(Math.max(0, Math.min(127, note))), time);
+	gain.gain.setValueAtTime(0, time);
+	gain.gain.linearRampToValueAtTime(velocity, time + attack);
+	oscillator.connect(gain);
+	oscillator.start(time);
+	let ended = false;
+	let stopped = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const finish = () => {
+		if (ended) return;
+		ended = true;
+		if (timer !== undefined) clearTimeout(timer);
+		onended();
+	};
+	oscillator.addEventListener('ended', finish);
+	const stop = (when?: number) => {
+		if (stopped) return;
+		stopped = true;
+		if (timer !== undefined) clearTimeout(timer);
+		const stopAt = liveStopTime(context, when);
+		try {
+			const hold = (gain.gain as AudioParam & { cancelAndHoldAtTime?: (value: number) => void }).cancelAndHoldAtTime;
+			if (hold) hold.call(gain.gain, stopAt);
+			else {
+				gain.gain.cancelScheduledValues(stopAt);
+				gain.gain.setValueAtTime(velocity, stopAt);
+			}
+			gain.gain.linearRampToValueAtTime(0, stopAt + release);
+		} catch {
+			try { gain.gain.setValueAtTime(0, stopAt); } catch { /* best effort */ }
+		}
+		try { oscillator.stop(stopAt + release + 0.005); } catch { /* already stopped */ }
+	};
+	const autoStopMs = Math.max(1_000, (Math.max(0, time - context.currentTime) + duration + release) * 1_000);
+	timer = setTimeout(stop, autoStopMs);
+	return { node: gain, nodes: { source: [oscillator] }, stop };
+}
+
+async function createLiveSoundfontVoice(module: StrudelModule, fonts: readonly string[], time: number, value: Record<string, any>, onended: () => void): Promise<LiveMidiAudioHandle> {
+	if (!module.getAudioContext || !module.getSoundIndex || !module.onceEnded || !module.releaseAudioNode) throw new Error('The Strudel soundfont runtime is unavailable.');
+	const context = module.getAudioContext();
+	const fontIndex = module.getSoundIndex(value.n, fonts.length);
+	const font = fonts[fontIndex] ?? fonts[0];
+	if (!font) throw new Error('The selected soundfont is unavailable.');
+	const soundfontRuntime = await loadSoundfontRuntime();
+	const bufferSource = await soundfontRuntime.getFontBufferSource(font, value, context);
+	const envGain = context.createGain();
+	const node = bufferSource.connect(envGain) as GainNode;
+	const [attack, decay, sustain, release] = module.getADSRValues?.([value.attack, value.decay, value.sustain, value.release]) ?? [0.001, 0.05, 0.6, 0.01];
+	const duration = Math.max(1, Number.isFinite(Number(value.duration)) ? Number(value.duration) : LIVE_MIDI_NOTE_SAFETY_DURATION_SECONDS);
+	bufferSource.start(time);
+	const holdEnd = time + duration;
+	module.getParamADSR?.(node.gain, attack, decay, sustain, release, 0, 0.3, time, holdEnd, 'linear');
+	const vibratoHandle = module.getVibratoOscillator?.(bufferSource.detune, value, time);
+	module.getPitchEnvelope?.(bufferSource.detune, value, time, holdEnd);
+	let ended = false;
+	let stopped = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const finish = () => {
+		if (ended) return;
+		ended = true;
+		if (timer !== undefined) clearTimeout(timer);
+		module.releaseAudioNode?.(bufferSource);
+		vibratoHandle?.stop?.();
+		onended();
+	};
+	module.onceEnded(bufferSource, finish);
+	const stop = (when?: number) => {
+		if (stopped) return;
+		stopped = true;
+		if (timer !== undefined) clearTimeout(timer);
+		const stopAt = liveStopTime(context, when);
+		try {
+			const hold = (node.gain as AudioParam & { cancelAndHoldAtTime?: (value: number) => void }).cancelAndHoldAtTime;
+			if (hold) hold.call(node.gain, stopAt);
+			else {
+				node.gain.cancelScheduledValues(stopAt);
+				node.gain.setValueAtTime(0, stopAt);
+			}
+			node.gain.linearRampToValueAtTime(0, stopAt + 0.025);
+		} catch { /* best effort */ }
+		try { bufferSource.stop(stopAt + 0.03); } catch { /* already stopped */ }
+	};
+	const autoStopMs = Math.max(1_000, (Math.max(0, time - context.currentTime) + duration + 0.05) * 1_000);
+	timer = setTimeout(stop, autoStopMs);
+	return { node, nodes: { source: [bufferSource], ...vibratoHandle?.nodes }, stop };
+}
+
 type StrudelModuleLoader = () => Promise<StrudelModule>;
+export type StrudelMidiModuleLoader = () => Promise<StrudelMidiModule | undefined>;
 
 interface SoundfontDefinition {
 	[name: string]: string[];
@@ -45,6 +190,18 @@ interface SoundfontDefinition {
 
 interface SoundfontRuntime {
 	getFontBufferSource: (name: string, value: Record<string, any>, audioContext: AudioContext) => Promise<AudioBufferSourceNode>;
+}
+
+interface LiveMidiAudioHandle {
+	node: AudioNode;
+	stop?: (when?: number) => unknown;
+	nodes?: Record<string, unknown>;
+}
+
+interface VisualTransportClock {
+	originSeconds: number;
+	originCycle: number;
+	cps: number;
 }
 
 export interface StrudelHap {
@@ -112,6 +269,12 @@ const SCHEDULER_START_TOLERANCE_CYCLES = 1;
 // first couple of cycles cover the assets needed to get playback started; later
 // events can continue loading through Strudel's normal lazy path.
 const PRELOAD_LOOKAHEAD_CYCLES = 2;
+const NOTE_PREVIEW_CYCLES = 0.18;
+const NOTE_PREVIEW_EXTRA_MS = 90;
+const LIVE_MIDI_NOTE_DURATION_MS = 650;
+const LIVE_MIDI_NOTE_LEAD_SECONDS = 0.008;
+const LIVE_MIDI_RELEASE_LEAD_SECONDS = 0.012;
+const LIVE_MIDI_NOTE_SAFETY_DURATION_SECONDS = 10;
 
 const soundCallPattern = /(?:^|[.\s])(?:s|sound)\s*\(\s*(['"`])([\s\S]*?)\1\s*\)/g;
 const directSoundPattern = /\(\s*(['"`])([\s\S]*?)\1\s*\)\s*\.note\s*\(/g;
@@ -119,6 +282,13 @@ const sourceNotePattern = /\b[A-Ga-g](?:#|b)?(?:-?\d+)\b/g;
 
 function unescapeSourceLiteral(value: string): string {
 	return value.replace(/\\([\\'"`])/g, '$1');
+}
+
+function previewSource(source: string, note: string, sound: string): string {
+	const tempo = source.match(/\bsetcpm\s*\([^\n\r]*\)/)?.[0] ?? 'setcpm(150 / 4)';
+	const safeNote = note.trim();
+	const safeSound = /^[A-Za-z][A-Za-z0-9_:-]*$/.test(sound.trim()) ? sound.trim() : 'sine';
+	return `${tempo}\n$: note(${JSON.stringify(safeNote)}).s(${JSON.stringify(safeSound)}).gain(.55).attack(.002).decay(.08).sustain(0).release(.12).dur(${NOTE_PREVIEW_CYCLES})`;
 }
 
 /**
@@ -296,6 +466,64 @@ function visualizerPatternIds(source: string): Map<string, string> {
 
 let soundfontRuntimePromise: Promise<SoundfontRuntime> | undefined;
 
+const patchedMidiWebMidi = new WeakSet<object>();
+const guardedMidiWebMidi = new WeakSet<object>();
+
+function guardMidiPermissionRequest(midi: StrudelMidiModule): void {
+	const webMidi = midi.WebMidi as (NonNullable<StrudelMidiModule['WebMidi']> & { __sushiMidiAllowEnable?: boolean }) | undefined;
+	if (!webMidi || typeof webMidi !== 'object' || typeof webMidi.enable !== 'function' || guardedMidiWebMidi.has(webMidi)) return;
+	const originalEnable = webMidi.enable;
+	webMidi.enable = function (...args: any[]) {
+		if (webMidi.enabled === true || webMidi.__sushiMidiAllowEnable === true) {
+			webMidi.__sushiMidiAllowEnable = false;
+			return originalEnable.apply(webMidi, args);
+		}
+		// @strudel/midi's helper currently requests SysEx from inside Pattern.midi.
+		// Resolve that helper without opening a permission prompt; the explicit
+		// Connect MIDI button sets the one-shot allow flag before enabling WebMidi.
+		const callback = typeof args[0] === 'function' ? args[0] as (...callbackArgs: any[]) => void : undefined;
+		if (callback) queueMicrotask(() => callback());
+		return Promise.resolve();
+	};
+	guardedMidiWebMidi.add(webMidi);
+}
+
+function patchMidiOutputCompatibility(midi: StrudelMidiModule): void {
+	const webMidi = midi.WebMidi;
+	if (!webMidi || typeof webMidi !== 'object') return;
+	guardMidiPermissionRequest(midi);
+	const patchOutputs = () => {
+		for (const output of webMidi.outputs ?? []) {
+			if (typeof output.sendNRPN === 'function' || typeof output.sendNrpnValue !== 'function') continue;
+			output.sendNRPN = function (nrpnn: unknown, nrpv: unknown, midichan: unknown) {
+				return output.sendNrpnValue?.(nrpnn, nrpv, { channels: midichan });
+			};
+		}
+	};
+	patchOutputs();
+	if (patchedMidiWebMidi.has(webMidi)) return;
+	patchedMidiWebMidi.add(webMidi);
+	webMidi.addListener?.('connected', patchOutputs);
+	webMidi.addListener?.('portschanged', patchOutputs);
+}
+
+function registerSushiMidi(module: StrudelModule, midi: StrudelMidiModule): void {
+	patchMidiOutputCompatibility(midi);
+	// @strudel/midi patches the shared @strudel/core Pattern prototype as soon as
+	// it loads. These top-level helpers still need to be added to the exact
+	// evalScope owned by @strudel/web, otherwise `midin(...)` and `midikeys(...)`
+	// work in the package but are invisible to Sushi source.
+	for (const [name, func] of Object.entries({
+		defaultmidimap: midi.defaultmidimap,
+		midimaps: midi.midimaps,
+		midin: midi.midin,
+		midikeys: midi.midikeys,
+	})) {
+		if (typeof func !== 'function') continue;
+		module.register?.(name, func, false);
+	}
+}
+
 function loadSoundfontRuntime(): Promise<SoundfontRuntime> {
 	if (!soundfontRuntimePromise) soundfontRuntimePromise = import('@strudel/soundfonts') as Promise<SoundfontRuntime>;
 	return soundfontRuntimePromise;
@@ -371,8 +599,20 @@ async function registerSoundfontsOnModule(module: StrudelModule): Promise<void> 
 			const context = module.getAudioContext?.();
 			if (!context || !font) throw new Error(`Could not load soundfont ${name}`);
 
-			const soundfontRuntime = await loadSoundfontRuntime();
-			const bufferSource = await soundfontRuntime.getFontBufferSource(font, value, context);
+			let soundfontRuntime: SoundfontRuntime;
+			try {
+				soundfontRuntime = await loadSoundfontRuntime();
+			} catch (error) {
+				reportAudioAssetIssue(`soundfont ${name}`, error);
+				return createLiveSynthVoice(module, time, { ...value, sushiLiveInstrument: 'sine' }, onended);
+			}
+			let bufferSource: AudioBufferSourceNode;
+			try {
+				bufferSource = await soundfontRuntime.getFontBufferSource(font, value, context);
+			} catch (error) {
+				reportAudioAssetIssue(`soundfont ${name}`, error);
+				return createLiveSynthVoice(module, time, { ...value, sushiLiveInstrument: 'sine' }, onended);
+			}
 			bufferSource.start(time);
 			const envGain = context.createGain();
 			const node = bufferSource.connect(envGain) as GainNode;
@@ -466,6 +706,7 @@ function isAudioPolicyError(error: unknown): boolean {
 export class StrudelAdapter {
 	private destroyed = false;
 	private module: StrudelModule | undefined;
+	private midiModule: StrudelMidiModule | undefined;
 	private repl: StrudelRepl | undefined;
 	private activePattern: StrudelPattern | undefined;
 	private activeSource = '';
@@ -476,11 +717,19 @@ export class StrudelAdapter {
 	private audioInitPromise: Promise<void> | undefined;
 	private sampleBankPromise: Promise<void> | undefined;
 	private initPromise: Promise<void> | undefined;
+	private midiLoadPromise: Promise<StrudelMidiModule | undefined> | undefined;
 	private evaluationQueue: Promise<void> = Promise.resolve();
 	private activeEvaluation: { error: unknown } | undefined;
 	private cycleTimer: ReturnType<typeof setInterval> | undefined;
 	private songEndCycle: number | undefined;
+	private visualTransportClock: VisualTransportClock | undefined;
 	private pendingSchedulerStart: { cycle: number; expiresAt: number } | undefined;
+	private readonly liveMidiNoteGenerations = new Map<string, number>();
+	private readonly liveMidiNoteHandles = new Map<string, LiveMidiAudioHandle>();
+	private readonly liveMidiNoteVoiceIds = new Map<string, string>();
+	private readonly liveMidiVoiceHandles = new Map<string, LiveMidiAudioHandle>();
+	private readonly liveMidiSoundModules = new WeakSet<object>();
+	private liveMidiVoiceCounter = 0;
 	private runtime: AdapterRuntimeUpdate = {
 		audioState: 'initializing',
 		transport: 'stopped',
@@ -491,7 +740,60 @@ export class StrudelAdapter {
 		private readonly onRuntimeUpdate?: (update: AdapterRuntimeUpdate) => void,
 		private readonly loadModule: StrudelModuleLoader = async () => (await import('@strudel/web/web.mjs')) as unknown as StrudelModule,
 		private readonly onEvaluation?: (update: StrudelEvaluationUpdate) => void,
+		private readonly loadMidiExtension: StrudelMidiModuleLoader = async () => {
+			if (typeof navigator === 'undefined' || typeof navigator.requestMIDIAccess !== 'function') return undefined;
+			return import('@strudel/midi').then((module) => module as unknown as StrudelMidiModule);
+		},
 	) {}
+
+	private loadMidiModule(): Promise<StrudelMidiModule | undefined> {
+		if (!this.midiLoadPromise) {
+			this.midiLoadPromise = this.loadMidiExtension().catch((error) => {
+				console.warn('[sushi] MIDI support could not be loaded; audio playback remains available.', error);
+				return undefined;
+			});
+		}
+		return this.midiLoadPromise;
+	}
+
+	public getMidiModule(): StrudelMidiModule | undefined {
+		return this.midiModule;
+	}
+
+	/**
+	 * Register a private Strudel sound for live input. `webaudioOutput()` does
+	 * not return superdough's internal voice handle, so the private sound keeps
+	 * its own handle registry while still flowing through Strudel's normal
+	 * WebAudio output/effects path.
+	 */
+	private registerLiveMidiSounds(module: StrudelModule): void {
+		if (!module.registerSound || !module.getAudioContext || this.liveMidiSoundModules.has(module as object)) return;
+		this.liveMidiSoundModules.add(module as object);
+		const registerVoice = (value: Record<string, any>, handle: LiveMidiAudioHandle): LiveMidiAudioHandle => {
+			const voiceId = typeof value.sushiLiveVoiceId === 'string' ? value.sushiLiveVoiceId : undefined;
+			if (voiceId) this.liveMidiVoiceHandles.set(voiceId, handle);
+			return handle;
+		};
+		const finishVoice = (value: Record<string, any>, onended: () => void) => () => {
+			const voiceId = typeof value.sushiLiveVoiceId === 'string' ? value.sushiLiveVoiceId : undefined;
+			if (voiceId) this.liveMidiVoiceHandles.delete(voiceId);
+			onended();
+		};
+		module.registerSound('sushi_live_synth', async (time, value, onended) => registerVoice(value, createLiveSynthVoice(module, time, value, finishVoice(value, onended))), { type: 'synth', prebake: true });
+		module.registerSound('sushi_live_soundfont', async (time, value, onended) => {
+			const instrument = String(value.sushiLiveInstrument ?? 'gm_acoustic_grand_piano');
+			const fonts = (soundfontDefinitions as SoundfontDefinition)[instrument];
+			try {
+				if (!fonts) throw new Error(`Unknown soundfont ${instrument}`);
+				return registerVoice(value, await createLiveSoundfontVoice(module, fonts, time, value, finishVoice(value, onended)));
+			} catch (error) {
+				// A missing/blocked soundfont should still produce a stoppable live
+				// note instead of leaving the user with a hanging or silent voice.
+				reportAudioAssetIssue(`live soundfont ${instrument}`, error);
+				return registerVoice(value, createLiveSynthVoice(module, time, { ...value, sushiLiveInstrument: 'sine' }, finishVoice(value, onended)));
+			}
+		}, { type: 'synth', prebake: true });
+	}
 
 	public async init(): Promise<void> {
 		if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
@@ -507,6 +809,11 @@ export class StrudelAdapter {
 
 			const module = await this.loadModule();
 			if (this.destroyed) throw new Error('The Strudel runtime has been destroyed.');
+			// MIDI is an optional browser-only extension. Import it here, after the
+			// Strudel web entry is requested, so Astro never evaluates Web MIDI during
+			// SSR/build. The package is cached by the module loader, which lets
+			// MidiService use the exact same WebMidi singleton later.
+			this.midiModule = await this.loadMidiModule();
 			// The editor package owns the official widget methods and transpiler
 			// registrations. Load the package entry (the same module imported by the
 			// React editor) before the runtime's prebake so production bundlers keep
@@ -548,11 +855,13 @@ export class StrudelAdapter {
 				clearInterval: clearSchedulerInterval,
 				prebake: async () => {
 					registerSushiCompatibility(module, this.sliderValues);
+					if (this.midiModule) registerSushiMidi(module, this.midiModule);
 					// @strudel/web only registers oscillator synths by default. Strudel.cc
 					// adds its GM soundfonts and the sample collections below before
 					// evaluating user code, so ordinary Strudel snippets resolve the same
 					// sounds in Sushi instead of silently dropping unsupported layers.
 					await registerSoundfontsOnModule(module);
+					this.registerLiveMidiSounds(module);
 					// Fetching the optional sample maps during init made a CORS/CDN or
 					// decoder failure look like a source-evaluation failure and prevented
 					// Firefox from reaching the first user-gesture Play. Start the work in
@@ -573,7 +882,12 @@ export class StrudelAdapter {
 					if (this.activeEvaluation) this.activeEvaluation.error = error;
 				},
 				onToggle: (started) => {
-					if (!started) this.pendingSchedulerStart = undefined;
+					if (started) this.startVisualTransportClock(this.pendingSchedulerStart?.cycle ?? this.runtime.currentCycle ?? 0);
+					else {
+						this.pendingSchedulerStart = undefined;
+						this.notifyMidiStop();
+						this.stopVisualTransportClock();
+					}
 					this.setRuntime({
 						transport: started ? 'playing' : 'stopped',
 						audioState: started ? 'ready' : this.runtime.audioState,
@@ -582,7 +896,7 @@ export class StrudelAdapter {
 					if (started) {
 						// The object above is evaluated while the previous transport state
 						// is still visible, so take one more sample after marking the
-						// transport as playing. This lets a pending SharedWorker reset
+						// transport as playing. This lets a newly started scheduler
 						// acknowledge itself immediately when the cursor is already near
 						// the requested start cycle.
 						this.setRuntime({ currentCycle: this.readCurrentCycle() });
@@ -592,9 +906,11 @@ export class StrudelAdapter {
 					}
 				},
 			});
-			// Keep editor-only Strudel helpers available after initialization too;
+			// Keep editor-only and MIDI helpers available after initialization too;
 			// this is idempotent when the prebake hook already installed them.
 			registerSushiCompatibility(module, this.sliderValues);
+			if (this.midiModule) registerSushiMidi(module, this.midiModule);
+			this.registerLiveMidiSounds(module);
 			if (this.destroyed) {
 				try {
 					this.repl.stop();
@@ -614,6 +930,7 @@ export class StrudelAdapter {
 			const module = this.module;
 			this.repl = undefined;
 			this.module = undefined;
+			this.midiModule = undefined;
 			this.activePattern = undefined;
 			this.activeSource = '';
 			this.sliderValues.clear();
@@ -624,6 +941,7 @@ export class StrudelAdapter {
 			this.sampleBankPromise = undefined;
 			this.activeEvaluation = undefined;
 			this.stopCycleTimer();
+			this.stopVisualTransportClock();
 			try {
 				repl?.stop();
 				module?.hush?.();
@@ -666,6 +984,153 @@ export class StrudelAdapter {
 	}
 
 	/**
+	 * Audition one note through the same Strudel REPL used by the accepted song.
+	 * The temporary pattern is never promoted to project source; the accepted
+	 * source and transport position are restored before this operation resolves.
+	 */
+	public async previewNote(note: string, sound = 'sine'): Promise<AdapterResult> {
+		return this.enqueueSerialized(async () => {
+			try {
+				return await this.previewNoteNow(note, sound);
+			} catch (error) {
+				return { ok: false, error };
+			}
+		});
+	}
+
+	/** Unlock the shared Strudel Web Audio context from a visible user action. */
+	public async unlockAudio(): Promise<AdapterResult> {
+		try {
+			await this.init();
+			await this.initializeAudio();
+			await this.ensureAudioContextRunning();
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, error: isAudioLockedError(error) ? error : new AudioLockedError() };
+		}
+	}
+
+	/**
+	 * Trigger one incoming MIDI note through the same Strudel/Web Audio trigger
+	 * used by the scheduler. This is intentionally not a second oscillator or
+	 * scheduler: it creates a short live hap and hands it to the runtime's
+	 * existing trigger function, while the recorder keeps the exact note-off
+	 * duration for the eventual source commit.
+	 */
+	public async triggerLiveMidiNote(note: number, velocity: number, sound = 'sine', durationMs = LIVE_MIDI_NOTE_DURATION_MS, channel = 1): Promise<AdapterResult> {
+		try {
+			if (!Number.isInteger(note) || note < 0 || note > 127) return { ok: false, error: new Error('Live MIDI note must be an integer from 0 to 127.') };
+			await this.init();
+			await this.initializeAudio();
+			await this.ensureAudioContextRunning();
+			const module = this.module;
+			const repl = this.repl;
+			const context = module?.getAudioContext?.();
+			const trigger = module?.getTriggerFunc?.();
+			const Hap = module?.Hap;
+			const TimeSpan = module?.TimeSpan;
+			const cps = repl?.scheduler?.cps;
+			if (!module || !context || !Hap || !TimeSpan || (!module.webaudioOutput && !trigger) || typeof cps !== 'number' || !Number.isFinite(cps) || cps <= 0) return { ok: false, error: new Error('The Strudel live MIDI audio trigger is not ready.') };
+			const safeSound = /^[A-Za-z][A-Za-z0-9_:-]*$/.test(sound.trim()) ? sound.trim() : 'sine';
+			const safeVelocity = Math.max(0, Math.min(1, Number.isFinite(velocity) ? velocity : 0));
+			const key = `${channel}:${note}`;
+			this.releaseLiveMidiNote(note, channel);
+			const generation = (this.liveMidiNoteGenerations.get(key) ?? 0) + 1;
+			this.liveMidiNoteGenerations.set(key, generation);
+			const managedLiveSound = this.liveMidiSoundModules.has(module as object);
+			const voiceId = `sushi-live-voice-${++this.liveMidiVoiceCounter}`;
+			if (managedLiveSound) this.liveMidiNoteVoiceIds.set(key, voiceId);
+			const liveSound = managedLiveSound
+				? /^gm_[A-Za-z0-9_:-]+$/i.test(safeSound) ? 'sushi_live_soundfont' : 'sushi_live_synth'
+				: safeSound;
+			const durationSeconds = module.webaudioOutput && managedLiveSound
+				? LIVE_MIDI_NOTE_SAFETY_DURATION_SECONDS
+				: Math.max(0.05, Math.min(10, Number.isFinite(durationMs) ? durationMs / 1000 : LIVE_MIDI_NOTE_DURATION_MS / 1000));
+			const durationCycles = Math.max(1 / 4096, durationSeconds * cps);
+			const span = new TimeSpan(0, durationCycles);
+			const hap = new Hap(span, span, {
+				note,
+				s: liveSound,
+				velocity: safeVelocity,
+				attack: 0.005,
+				release: 0.12,
+				...(managedLiveSound ? { sushiLiveVoiceId: voiceId, sushiLiveInstrument: safeSound } : {}),
+			}, {});
+			const targetTime = context.currentTime + LIVE_MIDI_NOTE_LEAD_SECONDS;
+			if (module.webaudioOutput) {
+				const handle = await module.webaudioOutput(hap, LIVE_MIDI_NOTE_LEAD_SECONDS, durationSeconds, cps, targetTime) as LiveMidiAudioHandle | undefined;
+				if (managedLiveSound) {
+					if (this.liveMidiNoteGenerations.get(key) !== generation) this.stopLiveMidiVoice(voiceId);
+					else if (!this.liveMidiVoiceHandles.has(voiceId) && handle) this.liveMidiVoiceHandles.set(voiceId, handle);
+				} else if (this.liveMidiNoteGenerations.get(key) !== generation) {
+					this.stopLiveMidiHandle(handle);
+				} else if (handle) {
+					this.liveMidiNoteHandles.set(key, handle);
+				}
+			} else if (trigger) {
+				await trigger(hap, LIVE_MIDI_NOTE_LEAD_SECONDS, durationSeconds, cps, targetTime);
+			}
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, error };
+		}
+	}
+
+	/** Stop one sustained live input note without touching the transport. */
+	public releaseLiveMidiNote(note: number, channel = 1): void {
+		const key = `${channel}:${note}`;
+		this.liveMidiNoteGenerations.set(key, (this.liveMidiNoteGenerations.get(key) ?? 0) + 1);
+		const handle = this.liveMidiNoteHandles.get(key);
+		this.liveMidiNoteHandles.delete(key);
+		const voiceId = this.liveMidiNoteVoiceIds.get(key);
+		this.liveMidiNoteVoiceIds.delete(key);
+		if (voiceId) this.stopLiveMidiVoice(voiceId);
+		this.stopLiveMidiHandle(handle);
+	}
+
+	private stopLiveMidiVoice(voiceId: string): void {
+		const handle = this.liveMidiVoiceHandles.get(voiceId);
+		this.liveMidiVoiceHandles.delete(voiceId);
+		this.stopLiveMidiHandle(handle);
+	}
+
+	private stopLiveMidiHandle(handle: LiveMidiAudioHandle | undefined): void {
+		const now = this.module?.getAudioContext?.()?.currentTime;
+		const stopAt = typeof now === 'number' && Number.isFinite(now) ? now + LIVE_MIDI_RELEASE_LEAD_SECONDS : undefined;
+		if (handle?.stop) {
+			try {
+				handle.stop(stopAt);
+			} catch {
+				// Some reduced/test runtimes expose a zero-argument stop callback.
+				try { handle.stop(); } catch { /* audio teardown is best effort */ }
+			}
+		}
+		// The soundfont adapter (and some older Strudel outputs) exposes a
+		// no-op handle.stop but still returns the real AudioBufferSourceNode in
+		// `nodes.source`. Stop those nodes directly as a final release guarantee.
+		const sources = (handle as { nodes?: Record<string, unknown> } | undefined)?.nodes?.source;
+		const sourceNodes = Array.isArray(sources) ? sources : sources ? [sources] : [];
+		for (const source of sourceNodes) {
+			if (!source || typeof (source as { stop?: unknown }).stop !== 'function') continue;
+			try { (source as { stop: (when?: number) => unknown }).stop(stopAt); } catch { /* already stopped or not stoppable */ }
+		}
+	}
+
+	/** Panic all notes currently being auditioned by the local live monitor. */
+	public releaseAllLiveMidiNotes(): void {
+		const keys = new Set([...this.liveMidiNoteGenerations.keys(), ...this.liveMidiNoteHandles.keys(), ...this.liveMidiNoteVoiceIds.keys()]);
+		for (const key of keys) {
+			const [channelText, noteText] = key.split(':');
+			this.releaseLiveMidiNote(Number(noteText), Number(channelText));
+		}
+		for (const voiceId of this.liveMidiVoiceHandles.keys()) this.stopLiveMidiVoice(voiceId);
+		this.liveMidiNoteHandles.clear();
+		this.liveMidiNoteVoiceIds.clear();
+		this.liveMidiVoiceHandles.clear();
+		this.liveMidiNoteGenerations.clear();
+	}
+
+	/**
 	 * Serialize every operation that can touch the REPL, not only source
 	 * evaluation. A transport request arriving while a candidate is evaluating
 	 * must wait for that evaluation (and its restore path) to finish; otherwise
@@ -676,6 +1141,96 @@ export class StrudelAdapter {
 		const queued = this.evaluationQueue.then(operation);
 		this.evaluationQueue = queued.then(() => undefined, () => undefined);
 		return queued;
+	}
+
+	private async restorePreviewTransport(transport: TransportState, cycle: number): Promise<AdapterResult> {
+		const repl = this.repl;
+		if (!repl) return { ok: false, error: new Error('Strudel did not return a browser REPL.') };
+		try {
+			this.setSchedulerCycle(cycle);
+			if (transport === 'playing') {
+				this.armSchedulerStart(cycle);
+				await repl.start();
+				this.startCycleTimer();
+			} else if (transport === 'paused') {
+				repl.pause();
+			} else {
+				repl.stop();
+				this.notifyMidiStop();
+				this.module?.hush?.();
+				this.stopCycleTimer();
+			}
+		} catch (error) {
+			this.stopAfterRestoreFailure();
+			return { ok: false, error: new Error(`Strudel restored the source but could not restore transport after note preview: ${this.describeError(error)}`) };
+		}
+		this.setRuntime({ transport, currentCycle: cycle });
+		return { ok: true };
+	}
+
+	private async previewNoteNow(note: string, sound: string): Promise<AdapterResult> {
+		await this.init();
+		if (this.destroyed) return { ok: false, error: this.destroyedError() };
+		const repl = this.repl;
+		const module = this.module;
+		const acceptedSource = this.activeSource;
+		if (!repl || !module || !acceptedSource) return { ok: false, error: new Error('The accepted Strudel source is not ready for note preview.') };
+		if (!note.trim()) return { ok: false, error: new Error('A note is required for preview.') };
+
+		const previousTransport = this.runtime.transport ?? 'stopped';
+		const previousCycle = this.runtime.currentCycle ?? 0;
+		const restoreCycle = previousTransport === 'playing' ? await this.waitForNextCycleBoundary() : previousCycle;
+		const candidate = previewSource(acceptedSource, note, sound);
+		const evaluated = await this.evaluateRaw(candidate, false);
+		if (!evaluated.ok) {
+			const restored = await this.evaluateRaw(acceptedSource, false);
+			if (!restored.ok) {
+				this.stopAfterRestoreFailure();
+				return evaluated;
+			}
+			const restoredTransport = await this.restorePreviewTransport(previousTransport, previousTransport === 'stopped' ? previousCycle : restoreCycle);
+			return restoredTransport.ok ? evaluated : restoredTransport;
+		}
+
+		let previewStarted = false;
+		let previewError: unknown;
+		try {
+			this.setSchedulerCycle(0);
+			await this.preloadActivePattern();
+			this.armSchedulerStart(0);
+			previewStarted = true;
+			await repl.start();
+			const cps = typeof repl.scheduler.cps === 'number' && Number.isFinite(repl.scheduler.cps) && repl.scheduler.cps > 0
+				? repl.scheduler.cps
+				: 0.5;
+			await new Promise<void>((resolve) => setTimeout(resolve, NOTE_PREVIEW_CYCLES / cps * 1000 + NOTE_PREVIEW_EXTRA_MS));
+		} catch (error) {
+			previewError = error;
+		} finally {
+			if (previewStarted) {
+				try {
+					repl.stop();
+				} catch {
+					// Preview cleanup is best-effort; the accepted source is restored below.
+				}
+				try {
+					module.hush?.();
+				} catch {
+					// Hushing is best-effort during a short audition.
+				}
+			}
+			this.stopCycleTimer();
+		}
+
+		const restored = await this.evaluateRaw(acceptedSource, false);
+		if (!restored.ok) {
+			this.stopAfterRestoreFailure();
+			return { ok: false, error: new Error(`Strudel could not restore the accepted source after note preview: ${this.describeError(restored.error)}`) };
+		}
+
+		const restoredTransport = await this.restorePreviewTransport(previousTransport, previousTransport === 'stopped' ? previousCycle : restoreCycle);
+		if (!restoredTransport.ok) return restoredTransport;
+		return previewError ? { ok: false, error: previewError } : { ok: true };
 	}
 
 	private async evaluateSourceNow(
@@ -691,6 +1246,7 @@ export class StrudelAdapter {
 		const pausedCycle = this.runtime.currentCycle ?? 0;
 		const boundaryCycle = wasPlaying ? await this.waitForNextCycleBoundary() : pausedCycle;
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
+		if (wasPlaying || wasPaused) this.notifyMidiStop();
 		const result = await this.evaluateRaw(source, options.autoplay ?? false);
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 		// The caller normally supplies the accepted source explicitly, but keeping
@@ -738,6 +1294,7 @@ export class StrudelAdapter {
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 		const previousTransport = this.runtime.transport ?? 'stopped';
 		const previousCycle = this.runtime.currentCycle ?? 0;
+		if (previousTransport === 'playing' || previousTransport === 'paused') this.notifyMidiStop();
 		const result = await this.evaluateRaw(source, false);
 		if (this.destroyed) return { ok: false, error: this.destroyedError() };
 
@@ -777,7 +1334,17 @@ export class StrudelAdapter {
 				throw new Error('Strudel did not return a browser REPL.');
 			}
 
-			let pattern = await this.repl.evaluate(source, autoplay);
+			let pattern: unknown;
+			try {
+				pattern = await this.repl.evaluate(source, autoplay);
+			} catch (error) {
+				if (!isHeaderOnlyAstError(error)) return { ok: false, error };
+				// Some Strudel builds report a header-only source by rejecting the
+				// evaluate promise instead of invoking onEvalError. Retry with runtime
+				// silence in that case, without adding silence to canonical source.
+				currentEvaluation.error = undefined;
+				pattern = await this.repl.evaluate(appendRuntimeSilence(source), autoplay);
+			}
 			if (this.destroyed) return { ok: false, error: this.destroyedError() };
 			if (currentEvaluation.error && isHeaderOnlyAstError(currentEvaluation.error)) {
 				// A source document may intentionally contain only Sushi's global
@@ -812,6 +1379,19 @@ export class StrudelAdapter {
 		return error instanceof Error ? error.message : String(error);
 	}
 
+	/** Notify the MIDI extension whenever Strudel tears down the active pattern. */
+	private notifyMidiStop(): void {
+		if (typeof window === 'undefined' || typeof window.postMessage !== 'function') return;
+		try {
+			// @strudel/midi listens for this native Strudel stop notification. It
+			// sends MIDI stop to every output; MidiService additionally provides the
+			// stronger all-notes-off panic for explicit teardown/user actions.
+			window.postMessage('strudel-stop', '*');
+		} catch {
+			// Browser teardown and restrictive embedded hosts can reject postMessage.
+		}
+	}
+
 	/**
 	 * A failed restore is different from a rejected candidate: the accepted
 	 * pattern is no longer guaranteed to be resident in the REPL. Stop and hush
@@ -820,6 +1400,8 @@ export class StrudelAdapter {
 	private stopAfterRestoreFailure(): void {
 		this.pendingSchedulerStart = undefined;
 		this.stopCycleTimer();
+		this.stopVisualTransportClock();
+		this.notifyMidiStop();
 		try {
 			this.repl?.stop();
 		} catch {
@@ -861,6 +1443,7 @@ export class StrudelAdapter {
 		} else {
 			if (this.destroyed) return;
 			repl.stop();
+			this.notifyMidiStop();
 			this.module?.hush?.();
 			this.stopCycleTimer();
 		}
@@ -1158,6 +1741,8 @@ export class StrudelAdapter {
 			const currentCycle = this.readCurrentCycle();
 			pauseAttempted = true;
 			this.repl.pause();
+			this.notifyMidiStop();
+			this.stopVisualTransportClock();
 			this.stopCycleTimer();
 			this.setRuntime({ transport: 'paused', currentCycle });
 			return { ok: true };
@@ -1192,6 +1777,7 @@ export class StrudelAdapter {
 				// considered stopped; their own stop implementation remains the
 				// fallback for resetting any internal cursor.
 			}
+			this.notifyMidiStop();
 			this.module?.hush?.();
 			this.stopCycleTimer();
 			this.setRuntime({ transport: 'stopped', currentCycle: 0 });
@@ -1209,6 +1795,18 @@ export class StrudelAdapter {
 	/** Return the live scheduler cursor for animation clients such as the lane visualizers. */
 	public getCurrentCycle(): number {
 		return this.readCurrentCycle();
+	}
+
+	/** Apply an external MIDI master's cycle rate without rewriting source BPM. */
+	public setRuntimeCps(cps: number): void {
+		if (!Number.isFinite(cps) || cps <= 0) return;
+		try {
+			const scheduler = this.repl?.scheduler as unknown as { setCps?: (value: number) => void } | undefined;
+			scheduler?.setCps?.(cps);
+		} catch {
+			// External clock is optional; a scheduler that cannot change rate keeps
+			// the source tempo rather than taking down the audio runtime.
+		}
 	}
 
 	/** Query the same source-location haps that Strudel uses for live editor highlighting. */
@@ -1306,6 +1904,8 @@ export class StrudelAdapter {
 			if (wasPlaying) {
 				transportTouched = true;
 				this.repl.pause();
+				this.notifyMidiStop();
+				this.stopVisualTransportClock();
 			}
 
 			transportTouched = true;
@@ -1330,12 +1930,14 @@ export class StrudelAdapter {
 
 	public destroy(): void {
 		this.destroyed = true;
+		this.releaseAllLiveMidiNotes();
 		this.pendingSchedulerStart = undefined;
 		this.stopCycleTimer();
 		const repl = this.repl;
 		const module = this.module;
 		this.repl = undefined;
 		this.module = undefined;
+		this.midiModule = undefined;
 		this.activePattern = undefined;
 		this.activeSource = '';
 		this.sliderValues.clear();
@@ -1344,8 +1946,10 @@ export class StrudelAdapter {
 		this.preloadPromise = undefined;
 		this.audioInitPromise = undefined;
 		this.sampleBankPromise = undefined;
+		this.stopVisualTransportClock();
 		try {
 			repl?.stop();
+			this.notifyMidiStop();
 			module?.hush?.();
 		} catch {
 			// Destruction should never turn a route change or HMR update into an
@@ -1364,12 +1968,42 @@ export class StrudelAdapter {
 		};
 	}
 
+	private startVisualTransportClock(cycle: number): void {
+		const currentTime = this.module?.getAudioContext?.()?.currentTime;
+		const cps = this.repl?.scheduler?.cps;
+		if (typeof currentTime !== 'number' || !Number.isFinite(currentTime) || typeof cps !== 'number' || !Number.isFinite(cps) || cps <= 0) {
+			this.visualTransportClock = undefined;
+			return;
+		}
+		this.visualTransportClock = {
+			originSeconds: currentTime,
+			originCycle: Number.isFinite(cycle) ? Math.max(0, cycle) : 0,
+			cps,
+		};
+	}
+
+	private stopVisualTransportClock(): void {
+		this.visualTransportClock = undefined;
+	}
+
+	private readVisualTransportCycle(): number | undefined {
+		const clock = this.visualTransportClock;
+		const currentTime = this.module?.getAudioContext?.()?.currentTime;
+		if (!clock || typeof currentTime !== 'number' || !Number.isFinite(currentTime)) return undefined;
+		const currentCps = this.repl?.scheduler?.cps;
+		if (typeof currentCps === 'number' && Number.isFinite(currentCps) && currentCps > 0 && Math.abs(currentCps - clock.cps) > 0.000001) {
+			const currentCycle = clock.originCycle + Math.max(0, currentTime - clock.originSeconds) * clock.cps;
+			clock.originSeconds = currentTime;
+			clock.originCycle = currentCycle;
+			clock.cps = currentCps;
+		}
+		return Math.max(0, clock.originCycle + Math.max(0, currentTime - clock.originSeconds) * clock.cps);
+	}
+
 	private readCurrentCycle(): number {
 		// Cyclist intentionally reports zero while paused or stopped even though
 		// its internal `lastEnd` cursor remains at the paused/boundary position.
-		// Runtime state is the authoritative playhead outside active playback;
-		// consulting scheduler.now() here would make Play after a pause or finite
-		// song end jump back to the wrong cursor.
+		// Runtime state is the authoritative playhead outside active playback.
 		if (this.runtime.transport !== 'playing') return this.runtime.currentCycle ?? 0;
 		const pendingStart = this.pendingSchedulerStart;
 		const cycle = this.repl?.scheduler?.now?.();
@@ -1383,6 +2017,8 @@ export class StrudelAdapter {
 				return pendingStart.cycle;
 			}
 		}
+		const visualCycle = this.readVisualTransportCycle();
+		if (visualCycle !== undefined) return visualCycle;
 		return typeof cycle === 'number' && Number.isFinite(cycle) ? Math.max(0, cycle) : this.runtime.currentCycle ?? 0;
 	}
 

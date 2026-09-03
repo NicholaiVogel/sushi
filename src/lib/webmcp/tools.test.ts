@@ -34,9 +34,45 @@ const state: WebMcpStateSnapshot = {
 	phase: 'ready',
 	persistenceState: 'ready',
 	webmcp: { available: true },
+	midi: {
+		supported: false,
+		secureContext: true,
+		permission: 'unsupported',
+		enabled: false,
+		sysexEnabled: false,
+		inputs: [],
+		outputs: [],
+		selectedInputId: null,
+		selectedOutputId: null,
+		inputChannel: 'all',
+		outputChannel: 1,
+		monitor: false,
+		clockMode: 'off',
+		clockRunning: false,
+		externalClockTicks: 0,
+		externalClockRunning: false,
+		learning: false,
+		recording: { status: 'idle', trackId: null, inputId: null, startedAtCycle: null, currentCycle: null, noteCount: 0, automationCount: 0, activeNoteCount: 0, take: null, options: null },
+	},
 };
 
 function testController(): WebMcpController {
+		const midi = {
+			getState: () => state.midi,
+			connect: async () => state.midi,
+			disconnect: async () => state.midi,
+			selectInput: () => state.midi,
+			selectOutput: () => state.midi,
+			setSettings: () => state.midi,
+			learnControl: () => ({ ...state.midi, learning: true }),
+			armRecording: () => ({ ...state.midi, recording: { ...state.midi.recording, status: 'armed' as const, trackId: 'trk_test', inputId: 'input', options: null } }),
+			startRecording: async () => ({ ...state.midi, recording: { ...state.midi.recording, status: 'recording' as const, trackId: 'trk_test', inputId: 'input' } }),
+			stopRecording: async () => ({ ...state.midi, recording: { ...state.midi.recording, status: 'review' as const, trackId: 'trk_test', inputId: 'input' } }),
+			cancelRecording: () => state.midi,
+			acceptTake: async (input: { transactionId: string }) => ({ ok: true, action: 'accept_midi_take', affectedEntityIds: ['source', 'midi'], message: 'accepted', state, revision: 1, activeRevision: 1, transactionId: input.transactionId }),
+			panic: () => state.midi,
+			testNote: async () => state.midi,
+		};
 	return {
 		getState: () => state,
 		loadTemplate: async (input) => ({ ok: true, action: 'load_editor_template', affectedEntityIds: ['source', 'project', 'timeline'], message: 'template loaded', state, revision: 1, activeRevision: 1, transactionId: input.transactionId }),
@@ -52,6 +88,8 @@ function testController(): WebMcpController {
 		controlPlayback: async ({ action }) => ({ ok: true, action: `control_playback:${action}`, affectedEntityIds: ['transport'], message: 'done', state, revision: state.source.revision, activeRevision: state.source.activeRevision }),
 		undoSourceEdit: async () => ({ ok: true, action: 'undo_source_edit', affectedEntityIds: ['source'], message: 'undone', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
 		redoSourceEdit: async () => ({ ok: true, action: 'redo_source_edit', affectedEntityIds: ['source'], message: 'redone', state, revision: 1, activeRevision: 1, transactionId: 'tx' }),
+		setTrackMidiRoute: async (input) => ({ ok: true, action: 'set_track_midi_route', affectedEntityIds: ['source', input.trackId ?? 'trk_test'], message: 'routed', state, revision: 1, activeRevision: 1, transactionId: input.transactionId }),
+		midi,
 	};
 }
 
@@ -211,6 +249,47 @@ describe('WebMCP tool adapter', () => {
 		expect(viewTemplate?.inputSchema).toMatchObject({ required: ['templateId'] });
 		const loadTemplate = tools.find((tool) => tool.name === 'load_editor_template');
 		expect(loadTemplate?.inputSchema).toMatchObject({ required: ['templateId', 'baseRevision', 'transactionId'] });
+		const midiRoute = tools.find((tool) => tool.name === 'set_track_midi_route');
+		expect(midiRoute?.inputSchema).toMatchObject({ properties: { velocity: { oneOf: [{ type: 'number', minimum: 0, maximum: 1 }, { type: 'null' }] }, program: { oneOf: [{ type: 'integer', minimum: 0, maximum: 127 }, { type: 'null' }] } } });
+	});
+
+	test('exposes MIDI state and dispatches guarded MIDI actions', async () => {
+		const tools = createWebMcpTools(testController());
+		const capabilities = tools.find((tool) => tool.name === 'get_midi_capabilities');
+		const access = tools.find((tool) => tool.name === 'request_midi_access');
+		const arm = tools.find((tool) => tool.name === 'arm_midi_recording');
+		const route = tools.find((tool) => tool.name === 'set_track_midi_route');
+		expect((await capabilities?.execute({}, { signal: new AbortController().signal }) as { capabilities: { supported: boolean } }).capabilities.supported).toBe(false);
+		expect((await access?.execute({ sysex: false }, { signal: new AbortController().signal }) as { ok: boolean }).ok).toBe(true);
+		expect((await arm?.execute({ trackId: 'trk_test' }, { signal: new AbortController().signal }) as { ok: boolean }).ok).toBe(true);
+		expect((await route?.execute({ trackId: 'trk_test', channel: 2, enabled: true, baseRevision: 0, transactionId: 'midi-route-test' }, { signal: new AbortController().signal }) as { ok: boolean }).ok).toBe(true);
+	});
+
+	test('passes a local instrument through the revision-safe MIDI route tool', async () => {
+		let received: unknown;
+		const controller = { ...testController(), setTrackMidiRoute: async (input: Parameters<NonNullable<WebMcpController['setTrackMidiRoute']>>[0]) => {
+			received = input;
+			return { ok: true, action: 'set_track_midi_route', affectedEntityIds: ['source', 'trk_test'], message: 'routed', state, revision: 1, activeRevision: 1, transactionId: input.transactionId };
+		} };
+		const route = createWebMcpTools(controller).find((tool) => tool.name === 'set_track_midi_route');
+		await route?.execute({ trackId: 'trk_test', instrument: 'gm_piano', channel: 1, enabled: false, baseRevision: 0, transactionId: 'instrument-route-test' }, { signal: new AbortController().signal });
+		expect(received).toMatchObject({ trackId: 'trk_test', instrument: 'gm_piano', channel: 1, enabled: false, baseRevision: 0, transactionId: 'instrument-route-test' });
+	});
+
+	test('requires user activation for agent MIDI permission and panic actions', async () => {
+		const previous = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+		Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { userActivation: { isActive: false } } });
+		try {
+			const tools = createWebMcpTools(testController());
+			const access = tools.find((tool) => tool.name === 'request_midi_access');
+			const panic = tools.find((tool) => tool.name === 'panic_midi');
+			const expected = { ok: false, error: { code: 'MIDI_USER_GESTURE_REQUIRED', message: 'The browser requires a user gesture. Press Connect MIDI or the hardware action button in Sushi before asking an agent to continue.' } };
+			expect(await access?.execute({ sysex: false }, { signal: new AbortController().signal })).toEqual(expected);
+			expect(await panic?.execute({}, { signal: new AbortController().signal })).toEqual(expected);
+		} finally {
+			if (previous) Object.defineProperty(globalThis, 'navigator', previous);
+			else Reflect.deleteProperty(globalThis, 'navigator');
+		}
 	});
 
 	test('rejects malformed tool inputs before dispatch', async () => {
@@ -274,7 +353,7 @@ describe('WebMCP tool adapter', () => {
 		const tools = createWebMcpTools(testController());
 		const list = tools.find((tool) => tool.name === 'list_editor_templates');
 		const view = tools.find((tool) => tool.name === 'view_editor_template');
-		const listed = await list?.execute({ query: 'witch' }, { signal: new AbortController().signal }) as { templates: Array<{ id: string; source?: string }> };
+		const listed = await list?.execute({ query: 'witch' }, { signal: new AbortController().signal }) as { templates: Array<{ id: string; name: string; description: string; bpm: number; key: string; lanes: number; source?: string }> };
 		expect(listed.templates).toEqual([{ id: 'witch-house-climax', name: 'Witch-House Climax', description: 'A cinematic 24-cycle build from sparse arpeggios into a dense, distorted climax.', bpm: 84, key: 'F minor', lanes: 16 }]);
 		expect(listed.templates[0]).not.toHaveProperty('source');
 

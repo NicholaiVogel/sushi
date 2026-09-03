@@ -11,11 +11,12 @@ export interface TrackContextMenuProps {
 	menuRef: RefObject<HTMLDivElement | null>;
 	trackDetails?: TrackDetails;
 	onRename: (trackId: string) => void;
+	onOpenNoteEditor: (trackId: string) => void;
 	onDelete: (trackId: string) => void;
 	onSetColor: (trackId: string, value: string) => void;
 }
 
-export function TrackContextMenu({ track, trackNumber, position, menuRef, trackDetails, onRename, onDelete, onSetColor }: TrackContextMenuProps) {
+export function TrackContextMenu({ track, trackNumber, position, menuRef, trackDetails, onRename, onOpenNoteEditor, onDelete, onSetColor }: TrackContextMenuProps) {
 	return (
 		<div className="track-context-menu" ref={menuRef} style={{ left: position.x, top: position.y }} role="menu" aria-label={`${track.name} track actions`}>
 			<div className="track-context-heading">TRACK {trackNumber.toString().padStart(2, '0')} · {track.name}</div>
@@ -29,6 +30,7 @@ export function TrackContextMenu({ track, trackNumber, position, menuRef, trackD
 					onChange={(value) => onSetColor(track.id, value)}
 				/>
 			</div>
+			<button type="button" role="menuitem" onClick={() => onOpenNoteEditor(track.id)}>Open note editor <span aria-hidden="true">♫</span></button>
 			<button type="button" role="menuitem" onClick={() => onRename(track.id)}>Rename track</button>
 			<button className="track-context-delete" type="button" role="menuitem" onClick={() => onDelete(track.id)}>Delete track <span aria-hidden="true">⌫</span></button>
 		</div>

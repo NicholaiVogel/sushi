@@ -7,9 +7,12 @@ import {
 import {
 	getSourceBlockDetails,
 	getSourceGlobals,
+	type TrackMidiRouteUpdate,
 } from '../../lib/project/source-mapper';
 import { getTimelineCapacityForEndCycle } from '../../lib/project/timeline';
 import { isAudioLockedError, type StrudelAdapter } from '../../lib/strudel/adapter';
+import type { MidiChannel, MidiClockMode, MidiRuntimeState } from '../../lib/midi/types';
+import type { MidiService } from '../../lib/midi/service';
 import {
 	applyTextEdits,
 	registerWebMcpTools,
@@ -26,6 +29,8 @@ import {
 	type WebMcpTempoInput,
 	type WebMcpTemplateLoadInput,
 	type WebMcpTimelineExtensionInput,
+	type WebMcpMidiRecordInput,
+	type WebMcpMidiRouteInput,
 	type WebMcpTrackMutationInput,
 	type WebMcpTrackRangeInput,
 	type WebMcpTrackRenameInput,
@@ -75,6 +80,11 @@ export interface UseStudioWebMcpOptions {
 	deleteTrack: (trackId: string) => Promise<CommitSourceResult>;
 	renameTrack: (trackId: string, name: string) => Promise<CommitSourceResult>;
 	loadTemplate: (preset: EditorPreset, expectedRevision?: number) => Promise<CommitSourceResult>;
+	midiService: MidiService;
+	startMidiRecording: (signal?: AbortSignal) => Promise<MidiRuntimeState>;
+	stopMidiRecording: () => Promise<MidiRuntimeState>;
+	commitMidiTake: (expectedRevision?: number) => Promise<CommitSourceResult>;
+	setTrackMidiRoute: (trackId: string, output: string | number | null | undefined, channel: number, enabled: boolean, settings?: Pick<TrackMidiRouteUpdate, 'instrument' | 'velocity' | 'gain' | 'noteOffsetMs' | 'midimap' | 'program'>, expectedRevision?: number) => Promise<CommitSourceResult>;
 }
 
 export function useStudioWebMcp({
@@ -95,9 +105,28 @@ export function useStudioWebMcp({
 	deleteTrack,
 	renameTrack,
 	loadTemplate,
+	midiService,
+	startMidiRecording,
+	stopMidiRecording,
+	commitMidiTake,
+	setTrackMidiRoute,
 }: UseStudioWebMcpOptions) {
 	const getWebMcpState = useCallback((): WebMcpStateSnapshot => {
 		const current = studioRef.current;
+		const midi = midiService.getState();
+		const reviewedTake = midi.recording.take;
+		const boundedMidi = reviewedTake ? {
+			...midi,
+			recording: {
+				...midi.recording,
+				take: {
+					...reviewedTake,
+					notes: reviewedTake.notes.slice(0, 256),
+					automation: reviewedTake.automation.slice(0, 256).map((event) => ({ ...event, data: event.data.slice(0, 256) })),
+					truncated: reviewedTake.truncated === true || reviewedTake.notes.length > 256 || reviewedTake.automation.length > 256 || reviewedTake.automation.some((event) => event.data.length > 256),
+				},
+			},
+		} : midi;
 		const project = createInitialProject();
 		const globals = getSourceGlobals(current.lastValid);
 		const tracks = getSourceBlockDetails(current.lastValid).map((track, index) => ({
@@ -109,6 +138,8 @@ export function useStudioWebMcp({
 			...(track.label === undefined ? {} : { label: track.label }),
 			...(track.expression === undefined ? {} : { expression: track.expression }),
 			...(track.color === undefined ? {} : { color: track.color }),
+			...(track.instrument === undefined ? {} : { instrument: track.instrument }),
+			...(track.midi === undefined ? {} : { midi: { ...track.midi } }),
 			colorEditable: track.colorEditable,
 			timing: getTrackTimingForTimeline(track, current.songEndCycle),
 			gain: { ...(track.gain === undefined ? {} : { value: track.gain }), editable: track.gainEditable },
@@ -136,13 +167,9 @@ export function useStudioWebMcp({
 			phase: current.phase,
 			persistenceState: current.persistenceState,
 			webmcp: { available: webmcpAvailableRef.current },
+			midi: boundedMidi,
 		};
-	}, [studioRef, webmcpAvailableRef]);
-
-	const rememberMutation = useCallback((result: WebMcpMutationResult): WebMcpMutationResult => {
-		if (result.transactionId) sourceTransactionsRef.current.set(result.action, result.transactionId, result);
-		return result;
-	}, [sourceTransactionsRef]);
+	}, [midiService, studioRef, webmcpAvailableRef]);
 
 	const applySourceMutation = useCallback(
 		async (action: string, input: SourceMutationInput): Promise<WebMcpMutationResult> => {
@@ -221,58 +248,64 @@ export function useStudioWebMcp({
 	);
 
 	const timelineMutationForWebMcp = useCallback(
-		async (
+		(
 			action: string,
 			input: WebMcpTempoInput | WebMcpKeyInput,
 			mutate: () => Promise<CommitSourceResult>,
 			successMessage: (state: WebMcpStateSnapshot) => string,
-		): Promise<WebMcpMutationResult> => {
-			const cached = sourceTransactionsRef.current.get(action, input.transactionId);
-			if (cached) return cached;
+		): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			action,
+			input.transactionId,
+			async () => {
+				const current = studioRef.current;
+				if (input.baseRevision !== current.revision) {
+					const state = getWebMcpState();
+					return {
+						ok: false,
+						action,
+						affectedEntityIds: ['source'],
+						message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+						state,
+						revision: state.source.revision,
+						activeRevision: state.source.activeRevision,
+						transactionId: input.transactionId,
+						error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
+						conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
+					};
+				}
 
-			const current = studioRef.current;
-			if (input.baseRevision !== current.revision) {
+				const beforeSource = current.draft;
+				let result: CommitSourceResult;
+				try {
+					result = await mutate();
+				} catch (error) {
+					const state = getWebMcpState();
+					return makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The timeline setting could not be changed.', { code: 'SOURCE_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) });
+				}
+
 				const state = getWebMcpState();
-				return {
-					ok: false,
-					action,
-					affectedEntityIds: ['source'],
-					message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+				if (result.ok) return makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, successMessage(state), undefined, ['source']);
+
+				const diagnostic = result.error;
+				return makeMutationResult(
 					state,
-					revision: state.source.revision,
-					activeRevision: state.source.activeRevision,
-					transactionId: input.transactionId,
-					error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
-					conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
-				};
-			}
-
-			const beforeSource = current.draft;
-			let result: CommitSourceResult;
-			try {
-				result = await mutate();
-			} catch (error) {
-				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The timeline setting could not be changed.', { code: 'SOURCE_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) }));
-			}
-
+					action,
+					input.transactionId,
+					beforeSource,
+					input.baseRevision,
+					false,
+					`Timeline setting was rejected; ${formatRevision(state.source.activeRevision)} remains active.`,
+					{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the timeline setting.', details: diagnostic ? { diagnostic } : undefined },
+					['source'],
+				);
+			},
+			stableSerialize(input),
+		).catch((error) => {
+			if (!(error instanceof TransactionReuseError)) throw error;
 			const state = getWebMcpState();
-			if (result.ok) return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, successMessage(state), undefined, ['source']));
-
-			const diagnostic = result.error;
-			return rememberMutation(makeMutationResult(
-				state,
-				action,
-				input.transactionId,
-				beforeSource,
-				input.baseRevision,
-				false,
-				`Timeline setting was rejected; ${formatRevision(state.source.activeRevision)} remains active.`,
-				{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the timeline setting.', details: diagnostic ? { diagnostic } : undefined },
-				['source'],
-			));
-		},
-		[getWebMcpState, rememberMutation, sourceTransactionsRef, studioRef],
+			return makeMutationResult(state, action, input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+		}),
+		[getWebMcpState, sourceTransactionsRef, studioRef],
 	);
 
 	const setTempoForWebMcp = useCallback(
@@ -296,58 +329,65 @@ export function useStudioWebMcp({
 	);
 
 	const extendTimelineForWebMcp = useCallback(
-		async (input: WebMcpTimelineExtensionInput): Promise<WebMcpMutationResult> => {
-			const cached = sourceTransactionsRef.current.get('extend_timeline', input.transactionId);
-			if (cached) return cached;
-			const current = studioRef.current;
-			if (input.baseRevision !== current.revision) {
-				const state = getWebMcpState();
-				return {
-					ok: false,
-					action: 'extend_timeline',
-					affectedEntityIds: ['timeline'],
-					message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
-					state,
-					revision: state.source.revision,
-					activeRevision: state.source.activeRevision,
-					transactionId: input.transactionId,
-					error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
-					conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
-				};
-			}
+		(input: WebMcpTimelineExtensionInput): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			'extend_timeline',
+			input.transactionId,
+			async () => {
+				const current = studioRef.current;
+				if (input.baseRevision !== current.revision) {
+					const state = getWebMcpState();
+					return {
+						ok: false,
+						action: 'extend_timeline',
+						affectedEntityIds: ['timeline'],
+						message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(state.source.revision)}.`,
+						state,
+						revision: state.source.revision,
+						activeRevision: state.source.activeRevision,
+						transactionId: input.transactionId,
+						error: { code: 'REVISION_CONFLICT', message: 'The source changed after this transaction was prepared.' },
+						conflict: { expectedRevision: input.baseRevision, actualRevision: state.source.revision },
+					};
+				}
 
-			const nextSongEndCycle = getTimelineCapacityForEndCycle(current.songEndCycle + TIMELINE_SNAP_CYCLE);
-			if (nextSongEndCycle > current.songEndCycle) {
-				adapterRef.current?.setSongEndCycle(nextSongEndCycle);
-				patchStudio({ songEndCycle: nextSongEndCycle });
-				void persistStudioSnapshot();
-			}
+				const nextSongEndCycle = getTimelineCapacityForEndCycle(current.songEndCycle + TIMELINE_SNAP_CYCLE);
+				if (nextSongEndCycle > current.songEndCycle) {
+					adapterRef.current?.setSongEndCycle(nextSongEndCycle);
+					patchStudio({ songEndCycle: nextSongEndCycle });
+					void persistStudioSnapshot();
+				}
+				const state = getWebMcpState();
+				return makeMutationResult(
+					state,
+					'extend_timeline',
+					input.transactionId,
+					current.draft,
+					input.baseRevision,
+					true,
+					`Timeline is available through bar ${state.timeline.songEndCycle}.`,
+					undefined,
+					['timeline'],
+				);
+			},
+			stableSerialize(input),
+		).catch((error) => {
+			if (!(error instanceof TransactionReuseError)) throw error;
 			const state = getWebMcpState();
-			return rememberMutation(makeMutationResult(
-				state,
-				'extend_timeline',
-				input.transactionId,
-				current.draft,
-				input.baseRevision,
-				true,
-				`Timeline is available through bar ${state.timeline.songEndCycle}.`,
-				undefined,
-				['timeline'],
-			));
-		},
-		[adapterRef, getWebMcpState, patchStudio, persistStudioSnapshot, rememberMutation, sourceTransactionsRef, studioRef],
+			return makeMutationResult(state, 'extend_timeline', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+		}),
+		[adapterRef, getWebMcpState, patchStudio, persistStudioSnapshot, sourceTransactionsRef, studioRef],
 	);
 
 	const trackMutationForWebMcp = useCallback(
-		async (
+		(
 			action: string,
 			input: WebMcpTrackMutationInput,
 			mutate: (trackId: string) => Promise<CommitSourceResult>,
 			successMessage: (track: TrackDetails, state: WebMcpStateSnapshot) => string,
-		): Promise<WebMcpMutationResult> => {
-			const cached = sourceTransactionsRef.current.get(action, input.transactionId);
-			if (cached) return cached;
-
+		): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			action,
+			input.transactionId,
+			async () => {
 			const current = studioRef.current;
 			if (input.baseRevision !== current.revision) {
 				const state = getWebMcpState();
@@ -369,7 +409,7 @@ export function useStudioWebMcp({
 			const resolved = resolveTrackTarget(mutationSource, input);
 			if (!resolved.ok) {
 				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, action, input.transactionId, current.draft, current.revision, false, resolved.message, { code: resolved.code, message: resolved.message }));
+				return makeMutationResult(state, action, input.transactionId, current.draft, current.revision, false, resolved.message, { code: resolved.code, message: resolved.message });
 			}
 
 			const beforeSource = current.draft;
@@ -378,17 +418,17 @@ export function useStudioWebMcp({
 				result = await mutate(resolved.track.id);
 			} catch (error) {
 				const state = getWebMcpState();
-				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The track transaction could not be completed.', { code: 'TRACK_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) }, ['source', resolved.track.id]));
+				return makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, false, 'The track transaction could not be completed.', { code: 'TRACK_COMMIT_FAILED', message: error instanceof Error ? error.message : String(error) }, ['source', resolved.track.id]);
 			}
 
 			const state = getWebMcpState();
 			const affectedEntityIds = ['source', resolved.track.id];
 			if (result.ok) {
-				return rememberMutation(makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, successMessage(resolved.track, state), undefined, affectedEntityIds));
+				return makeMutationResult(state, action, input.transactionId, beforeSource, input.baseRevision, true, successMessage(resolved.track, state), undefined, affectedEntityIds);
 			}
 
 			const diagnostic = result.error;
-			return rememberMutation(makeMutationResult(
+			return makeMutationResult(
 				state,
 				action,
 				input.transactionId,
@@ -398,9 +438,15 @@ export function useStudioWebMcp({
 				`Track change was rejected; ${formatRevision(state.source.activeRevision)} remains active.`,
 				{ code: 'VALIDATION_FAILED', message: diagnostic?.message ?? 'Strudel could not evaluate the track change.', details: diagnostic ? { diagnostic } : undefined },
 				affectedEntityIds,
-			));
-		},
-		[getWebMcpState, rememberMutation, sourceTransactionsRef, studioRef],
+			);
+			},
+			stableSerialize(input),
+		).catch((error) => {
+			if (!(error instanceof TransactionReuseError)) throw error;
+			const state = getWebMcpState();
+			return makeMutationResult(state, action, input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+		}),
+		[getWebMcpState, sourceTransactionsRef, studioRef],
 	);
 
 	const deleteTrackForWebMcp = useCallback(
@@ -434,6 +480,23 @@ export function useStudioWebMcp({
 			},
 		),
 		[commitTrackRange, trackMutationForWebMcp],
+	);
+
+	const setTrackMidiRouteForWebMcp = useCallback(
+		(input: WebMcpMidiRouteInput): Promise<WebMcpMutationResult> => trackMutationForWebMcp(
+			'set_track_midi_route',
+			input,
+			(trackId) => setTrackMidiRoute(trackId, input.output, input.channel, input.enabled, {
+				instrument: input.instrument,
+				velocity: input.velocity,
+				gain: input.gain,
+				noteOffsetMs: input.noteOffsetMs,
+				midimap: input.midimap,
+				program: input.program,
+			}, input.baseRevision),
+			(track, state) => `${input.enabled ? 'Enabled' : 'Disabled'} MIDI output for ${JSON.stringify(track.name)} at ${formatRevision(state.source.revision)}.`,
+		),
+		[setTrackMidiRoute, trackMutationForWebMcp],
 	);
 
 	const loadTemplateForWebMcp = useCallback(
@@ -589,8 +652,12 @@ export function useStudioWebMcp({
 			}
 
 			try {
+				const previousTransport = studioRef.current.runtime.transport;
+				const wasPlaying = previousTransport === 'playing';
+				if (previousTransport !== 'stopped' || midiService.getState().clockRunning) midiService.panic();
 				const result = await adapter.validateSource(candidate, studioRef.current.lastValid);
 				const state = getWebMcpState();
+				if (wasPlaying && state.runtime.transport === 'playing') midiService.startTransportClock();
 				const resultRevision = state.source.revision;
 				const staleSuffix = resultRevision === revision
 					? ''
@@ -604,7 +671,7 @@ export function useStudioWebMcp({
 				return { ok: false, action: 'validate_strudel_source', source: candidate, diagnostics: [diagnostic], message: diagnostic.message, revision: state.source.revision, state, error: { code: 'VALIDATION_FAILED', message: diagnostic.message, details: { diagnostic } } };
 			}
 		},
-		[adapterRef, getWebMcpState, studioRef],
+		[adapterRef, getWebMcpState, midiService, studioRef],
 	);
 
 	const controlPlaybackForWebMcp = useCallback(
@@ -702,6 +769,96 @@ export function useStudioWebMcp({
 		[bumpSourceHistory, commitSource, getWebMcpState, sourceHistoryRef, sourceTransactionsRef, studioRef],
 	);
 
+	const acceptMidiTakeForWebMcp = useCallback(
+		(input: { baseRevision: number; transactionId: string }): Promise<WebMcpMutationResult> => sourceTransactionsRef.current.run(
+			'accept_midi_take',
+			input.transactionId,
+			async () => {
+				const current = studioRef.current;
+				const stateBefore = getWebMcpState();
+				if (input.baseRevision !== current.revision) return {
+					ok: false,
+					action: 'accept_midi_take',
+					affectedEntityIds: sourceEntityIds(stateBefore),
+					message: `Revision conflict: expected ${formatRevision(input.baseRevision)}, current is ${formatRevision(stateBefore.source.revision)}.`,
+					state: stateBefore,
+					revision: stateBefore.source.revision,
+					activeRevision: stateBefore.source.activeRevision,
+					transactionId: input.transactionId,
+					error: { code: 'REVISION_CONFLICT', message: 'The source changed after this MIDI take was prepared.' },
+					conflict: { expectedRevision: input.baseRevision, actualRevision: stateBefore.source.revision },
+				};
+				if (!midiService.getState().recording.take) return makeMutationResult(stateBefore, 'accept_midi_take', input.transactionId, current.draft, current.revision, false, 'There is no MIDI take waiting for review.', { code: 'MIDI_TAKE_NOT_AVAILABLE', message: 'Stop or review a MIDI take before accepting it.' });
+				const result = await commitMidiTake(input.baseRevision);
+				const state = getWebMcpState();
+				if (result.conflict) return {
+					ok: false,
+					action: 'accept_midi_take',
+					affectedEntityIds: sourceEntityIds(state),
+					message: `Revision conflict: expected ${formatRevision(result.conflict.expectedRevision)}, current is ${formatRevision(result.conflict.actualRevision)}.`,
+					state,
+					revision: state.source.revision,
+					activeRevision: state.source.activeRevision,
+					transactionId: input.transactionId,
+					error: { code: 'REVISION_CONFLICT', message: 'The source changed while accepting the MIDI take.' },
+					conflict: result.conflict,
+				};
+				if (result.ok) return makeMutationResult(state, 'accept_midi_take', input.transactionId, current.draft, input.baseRevision, true, `Accepted MIDI take at ${formatRevision(state.source.revision)}.`, undefined, ['source', 'midi']);
+				return makeMutationResult(state, 'accept_midi_take', input.transactionId, current.draft, input.baseRevision, false, 'MIDI take source was rejected; the accepted source remains active.', { code: 'VALIDATION_FAILED', message: result.error?.message ?? 'Strudel rejected the recorded MIDI source.' }, ['source', 'midi']);
+			},
+			stableSerialize(input),
+		).catch((error) => {
+			if (!(error instanceof TransactionReuseError)) throw error;
+			const state = getWebMcpState();
+			return makeMutationResult(state, 'accept_midi_take', input.transactionId, state.source.draft, state.source.revision, false, error.message, { code: 'TRANSACTION_REUSE', message: error.message });
+		}),
+		[commitMidiTake, getWebMcpState, midiService, sourceTransactionsRef, studioRef],
+	);
+
+	const midiController = useMemo(() => ({
+		getState: () => midiService.getState(),
+		connect: (options: { sysex: boolean }) => midiService.connect(options),
+		disconnect: () => {
+			adapterRef.current?.releaseAllLiveMidiNotes();
+			return midiService.disconnect();
+		},
+		selectInput: (id: string | null) => midiService.setSelectedInput(id),
+		selectOutput: (id: string | null) => {
+			const before = midiService.getState();
+			if (before.clockRunning && id !== before.selectedOutputId) midiService.panic();
+			const next = midiService.setSelectedOutput(id);
+			if (id === null) midiService.stopTransportClock();
+			else if (!next.lastError && studioRef.current.runtime.transport === 'playing' && next.clockMode === 'send' && (!next.clockRunning || next.selectedOutputId !== before.selectedOutputId)) midiService.startTransportClock();
+			return midiService.getState();
+		},
+		setSettings: (settings: { inputChannel?: MidiChannel; outputChannel?: number; monitor?: boolean; clockMode?: MidiClockMode }) => {
+			if (settings.inputChannel !== undefined) midiService.setInputChannel(settings.inputChannel);
+			if (settings.outputChannel !== undefined) midiService.setOutputChannel(settings.outputChannel);
+			if (settings.monitor !== undefined) midiService.setMonitor(settings.monitor);
+			if (settings.clockMode !== undefined) midiService.setClockMode(settings.clockMode);
+			const next = midiService.getState();
+			if (next.clockMode === 'send' && next.enabled && studioRef.current.runtime.transport === 'playing' && !next.clockRunning) midiService.startTransportClock();
+			return midiService.getState();
+		},
+		learnControl: () => midiService.beginControlLearn(),
+		armRecording: (options: WebMcpMidiRecordInput) => {
+			const track = getSourceBlockDetails(studioRef.current.lastValid).find((candidate) => candidate.id === options.trackId);
+			return midiService.armRecording({
+				...options,
+				...(options.loop && track ? { loopStartCycle: track.timing.startCycle, loopEndCycle: track.timing.endCycle } : {}),
+			});
+		},
+		startRecording: startMidiRecording,
+		stopRecording: stopMidiRecording,
+		cancelRecording: () => midiService.cancelRecording(),
+		acceptTake: acceptMidiTakeForWebMcp,
+		panic: (outputId?: string | null) => {
+			adapterRef.current?.releaseAllLiveMidiNotes();
+			return midiService.panic(outputId);
+		},
+		testNote: (note?: number, durationMs?: number, velocity?: number) => midiService.testNote(note, durationMs, velocity),
+	}), [acceptMidiTakeForWebMcp, midiService, startMidiRecording, stopMidiRecording]);
+
 	const webmcpController = useMemo<WebMcpController>(() => ({
 		getState: getWebMcpState,
 		loadTemplate: loadTemplateForWebMcp,
@@ -717,7 +874,9 @@ export function useStudioWebMcp({
 		controlPlayback: controlPlaybackForWebMcp,
 		undoSourceEdit: undoSourceForWebMcp,
 		redoSourceEdit: redoSourceForWebMcp,
-	}), [controlPlaybackForWebMcp, deleteTrackForWebMcp, extendTimelineForWebMcp, getWebMcpState, loadTemplateForWebMcp, patchSourceForWebMcp, redoSourceForWebMcp, renameTrackForWebMcp, setKeyForWebMcp, setTempoForWebMcp, setTrackRangeForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
+		setTrackMidiRoute: setTrackMidiRouteForWebMcp,
+		midi: midiController,
+	}), [controlPlaybackForWebMcp, deleteTrackForWebMcp, extendTimelineForWebMcp, getWebMcpState, loadTemplateForWebMcp, midiController, patchSourceForWebMcp, redoSourceForWebMcp, renameTrackForWebMcp, setKeyForWebMcp, setTempoForWebMcp, setTrackMidiRouteForWebMcp, setTrackRangeForWebMcp, sourceMutationForWebMcp, undoSourceForWebMcp, validateSourceForWebMcp]);
 
 	useEffect(() => {
 		let disposed = false;

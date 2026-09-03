@@ -42,6 +42,7 @@ export interface SourceBlockDetails extends SourceBlockSummary {
 	gain?: number;
 	pan?: number;
 	color?: string;
+	midi?: SourceMidiRoute;
 	gainEditable: boolean;
 	panEditable: boolean;
 	colorEditable: boolean;
@@ -95,6 +96,23 @@ export type SourceEffectMethod = TrackEffectMethod;
 export type SourceEffectKind = TrackEffectValueKind;
 export type SourceEffectValue = TrackEffectInput;
 
+export interface SourceMidiRoute {
+	/** Human-readable output name or a runtime output index. */
+	output?: string | number;
+	channel: number;
+	enabled: boolean;
+	/** Default note velocity passed to native `.midi()` output. */
+	velocity?: number;
+	/** Multiplier applied to note velocity by native MIDI output. */
+	gain?: number;
+	/** Milliseconds subtracted from scheduled note duration for note-off latency. */
+	noteOffsetMs?: number;
+	/** Optional named Strudel MIDI control map. */
+	midimap?: string;
+	/** Static program change sent with each matching MIDI hap. */
+	program?: number;
+}
+
 export interface SourceEffect {
 	/** Stable within a source lane; based on the effect method and ordinal. */
 	id: string;
@@ -141,6 +159,18 @@ const setcpmSingleValuePattern = new RegExp(`(\\bsetcpm\\s*\\(\\s*)(${numericLit
 const keyDeclarationPattern = /^(\s*(?:const|let|var)\s+key\s*=\s*)(["'])([^"'\r\n]*)(\2)(\s*;?)/m;
 const colorMethodPattern = /(\.color\s*\(\s*)(["'`])([^"'`\r\n]*)(\2)(\s*\))/;
 const safeColorPattern = /^(?:#[0-9a-f]{3}|#[0-9a-f]{4}|#[0-9a-f]{6}|#[0-9a-f]{8}|(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^()\r\n]*\)|[a-z]+)$/i;
+
+/** Strudel treats double-quoted text as mini-notation in several controls. */
+function quoteStringLiteral(value: string): string {
+	return `'${value
+		.replace(/\\/g, '\\\\')
+		.replace(/'/g, "\\'")
+		.replace(/\r/g, '\\r')
+		.replace(/\n/g, '\\n')
+		.replace(/\t/g, '\\t')
+		.replace(/\u2028/g, '\\u2028')
+		.replace(/\u2029/g, '\\u2029')}'`;
+}
 
 export function getSourceGlobals(source: string): SourceGlobals {
 	const tempoMatch = source.match(new RegExp(`\\bsetcpm\\s*\\(\\s*(${numericLiteral})(?:\\s*\\/\\s*(${numericLiteral}))?\\s*\\)`));
@@ -308,7 +338,7 @@ function topLevelMethodMatch(expression: string, pattern: RegExp): RegExpMatchAr
 	return undefined;
 }
 
-function numericMethodValue(expression: string, method: 'gain' | 'pan'): number | undefined {
+function numericMethodValue(expression: string, method: string): number | undefined {
 	const match = topLevelMethodMatch(expression, new RegExp(`\\.${method}\\s*\\(\\s*(${numericLiteral})\\s*\\)`));
 	if (!match) return undefined;
 	const value = Number(match[1]);
@@ -317,6 +347,77 @@ function numericMethodValue(expression: string, method: 'gain' | 'pan'): number 
 
 function hasMethod(expression: string, method: string): boolean {
 	return topLevelMethodMatch(expression, new RegExp(`\\.${method}\\s*\\(`)) !== undefined;
+}
+
+function parseSimpleStringLiteral(value: string): string | undefined {
+	const trimmed = value.trim();
+	if (trimmed.length < 2 || !['"', "'", '`'].includes(trimmed[0]) || trimmed[trimmed.length - 1] !== trimmed[0]) return undefined;
+	const body = trimmed.slice(1, -1);
+	if (trimmed[0] === '`' && /\$\{/.test(body)) return undefined;
+	return body
+		.replace(/\\u2028/g, '\u2028')
+		.replace(/\\u2029/g, '\u2029')
+		.replace(/\\([\\\\'"`nrt])/g, (_match, escape: string) => ({ '\\': '\\', "'": "'", '"': '"', '`': '`', n: '\n', r: '\r', t: '\t' }[escape] ?? escape));
+}
+
+function objectNumericProperty(objectExpression: string, property: string): number | undefined {
+	if (!objectExpression.startsWith('{') || !objectExpression.endsWith('}')) return undefined;
+	const body = objectExpression.slice(1, -1);
+	const match = body.match(new RegExp(`(?:^|,)\\s*${property}\\s*:\\s*(${numericLiteral})(?=\\s*(?:,|$))`));
+	if (!match) return undefined;
+	const value = Number(match[1]);
+	return Number.isFinite(value) ? value : undefined;
+}
+
+function objectStringProperty(objectExpression: string, property: string): string | undefined {
+	if (!objectExpression.startsWith('{') || !objectExpression.endsWith('}')) return undefined;
+	const body = objectExpression.slice(1, -1);
+	const match = body.match(new RegExp(`(?:^|,)\\s*${property}\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\\x60(?:\\\\.|[^\\x60\\\\])*\\x60)(?=\\s*(?:,|$))`));
+	return match ? parseSimpleStringLiteral(match[1]) : undefined;
+}
+
+function sourceMidiRoute(expression: string): SourceMidiRoute | undefined {
+	const midiMatch = topLevelMethodMatch(expression, /\.midi\s*\(/);
+	if (!midiMatch || midiMatch.index === undefined) return undefined;
+	const open = expression.indexOf('(', midiMatch.index);
+	const close = open < 0 ? undefined : findMatchingCallEnd(expression, open);
+	if (close === undefined) return undefined;
+	const argumentsList = splitCallArguments(expression, open + 1, close);
+	const argument = argumentsList[0]?.text.trim() ?? '';
+	const optionsArgument = argumentsList[1]?.text.trim() || (argument.startsWith('{') ? argument : '');
+	let output: string | number | undefined;
+	if (argument.startsWith('{')) {
+		const objectOutput = objectStringProperty(argument, 'port');
+		const objectIndex = objectNumericProperty(argument, 'port');
+		if (objectOutput !== undefined) output = objectOutput;
+		else if (objectIndex !== undefined) output = objectIndex;
+	} else if (argument) {
+		const stringValue = parseSimpleStringLiteral(argument);
+		if (stringValue !== undefined) output = stringValue;
+		else if (/^[-+]?\d+(?:\.\d+)?$/.test(argument)) output = Number(argument);
+	}
+	const channelMatch = topLevelMethodMatch(expression, /\.midichan\s*\(\s*(\d+)\s*\)/);
+	const channel = channelMatch ? Number(channelMatch[1]) : objectNumericProperty(optionsArgument, 'midichannel') ?? 1;
+	const program = numericMethodValue(expression, 'progNum');
+	return {
+		...(output === undefined ? {} : { output }),
+		channel: Number.isInteger(channel) && channel >= 1 && channel <= 16 ? channel : 1,
+		enabled: true,
+		...(objectNumericProperty(optionsArgument, 'velocity') === undefined ? {} : { velocity: objectNumericProperty(optionsArgument, 'velocity') }),
+		...(objectNumericProperty(optionsArgument, 'gain') === undefined ? {} : { gain: objectNumericProperty(optionsArgument, 'gain') }),
+		...(objectNumericProperty(optionsArgument, 'noteOffsetMs') === undefined ? {} : { noteOffsetMs: objectNumericProperty(optionsArgument, 'noteOffsetMs') }),
+		...(objectStringProperty(optionsArgument, 'midimap') === undefined ? {} : { midimap: objectStringProperty(optionsArgument, 'midimap') }),
+		...(program === undefined ? {} : { program }),
+	};
+}
+
+function replaceTopLevelMethodCall(expression: string, method: string, replacement: string): { expression: string; found: boolean } {
+	const match = topLevelMethodMatch(expression, new RegExp(`\\.${method}\\s*\\(`));
+	if (!match || match.index === undefined) return { expression, found: false };
+	const open = expression.indexOf('(', match.index);
+	const close = open < 0 ? undefined : findMatchingCallEnd(expression, open);
+	if (close === undefined) return { expression, found: false };
+	return { expression: `${expression.slice(0, match.index)}${replacement}${expression.slice(close + 1)}`, found: true };
 }
 
 function normalizeSourceColor(value: string): string | undefined {
@@ -969,6 +1070,7 @@ export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_
 		const pan = numericMethodValue(expression, 'pan');
 		const color = sourceColorValue(expression);
 		const visualizer = sourceVisualizerValue(expression);
+		const midi = sourceMidiRoute(expression);
 		const sounds = sourceSoundValues(expression);
 		// Prefer a track-level sound as the primary source summary. A layer-only
 		// expression still gets its first nested voice so it remains editable in
@@ -987,6 +1089,7 @@ export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_
 			gain,
 			pan,
 			...(color === undefined ? {} : { color }),
+			...(midi === undefined ? {} : { midi }),
 			gainEditable: !hasMethod(expression, 'gain') || gain !== undefined,
 			panEditable: !hasMethod(expression, 'pan') || pan !== undefined,
 			colorEditable: !hasMethod(expression, 'color') || color !== undefined,
@@ -995,10 +1098,15 @@ export function getSourceBlockDetails(source: string, defaultEndCycle = DEFAULT_
 	});
 }
 
+export interface SourceTrackExpressionParts {
+	label: string;
+	expression: string;
+}
+
 function replaceExpressionBlock(
 	source: string,
 	trackId: string,
-	transform: (parts: { label: string; expression: string }) => { label: string; expression: string },
+	transform: (parts: SourceTrackExpressionParts) => SourceTrackExpressionParts,
 ): string {
 	const details = getSourceBlockDetails(source).find((block) => block.id === trackId);
 	if (!details?.expressionRange || !details.label || details.expression === undefined) return source;
@@ -1066,6 +1174,120 @@ function appendExpressionCall(expression: string, call: string): string {
 	return `${body}${call}${semicolon}${trailingWhitespace}${suffix}`;
 }
 
+/** Apply a source-backed transformation to one complete track expression. */
+export function replaceSourceTrackExpression(
+	source: string,
+	trackId: string,
+	transform: (parts: SourceTrackExpressionParts) => SourceTrackExpressionParts,
+): string {
+	return replaceExpressionBlock(source, trackId, transform);
+}
+
+/** Append a native Strudel method while preserving trailing source comments. */
+export function appendSourceExpressionCall(expression: string, call: string): string {
+	return appendExpressionCall(expression, call);
+}
+
+export interface TrackMidiRouteUpdate {
+	output?: string | number | null;
+	channel: number;
+	/** MIDI-track local instrument metadata; intentionally separate from .midi(). */
+	instrument?: string | null;
+	enabled: boolean;
+	velocity?: number | null;
+	gain?: number | null;
+	noteOffsetMs?: number | null;
+	midimap?: string | null;
+	program?: number | null;
+}
+
+function validMidiRouteNumber(value: number | null | undefined, min: number, max: number): boolean {
+	return value === null || value === undefined || (Number.isFinite(value) && value >= min && value <= max);
+}
+
+const MIDI_ROUTE_OPTION_KEYS = ['velocity', 'gain', 'noteOffsetMs', 'midimap'] as const;
+type MidiRouteOptionKey = (typeof MIDI_ROUTE_OPTION_KEYS)[number];
+
+function midiRouteOptionValue(key: MidiRouteOptionKey, route: TrackMidiRouteUpdate): string | undefined {
+	switch (key) {
+		case 'velocity': return route.velocity === undefined || route.velocity === null ? undefined : formatNumber(route.velocity);
+		case 'gain': return route.gain === undefined || route.gain === null ? undefined : formatNumber(route.gain);
+		case 'noteOffsetMs': return route.noteOffsetMs === undefined || route.noteOffsetMs === null ? undefined : formatNumber(route.noteOffsetMs);
+		case 'midimap': return route.midimap === undefined || route.midimap === null || !route.midimap.trim() ? undefined : quoteStringLiteral(route.midimap.trim());
+	}
+}
+
+/** Merge explicit route option changes without discarding unrelated native options. */
+function mergeMidiRouteOptions(existingArguments: readonly { text: string }[], route: TrackMidiRouteUpdate, omitLegacyPort = false): string {
+	const explicitKeys = MIDI_ROUTE_OPTION_KEYS.filter((key) => route[key] !== undefined);
+	const existingText = existingArguments.slice(1).map((argument) => argument.text.trim()).filter(Boolean).join(', ');
+	const firstOption = existingArguments[1]?.text.trim();
+	if (!explicitKeys.length && !omitLegacyPort) return existingText;
+	const isObjectLiteral = existingArguments.length === 2 && firstOption?.startsWith('{') && firstOption.endsWith('}');
+	const entries = isObjectLiteral
+		? splitCallArguments(firstOption!.slice(1, -1), 0, firstOption!.length - 2).map((entry) => entry.text.trim()).filter(Boolean)
+		: [];
+	const consumed = new Set<MidiRouteOptionKey>();
+	const merged: string[] = [];
+	for (const entry of entries) {
+		const keyMatch = entry.match(/^([A-Za-z_$][\w$]*|["'][^"']+["'])\s*:/);
+		const rawKey = keyMatch?.[1]?.replace(/^["']|["']$/g, '');
+		const key = rawKey as MidiRouteOptionKey | undefined;
+		if (omitLegacyPort && rawKey === 'port') continue;
+		if (key && (MIDI_ROUTE_OPTION_KEYS as readonly string[]).includes(key) && route[key] !== undefined) {
+			consumed.add(key);
+			const value = midiRouteOptionValue(key, route);
+			if (value !== undefined) merged.push(`${key}: ${value}`);
+		} else {
+			merged.push(entry);
+		}
+	}
+	for (const key of explicitKeys) {
+		if (consumed.has(key)) continue;
+		const value = midiRouteOptionValue(key, route);
+		if (value !== undefined) merged.push(`${key}: ${value}`);
+	}
+	return merged.length ? `{ ${merged.join(', ')} }` : '';
+}
+
+/** Update a track's native MIDI calls without touching its pattern body. */
+export function updateTrackMidiRoute(source: string, trackId: string, route: TrackMidiRouteUpdate): string {
+	if (!Number.isInteger(route.channel) || route.channel < 1 || route.channel > 16) return source;
+	if (!validMidiRouteNumber(route.velocity, 0, 1) || !validMidiRouteNumber(route.gain, 0, 1) || !validMidiRouteNumber(route.noteOffsetMs, 0, 10_000) || !validMidiRouteNumber(route.program, 0, 127)) return source;
+	if (route.program !== null && route.program !== undefined && !Number.isInteger(route.program)) return source;
+	const routedSource = replaceSourceTrackExpression(source, trackId, ({ label, expression }) => {
+		const existingMidiMatch = topLevelMethodMatch(expression, /\.midi\s*\(/);
+		const existingMidiOpen = existingMidiMatch?.index === undefined ? -1 : expression.indexOf('(', existingMidiMatch.index);
+		const existingMidiClose = existingMidiOpen < 0 ? undefined : findMatchingCallEnd(expression, existingMidiOpen);
+		const existingMidiArguments = existingMidiOpen >= 0 && existingMidiClose !== undefined ? splitCallArguments(expression, existingMidiOpen + 1, existingMidiClose) : [];
+		const firstArgument = existingMidiArguments[0]?.text.trim() ?? '';
+		const legacyObjectForm = existingMidiArguments.length === 1 && firstArgument.startsWith('{') && firstArgument.endsWith('}');
+		const optionArguments = legacyObjectForm ? [{ text: '' }, { text: firstArgument }] : existingMidiArguments;
+		const optionsText = mergeMidiRouteOptions(optionArguments, route, legacyObjectForm && route.output !== undefined);
+		const existingOutputText = legacyObjectForm ? '' : firstArgument;
+		const outputText = route.output === undefined
+			? existingOutputText
+			: route.output === null || route.output === '' ? '' : typeof route.output === 'string' ? quoteStringLiteral(route.output) : String(route.output);
+		const midiCall = route.enabled
+			? outputText ? `.midi(${outputText}${optionsText ? `, ${optionsText}` : ''})` : optionsText ? `.midi(${optionsText})` : '.midi()'
+			: '';
+		let next = expression;
+		if (route.program !== undefined) {
+			const programCall = route.program === null ? '' : `.progNum(${route.program})`;
+			const replacement = replaceTopLevelMethodCall(next, 'progNum', programCall);
+			next = replacement.found ? replacement.expression : route.program === null ? next : appendExpressionCall(next, programCall);
+		}
+		const midiReplacement = replaceTopLevelMethodCall(next, 'midi', midiCall);
+		next = midiReplacement.expression;
+		const channelCall = route.enabled ? `.midichan(${route.channel})` : '';
+		const channelReplacement = replaceTopLevelMethodCall(next, 'midichan', channelCall);
+		next = channelReplacement.found ? channelReplacement.expression : channelCall ? appendExpressionCall(next, channelCall) : next;
+		if (route.enabled && !midiReplacement.found) next = appendExpressionCall(next, midiCall);
+		return { label, expression: next };
+	});
+	return route.instrument === undefined ? routedSource : updateTrackInstrument(routedSource, trackId, route.instrument);
+}
+
 function wrapExpressionInSeqPLoop(expression: string, start: number, end: number): string {
 	const { body: withoutComment, suffix } = splitTrailingComment(expression);
 	const trailingWhitespace = withoutComment.match(/\s*$/)?.[0] ?? '';
@@ -1073,6 +1295,47 @@ function wrapExpressionInSeqPLoop(expression: string, start: number, end: number
 	const semicolon = expressionBody.endsWith(';') ? ';' : '';
 	const body = semicolon ? expressionBody.slice(0, -1) : expressionBody;
 	return `seqPLoop([${formatNumber(start)}, ${formatNumber(end)}, ${body}])${semicolon}${trailingWhitespace}${suffix}`;
+}
+
+/**
+ * Preserve an existing source lane when its visible range grows. A normal
+ * seqPLoop range scales its contents to the new outer span, so append an
+ * explicit rest section instead of changing the old section's duration.
+ * Static note grids use their own cell-level expansion; this fallback covers
+ * procedural note patterns, sample lanes, and other source that the note-grid
+ * projection cannot safely rewrite.
+ */
+export function extendTrackSourceRangeWithRest(source: string, trackId: string, previousEndCycle: number, nextEndCycle: number): string {
+	if (!Number.isFinite(previousEndCycle) || !Number.isFinite(nextEndCycle) || nextEndCycle <= previousEndCycle) return source;
+	const block = getSourceBlockDetails(source).find((candidate) => candidate.id === trackId);
+	if (!block?.expression) return source;
+
+	return replaceExpressionBlock(source, trackId, ({ label, expression }) => {
+		const seqPrefix = expression.search(/^\s*seqPLoop\s*\(/);
+		if (seqPrefix >= 0) {
+			const open = expression.indexOf('(', seqPrefix);
+			const close = open < 0 ? undefined : findMatchingCallEnd(expression, open);
+			if (close === undefined) return { label, expression };
+			const beforeClose = expression.slice(0, close);
+			const beforeParts = splitTrailingComment(beforeClose);
+			const insertion = `, [${formatNumber(previousEndCycle)}, ${formatNumber(nextEndCycle)}, s("~")]`;
+			return {
+				label,
+				expression: `${beforeParts.body}${insertion}${beforeParts.suffix}${expression.slice(close)}`,
+			};
+		}
+
+		const { body: withoutComment, suffix } = splitTrailingComment(expression);
+		const trailingWhitespace = withoutComment.match(/\s*$/)?.[0] ?? '';
+		const expressionBody = trailingWhitespace ? withoutComment.slice(0, -trailingWhitespace.length) : withoutComment;
+		const semicolon = expressionBody.endsWith(';') ? ';' : '';
+		const body = semicolon ? expressionBody.slice(0, -1) : expressionBody;
+		const startCycle = block.timing.startCycle;
+		return {
+			label,
+			expression: `seqPLoop([${formatNumber(startCycle)}, ${formatNumber(previousEndCycle)}, ${body}], [${formatNumber(previousEndCycle)}, ${formatNumber(nextEndCycle)}, s("~")])${semicolon}${trailingWhitespace}${suffix}`,
+		};
+	});
 }
 
 function replaceNumericMethod(expression: string, method: 'gain' | 'pan', value: number): string | undefined {
@@ -1345,6 +1608,28 @@ export function updateTrackSound(source: string, trackId: string, value: string,
 	});
 }
 
+/** Update the live instrument metadata stored in a MIDI track marker. */
+export function updateTrackInstrument(source: string, trackId: string, instrument: string | null): string {
+	const details = getSourceBlockDetails(source).find((block) => block.id === trackId);
+	if (!details?.marker) return source;
+	const lineEnd = source.indexOf('\n', details.sourceRange.start);
+	const markerEnd = lineEnd === -1 ? source.length : lineEnd;
+	const markerLine = source.slice(details.sourceRange.start, markerEnd);
+	const match = markerLine.match(markerLinePattern);
+	if (!match) return source;
+	const normalizedInstrument = instrument?.trim();
+	if (normalizedInstrument && /[\r\n]/.test(normalizedInstrument)) return source;
+	try {
+		const metadata = JSON.parse(match[2]) as Record<string, unknown>;
+		if (normalizedInstrument) metadata.instrument = normalizedInstrument;
+		else delete metadata.instrument;
+		const updatedMarker = JSON.stringify(metadata);
+		return `${source.slice(0, details.sourceRange.start)}${match[1]}${updatedMarker}${match[3]}${source.slice(markerEnd)}`;
+	} catch {
+		return source;
+	}
+}
+
 /**
  * Update the display name stored in a Sushi marker. Unmanaged Strudel blocks
  * are promoted to marked blocks so a rename gives them a stable identity for
@@ -1374,7 +1659,7 @@ export function updateTrackName(source: string, trackId: string, name: string): 
 	}
 
 	const lineEnding = source.includes('\r\n') ? '\r\n' : '\n';
-	const marker = JSON.stringify({ id: details.id, name: normalizedName, type: details.type, schema: 1 });
+	const marker = JSON.stringify({ id: details.id, name: normalizedName, type: details.type, schema: 1, ...(details.instrument ? { instrument: details.instrument } : {}) });
 	return `${source.slice(0, details.sourceRange.start)}// @sushi-track ${marker}${lineEnding}${source.slice(details.sourceRange.start)}`;
 }
 
@@ -1393,16 +1678,47 @@ export function updateTrackRange(source: string, trackId: string, startCycle: nu
 		const rangePattern = new RegExp(`(seqPLoop\\s*\\(\\s*|\\]\\s*,\\s*)\\[\\s*(${numericLiteral})(\\s*,\\s*)(${numericLiteral})`, 'g');
 		const ranges = Array.from(expression.matchAll(rangePattern));
 		if (ranges.length) {
-			let rangeIndex = 0;
-			return {
-				label,
-				expression: expression.replace(rangePattern, (match, prefix: string, oldStart: string, separator: string, oldEnd: string) => {
-					const nextStart = rangeIndex === 0 ? formatNumber(start) : oldStart;
-					const nextEnd = rangeIndex === ranges.length - 1 ? formatNumber(end) : oldEnd;
-					rangeIndex += 1;
-					return `${prefix}[${nextStart}${separator}${nextEnd}`;
-				}),
-			};
+			const seqPrefix = expression.search(/^\s*seqPLoop\s*\(/);
+			const open = seqPrefix < 0 ? -1 : expression.indexOf('(', seqPrefix);
+			const close = open < 0 ? undefined : findMatchingCallEnd(expression, open);
+			if (close !== undefined) {
+				const argumentsList = splitCallArguments(expression, open + 1, close);
+				const rangeArgumentPattern = new RegExp(`^(\\s*\\[\\s*)(${numericLiteral})(\\s*,\\s*)(${numericLiteral})`);
+				const rangeArguments = argumentsList.map((argument, argumentIndex) => {
+					const match = argument.text.match(rangeArgumentPattern);
+					return match ? { argument, argumentIndex, start: Number(match[2]), end: Number(match[4]) } : undefined;
+				}).filter((argument): argument is { argument: { start: number; end: number; text: string }; argumentIndex: number; start: number; end: number } => argument !== undefined);
+				if (rangeArguments.length === ranges.length) {
+					const currentStart = Math.min(...rangeArguments.map((range) => range.start));
+					const currentEnd = Math.max(...rangeArguments.map((range) => range.end));
+					const currentSpan = currentEnd - currentStart;
+					const nextSpan = end - start;
+					const isMove = Math.abs(nextSpan - currentSpan) < 0.000001 && Math.abs(start - currentStart) > 0.000001;
+					const delta = start - currentStart;
+					const firstRangeIndex = rangeArguments[0]?.argumentIndex ?? -1;
+					const lastRangeIndex = rangeArguments.at(-1)?.argumentIndex ?? -1;
+					const updatedArguments = argumentsList.flatMap((argument, argumentIndex) => {
+						const range = rangeArguments.find((candidate) => candidate.argumentIndex === argumentIndex);
+						if (!range) return [argument.text];
+						let nextStart = isMove ? range.start + delta : range.start;
+						let nextEnd = isMove ? range.end + delta : range.end;
+						if (!isMove && argumentIndex === firstRangeIndex) nextStart = start;
+						if (!isMove && argumentIndex === lastRangeIndex) nextEnd = end;
+						// Resizing a multi-part loop must not leave a zero-width
+						// section behind: Strudel divides by the final loop span.
+						if (!isMove) {
+							nextStart = Math.max(start, nextStart);
+							nextEnd = Math.min(end, nextEnd);
+						}
+						if (nextEnd <= nextStart) return [];
+						return [argument.text.replace(rangeArgumentPattern, (_match, prefix: string, _oldStart: string, separator: string, _oldEnd: string) => `${prefix}${formatNumber(nextStart)}${separator}${formatNumber(nextEnd)}`)];
+					});
+				return {
+					label,
+					expression: `${expression.slice(0, open + 1)}${updatedArguments.join(',')}${expression.slice(close)}`,
+				};
+				}
+			}
 		}
 
 		return {

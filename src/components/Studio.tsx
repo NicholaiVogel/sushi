@@ -26,6 +26,8 @@ import {
 	updateTrackColor,
 	setTrackEffectsEnabled as setSourceTrackEffectsEnabled,
 	updateTrackMode,
+	updateTrackMidiRoute,
+	updateTrackInstrument,
 	updateTrackName as updateSourceTrackName,
 	updateTrackPan,
 	updateTrackRange as updateSourceTrackRange,
@@ -33,8 +35,10 @@ import {
 	updateTrackSlider,
 	updateTrackSound as updateSourceTrackSound,
 	type SourceEffectValue,
+	type TrackMidiRouteUpdate,
 } from '../lib/project/source-mapper';
 import type { TrackEffectMethod } from '../lib/strudel/track-effects';
+import { extendNoteGridSourceRange, midiToNoteName, normalizeNoteGridSourceRanges, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
 import type { EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
@@ -44,11 +48,16 @@ import { listStoredProjects, loadProjectSnapshot, parseProjectExport, saveProjec
 import { isAudioLockedError, StrudelAdapter, type AdapterResult, type AdapterRuntimeUpdate, type StrudelEvaluationUpdate, type StrudelHap, type StrudelVisualizer, type VisualizerHap } from '../lib/strudel/adapter';
 import type { WebMcpMutationResult, WebMcpRegistration } from '../lib/webmcp/tools';
 import { TransactionCache } from '../lib/webmcp/transaction-cache';
+import { COMPUTER_KEYBOARD_INPUT_ID, MidiService } from '../lib/midi/service';
+import type { MidiChannel, MidiClockSnapshot, MidiClockMode, MidiRecordedTake, MidiRecordingOptions, MidiRuntimeState } from '../lib/midi/types';
+import { writeMidiTakeToSource } from '../lib/midi/source-writer';
 import { StudioHeader } from './studio/StudioHeader';
 import { SourceEditor, CanvasDiagnostic, type StrudelCodeMirrorModule } from './studio/SourceEditor';
 import { Timeline } from './studio/Timeline';
 import { TrackContextMenu } from './studio/TrackContextMenu';
 import { TrackFxDrawer } from './studio/TrackFxDrawer';
+import { NoteEditor } from './studio/NoteEditor';
+import { MidiPanel } from './studio/MidiPanel';
 import { useStudioWebMcp } from './studio/useStudioWebMcp';
 import { APPEARANCE_STORAGE_KEY, normalizeAppearanceMode, readStoredAppearanceMode, type AppearanceMode } from '../lib/project/appearance';
 import {
@@ -59,8 +68,8 @@ import {
 	getErrorDiagnostic,
 	getExplicitSourceEndCycle,
 	getKeyParts,
-	getSourceCycleStep,
 	getTrackColor,
+	getSourceCycleStep,
 	getTrackTimingForTimeline,
 	formatClock,
 	formatCycle,
@@ -86,6 +95,104 @@ import type {
 	StudioState,
 	TimingDrag,
 } from './studio/types';
+
+// The home row is the familiar browser-piano layout: white keys are A–K and
+// the raised keys are W/E/T/Y/U. Z–M supplies a lower white-key octave.
+const COMPUTER_KEYBOARD_NOTE_BY_CODE: Readonly<Record<string, number>> = {
+	KeyZ: 48,
+	KeyX: 50,
+	KeyC: 52,
+	KeyV: 53,
+	KeyB: 55,
+	KeyN: 57,
+	KeyM: 59,
+	KeyA: 60,
+	KeyW: 61,
+	KeyS: 62,
+	KeyE: 63,
+	KeyD: 64,
+	KeyF: 65,
+	KeyT: 66,
+	KeyG: 67,
+	KeyY: 68,
+	KeyH: 69,
+	KeyU: 70,
+	KeyJ: 71,
+	KeyK: 72,
+	KeyL: 74,
+	Semicolon: 76,
+};
+
+function isKeyboardTextEntryTarget(target: EventTarget | null): boolean {
+	if (!(target instanceof HTMLElement)) return false;
+	return target instanceof HTMLInputElement
+		|| target instanceof HTMLTextAreaElement
+		|| target instanceof HTMLSelectElement
+		|| target.isContentEditable
+		|| Boolean(target.closest('.cm-editor, .source-editor, .note-editor'));
+}
+
+function noteGridFromMidiTake(take: MidiRecordedTake, timingStartCycle: number, timingEndCycle: number, stepCycle: number, sound: string): NoteGrid {
+	const safeStepCycle = Math.max(1 / 4096, stepCycle);
+	const patternCycles = Math.max(safeStepCycle, timingEndCycle - timingStartCycle, take.endedAtCycle - timingStartCycle);
+	const notes = take.notes.map((note, index) => {
+		const startCycle = Math.max(0, note.startCycle - timingStartCycle);
+		return {
+			id: `live-${take.trackId}-${note.id}-${index}`,
+			slot: Math.max(0, Math.floor(startCycle / safeStepCycle)),
+			stackIndex: 0,
+			startCycle,
+			durationCycles: Math.max(safeStepCycle / 4, note.endCycle - note.startCycle),
+			midi: note.note,
+			sourceValue: midiToNoteName(note.note),
+		};
+	});
+	const steps = Math.max(1, Math.ceil(patternCycles / safeStepCycle));
+	const values = Array.from({ length: steps }, () => [] as string[]);
+	for (const note of notes) {
+		const slot = Math.min(steps - 1, note.slot);
+		values[slot].push(note.sourceValue);
+	}
+	return {
+		trackId: take.trackId,
+		sourceKind: 'note',
+		steps,
+		patternCycles,
+		stepCycle: safeStepCycle,
+		sourceStepCycle: safeStepCycle,
+		startOffsets: Array.from({ length: steps }, () => 0),
+		values,
+		durationInsidePattern: true,
+		tokens: values.map((slot) => slot.length ? slot.join(' ') : '~'),
+		durations: Array.from({ length: steps }, () => safeStepCycle),
+		durationMode: 'dur',
+		sound,
+		octaveShift: 0,
+		notes,
+		editable: true,
+	};
+}
+
+async function waitForMidiBoundary(clock: () => MidiClockSnapshot, targetCycle: number, isCancelled: () => boolean): Promise<boolean> {
+	if (!Number.isFinite(targetCycle)) return false;
+	return new Promise((resolve) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const poll = () => {
+			if (isCancelled()) {
+				if (timer !== undefined) clearTimeout(timer);
+				resolve(false);
+				return;
+			}
+			if (clock().cycle >= targetCycle - 0.01) {
+				resolve(true);
+				return;
+			}
+			timer = setTimeout(poll, 10);
+		};
+		poll();
+	});
+}
+
 export default function Studio() {
 	const [studio, setStudio] = useState<StudioState>(createInitialStudioState);
 	const [appearanceMode, setAppearanceMode] = useState<AppearanceMode>(readStoredAppearanceMode);
@@ -93,12 +200,16 @@ export default function Studio() {
 	const [editorWidth, setEditorWidth] = useState(350);
 	const [, setSourceHistoryVersion] = useState(0);
 	const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+	const selectedTrackIdRef = useRef<string | null>(null);
+	selectedTrackIdRef.current = selectedTrackId;
 	const [fxDrawerTrackId, setFxDrawerTrackId] = useState<string | null>(null);
+	const [noteEditorTrackId, setNoteEditorTrackId] = useState<string | null>(null);
 	const [contextMenu, setContextMenu] = useState<{ trackId: string; x: number; y: number } | null>(null);
 	const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
 	const [renamingTrackValue, setRenamingTrackValue] = useState('');
 	const [timelineZoom, setTimelineZoom] = useState(0);
 	const [openHeaderPopover, setOpenHeaderPopover] = useState<HeaderPopover | null>(null);
+	const [midiPanelOpen, setMidiPanelOpen] = useState(false);
 	const [localProjects, setLocalProjects] = useState<StoredProjectSummary[]>([]);
 	const [localProjectsLoading, setLocalProjectsLoading] = useState(false);
 	const [localProjectsError, setLocalProjectsError] = useState<string | null>(null);
@@ -138,9 +249,92 @@ export default function Studio() {
 		redo: [],
 	});
 	const sourceTransactionsRef = useRef(new TransactionCache<WebMcpMutationResult>(SOURCE_HISTORY_LIMIT));
+	const [midiService] = useState(() => new MidiService());
+	const midiServiceRef = useRef(midiService);
+	const externalMidiCpsRef = useRef<number | null>(null);
+	const midiRecordStartTokenRef = useRef(0);
+	const autoCommitMidiTakeRef = useRef(false);
+	const commitMidiTakeRef = useRef<((expectedRevision?: number) => Promise<CommitSourceResult>) | null>(null);
 	const webmcpRegistrationRef = useRef<WebMcpRegistration | null>(null);
 	const webmcpAvailableRef = useRef(false);
 	const isDarkMode = appearanceMode === 'dark' || (appearanceMode === 'system' && systemPrefersDark);
+	const [midiState, setMidiState] = useState(() => midiServiceRef.current.getState());
+	const getMidiClock = useCallback((): MidiClockSnapshot => {
+		const globals = liveSourceGlobalsRef.current ?? getSourceGlobals(studioRef.current.lastValid);
+		const timestampMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+		return {
+			cycle: adapterRef.current?.getCurrentCycle() ?? studioRef.current.runtime.currentCycle,
+			timestampMs,
+			cyclesPerSecond: externalMidiCpsRef.current ?? Math.max(0.000001, globals.bpm / (60 * Math.max(0.000001, globals.quarterNotesPerCycle))),
+		};
+	}, []);
+
+	useEffect(() => {
+		const service = midiServiceRef.current;
+		service.setClock(getMidiClock);
+		const unsubscribe = service.subscribe(setMidiState);
+		service.setLiveInputHandler((event) => {
+			if (!event.on) {
+				adapterRef.current?.releaseLiveMidiNote(event.note, event.channel);
+				return;
+			}
+			const sourceTracks = getSourceBlockDetails(studioRef.current.lastValid);
+			const selected = selectedTrackIdRef.current ? sourceTracks.find((track) => track.id === selectedTrackIdRef.current) : undefined;
+			const midiTrack = selected?.type === 'midi' ? selected : sourceTracks.find((track) => track.type === 'midi');
+			void adapterRef.current?.triggerLiveMidiNote(event.note, event.velocity, midiTrack?.instrument ?? 'sine', undefined, event.channel);
+		});
+		return () => {
+			service.setLiveInputHandler(undefined);
+			adapterRef.current?.releaseAllLiveMidiNotes();
+			unsubscribe();
+			service.destroy();
+		};
+	}, [getMidiClock]);
+
+	useEffect(() => {
+		const heldKeys = new Map<string, number>();
+		const releaseHeldKeys = () => {
+			for (const [code, note] of heldKeys) {
+				midiServiceRef.current.ingestKeyboardNote(note, 0, false);
+				heldKeys.delete(code);
+			}
+			adapterRef.current?.releaseAllLiveMidiNotes();
+		};
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (event.defaultPrevented || event.repeat || isKeyboardTextEntryTarget(event.target)) return;
+			const baseNote = COMPUTER_KEYBOARD_NOTE_BY_CODE[event.code];
+			if (baseNote === undefined) return;
+			const note = Math.max(0, Math.min(127, baseNote + (event.shiftKey ? 12 : 0)));
+			if (heldKeys.has(event.code)) return;
+			heldKeys.set(event.code, note);
+			event.preventDefault();
+			midiServiceRef.current.ingestKeyboardNote(note, 0.78, true);
+		};
+		const handleKeyUp = (event: KeyboardEvent) => {
+			const note = heldKeys.get(event.code);
+			if (note === undefined) return;
+			heldKeys.delete(event.code);
+			event.preventDefault();
+			midiServiceRef.current.ingestKeyboardNote(note, 0, false);
+		};
+		window.addEventListener('keydown', handleKeyDown);
+		window.addEventListener('keyup', handleKeyUp);
+		window.addEventListener('blur', releaseHeldKeys);
+		document.addEventListener('visibilitychange', releaseHeldKeys);
+		return () => {
+			releaseHeldKeys();
+			window.removeEventListener('keydown', handleKeyDown);
+			window.removeEventListener('keyup', handleKeyUp);
+			window.removeEventListener('blur', releaseHeldKeys);
+			document.removeEventListener('visibilitychange', releaseHeldKeys);
+		};
+	}, []);
+
+	useEffect(() => {
+		if (midiState.recording.status !== 'recording') return undefined;
+		const timer = window.setInterval(() => midiServiceRef.current.update(), 50);
+		return () => window.clearInterval(timer);
+	}, [midiState.recording.status]);
 
 	const handleAppearanceModeChange = useCallback((mode: AppearanceMode) => {
 		const nextMode = normalizeAppearanceMode(mode);
@@ -217,6 +411,10 @@ export default function Studio() {
 	}, []);
 
 	const patchRuntime = useCallback((update: AdapterRuntimeUpdate) => {
+		if (update.transport && update.transport !== 'playing') {
+			adapterRef.current?.releaseAllLiveMidiNotes();
+			if (update.transport === 'stopped') midiServiceRef.current.panic();
+		}
 		const runtime = { ...studioRef.current.runtime, ...update };
 		const next = { ...studioRef.current, runtime };
 		studioRef.current = next;
@@ -314,9 +512,14 @@ export default function Studio() {
 			const isUntouchedLegacySeed = storedProject?.source.revision === 0
 				&& storedProject.source.draft === LEGACY_DEFAULT_SOURCE
 				&& storedProject.source.lastValid === LEGACY_DEFAULT_SOURCE;
-			const project = !storedProject
+			const baseProject = !storedProject
 				? fallbackProject
 				: isUntouchedLegacySeed ? { ...storedProject, source: fallbackProject.source } : storedProject;
+			const repairedDraft = normalizeNoteGridSourceRanges(baseProject.source.draft);
+			const repairedLastValid = normalizeNoteGridSourceRanges(baseProject.source.lastValid);
+			const project = repairedDraft === baseProject.source.draft && repairedLastValid === baseProject.source.lastValid
+				? baseProject
+				: { ...baseProject, source: { ...baseProject.source, draft: repairedDraft, lastValid: repairedLastValid } };
 			const activeRevision = !storedProject || isUntouchedLegacySeed
 				? fallbackProject.source.revision
 				: stored?.activeRevision ?? project.source.revision;
@@ -484,6 +687,9 @@ export default function Studio() {
 				if (options.expectedRevision !== undefined && current.revision !== options.expectedRevision) {
 					return { ok: false, changed: false, previousSource, source, revision: current.revision, conflict: { expectedRevision: options.expectedRevision, actualRevision: current.revision } };
 				}
+				// Normalize source-generated static note lanes before validation so the
+				// source sent to Strudel has the same bar spacing the timeline displays.
+				source = normalizeNoteGridSourceRanges(source);
 				const hasSourceDiagnostics = current.diagnostics.some((diagnostic) => diagnostic.phase !== 'audio');
 				if (source === current.lastValid && source === current.draft && !hasSourceDiagnostics) {
 					sourceHistoryRef.current.cursorSource = source;
@@ -518,8 +724,16 @@ export default function Studio() {
 					if (mountedRef.current && studioGenerationRef.current === operationGeneration) await persistStudioSnapshot(undefined, operationGeneration);
 					return { ok: false, changed: source !== previousSource, previousSource, source, revision, error: diagnostic };
 				}
+				const wasPlaying = current.runtime.transport === 'playing';
 				let result: AdapterResult;
 				try {
+					// Re-evaluation tears down the active Strudel pattern. Panic first so
+					// external instruments cannot retain a note while the new source is
+					// validated and the accepted pattern is restored.
+					if (studioRef.current.runtime.transport !== 'stopped' || midiServiceRef.current.getState().clockRunning) {
+						midiServiceRef.current.panic();
+						adapter.releaseAllLiveMidiNotes();
+					}
 					result = await adapter.evaluateSource(source, {
 						autoplay: false,
 						restoreSource: current.lastValid,
@@ -527,9 +741,12 @@ export default function Studio() {
 				} catch (error) {
 					result = { ok: false, error };
 				}
+				if (wasPlaying && studioRef.current.runtime.transport === 'playing') midiServiceRef.current.startTransportClock();
 
 				if (!mountedRef.current || studioGenerationRef.current !== operationGeneration) return { ok: false, changed: false, previousSource, source, revision };
 				if (result.ok) {
+					midiServiceRef.current.setTempo(getSourceGlobals(source).bpm);
+					if (externalMidiCpsRef.current !== null) adapter.setRuntimeCps(externalMidiCpsRef.current);
 					const explicitEndCycle = getExplicitSourceEndCycle(source);
 					const nextSongEndCycle = getTimelineCapacityForEndCycle(Math.max(studioRef.current.songEndCycle, explicitEndCycle));
 					adapter.setSongEndCycle(nextSongEndCycle);
@@ -615,7 +832,7 @@ export default function Studio() {
 
 	useEffect(() => cancelPendingTrackCommit, [cancelPendingTrackCommit]);
 
-	const addTrack = useCallback(async () => {
+	const createTrack = useCallback(async (kind: 'audio' | 'midi'): Promise<string | null> => {
 		cancelPendingTrackCommit();
 		const baseRevision = studioRef.current.revision;
 		const draft = studioRef.current.draft.trimEnd();
@@ -628,21 +845,34 @@ export default function Studio() {
 				: `${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
 			trackId = `trk_${randomUuid}`;
 		}
-		const nextSource = `${currentSource}\n\n// @sushi-track {"id":"${trackId}","name":"untitled","type":"synth","schema":1}\n$: seqPLoop([0, 4, note("<c3 e3 g3 a3>").s("sine").gain(0.18)])\n`;
-		await commitSource(nextSource, { expectedRevision: baseRevision });
+		const marker = kind === 'midi'
+			? JSON.stringify({ id: trackId, name: 'MIDI Track', type: 'midi', instrument: 'sine', schema: 1 })
+			: JSON.stringify({ id: trackId, name: 'untitled', type: 'synth', schema: 1 });
+		const expression = kind === 'midi'
+			? '$: silence'
+			: '$: seqPLoop([0, 4, note("c3 e3 g3 a3").slow(4).s("sine").gain(0.18)])';
+		const nextSource = `${currentSource}\n\n// @sushi-track ${marker}\n${expression}\n`;
+		const result = await commitSource(nextSource, { expectedRevision: baseRevision });
+		if (!result.ok) return null;
+		setSelectedTrackId(trackId);
+		if (kind === 'midi') setFxDrawerTrackId(trackId);
+		return trackId;
 	}, [cancelPendingTrackCommit, commitSource]);
+	const addAudioTrack = useCallback(() => { void createTrack('audio'); }, [createTrack]);
+	const addMidiTrack = useCallback(() => { void createTrack('midi'); }, [createTrack]);
 
 	const updateSourceDraft = useCallback(
-		(update: (source: string) => string) => {
+		(update: (source: string) => string): boolean => {
 			const currentSource = studioRef.current.draft;
 			const nextSource = update(currentSource);
-			if (nextSource === currentSource) return;
+			if (nextSource === currentSource) return false;
 			const baseRevision = studioRef.current.revision;
 			patchStudio({
 				draft: nextSource,
 				...(studioRef.current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
 			});
 			queueTrackCommit(nextSource, baseRevision);
+			return true;
 		},
 		[patchStudio, queueTrackCommit],
 	);
@@ -653,7 +883,7 @@ export default function Studio() {
 	);
 
 	const setTrackRange = useCallback(
-		(trackId: string, startCycle: number, endCycle: number) => {
+		(trackId: string, startCycle: number, endCycle: number, dragBase?: Pick<TimingDrag, 'source' | 'startCycle' | 'endCycle'>) => {
 			const current = studioRef.current;
 			const requestedEndCycle = Math.max(
 				Number.isFinite(startCycle) ? startCycle : 0,
@@ -668,7 +898,33 @@ export default function Studio() {
 				void persistStudioSnapshot();
 			}
 			const range = normalizeTrackRange(startCycle, endCycle, nextSongEndCycle);
-			updateTrackSource(trackId, (source) => updateSourceTrackRange(source, trackId, range.startCycle, range.endCycle, getSourceCycleStep(source)));
+			const mutationSource = dragBase?.source ?? sourceForTrackMutation(current);
+			const currentTrack = getSourceBlockDetails(mutationSource).find((track) => track.id === trackId);
+			const currentTiming = currentTrack ? getTrackTimingForTimeline(currentTrack, current.songEndCycle) : undefined;
+			const baseStartCycle = dragBase?.startCycle ?? currentTiming?.startCycle;
+			const baseEndCycle = dragBase?.endCycle ?? currentTiming?.endCycle;
+			const sameStart = baseStartCycle !== undefined && Math.abs(range.startCycle - baseStartCycle) < 0.000001;
+			const extendsEnd = sameStart && baseEndCycle !== undefined && range.endCycle > baseEndCycle;
+			const shrinksEnd = sameStart && baseEndCycle !== undefined && range.endCycle < baseEndCycle;
+			const adjusted = baseEndCycle === undefined
+				? mutationSource
+				: extendsEnd
+					? extendNoteGridSourceRange(mutationSource, trackId, baseEndCycle, range.endCycle)
+					: shrinksEnd ? trimNoteGridSourceRange(mutationSource, trackId, range.endCycle) : mutationSource;
+			const nextSource = updateSourceTrackRange(adjusted, trackId, range.startCycle, range.endCycle, getSourceCycleStep(adjusted));
+			if (dragBase) {
+				if (nextSource === current.draft) return;
+				patchStudio({
+					draft: nextSource,
+					...(current.diagnostics.length ? { diagnostics: [], phase: 'ready' as const } : {}),
+				});
+				// Keep drag previews in the draft, but validate only the final range
+				// on pointer-up. Otherwise an intermediate pointer event can commit
+				// first and make the next event conflict against its old revision.
+				pendingTrackSourceRef.current = { source: nextSource, baseRevision: current.revision };
+				return;
+			}
+			updateTrackSource(trackId, () => nextSource);
 		},
 		[patchStudio, persistStudioSnapshot, updateTrackSource],
 	);
@@ -715,12 +971,12 @@ export default function Studio() {
 	);
 
 	const setTempo = useCallback(
-		(bpm: number): void => updateGlobalSource((source) => updateSourceBpm(source, bpm)),
+		(bpm: number): void => { updateGlobalSource((source) => updateSourceBpm(source, bpm)); },
 		[updateGlobalSource],
 	);
 
 	const setKey = useCallback(
-		(key: string): void => updateGlobalSource((source) => updateSourceKey(source, key)),
+		(key: string): void => { updateGlobalSource((source) => updateSourceKey(source, key)); },
 		[updateGlobalSource],
 	);
 
@@ -759,7 +1015,18 @@ export default function Studio() {
 				: current.songEndCycle;
 			const range = normalizeTrackRange(startCycle, endCycle, timelineEndCycle);
 			const source = sourceForTrackMutation(current);
-			const nextSource = updateSourceTrackRange(source, trackId, range.startCycle, range.endCycle);
+			const currentTrack = getSourceBlockDetails(source).find((track) => track.id === trackId);
+			const currentTiming = currentTrack ? getTrackTimingForTimeline(currentTrack, current.songEndCycle) : undefined;
+			const previousEndCycle = currentTiming?.endCycle;
+			const sameStart = currentTiming !== undefined && Math.abs(range.startCycle - currentTiming.startCycle) < 0.000001;
+			const extendsEnd = sameStart && currentTiming !== undefined && range.endCycle > currentTiming.endCycle;
+			const shrinksEnd = sameStart && currentTiming !== undefined && range.endCycle < currentTiming.endCycle;
+			const adjusted = previousEndCycle === undefined
+				? source
+				: extendsEnd
+					? extendNoteGridSourceRange(source, trackId, previousEndCycle, range.endCycle)
+					: shrinksEnd ? trimNoteGridSourceRange(source, trackId, range.endCycle) : source;
+			const nextSource = updateSourceTrackRange(adjusted, trackId, range.startCycle, range.endCycle);
 			if (nextSource === source) {
 				return { ok: true, changed: false, previousSource: source, source, revision: current.revision };
 			}
@@ -810,7 +1077,10 @@ export default function Studio() {
 				};
 			}
 			const result = await commitSource(nextSource);
-			if (result.ok) setSelectedTrackId((selected) => selected === trackId ? null : selected);
+			if (result.ok) {
+				setSelectedTrackId((selected) => selected === trackId ? null : selected);
+				setNoteEditorTrackId((selected) => selected === trackId ? null : selected);
+			}
 			return result;
 		},
 		[cancelPendingTrackCommit, commitSource],
@@ -835,7 +1105,7 @@ export default function Studio() {
 			if (drag.edge === 'move') {
 				const delta = nextCycle - drag.pointerStartCycle;
 				const range = shiftTrackRange(drag.startCycle, drag.endCycle, delta);
-				setTrackRange(drag.trackId, range.startCycle, range.endCycle);
+				setTrackRange(drag.trackId, range.startCycle, range.endCycle, drag);
 				return;
 			}
 
@@ -843,7 +1113,7 @@ export default function Studio() {
 			if (!details) return;
 			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, drag.endCycle - TIMELINE_SNAP_CYCLE) : drag.startCycle;
 			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, drag.startCycle + TIMELINE_SNAP_CYCLE) : drag.endCycle;
-			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.max(0, endCycle));
+			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.max(0, endCycle), drag);
 		},
 		[setTrackRange],
 	);
@@ -853,7 +1123,12 @@ export default function Studio() {
 		window.removeEventListener('pointermove', handleTimingPointerMove);
 		window.removeEventListener('pointerup', stopTimingDrag);
 		window.removeEventListener('pointercancel', stopTimingDrag);
-	}, [handleTimingPointerMove]);
+		const pending = pendingTrackSourceRef.current;
+		if (pending) {
+			pendingTrackSourceRef.current = null;
+			void commitSource(pending.source, { expectedRevision: pending.baseRevision });
+		}
+	}, [commitSource, handleTimingPointerMove]);
 
 	const startTimingDrag = useCallback(
 		(event: ReactPointerEvent<HTMLElement>, trackId: string, edge: 'start' | 'end' | 'move') => {
@@ -862,6 +1137,8 @@ export default function Studio() {
 			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === trackId);
 			if (!details) return;
 			const timing = getTrackTimingForTimeline(details, studioRef.current.songEndCycle);
+			const source = sourceForTrackMutation(studioRef.current);
+			cancelPendingTrackCommit();
 			event.preventDefault();
 			event.stopPropagation();
 			const rect = lane.getBoundingClientRect();
@@ -871,6 +1148,7 @@ export default function Studio() {
 			timingDragRef.current = {
 				trackId,
 				edge,
+				source,
 				lane,
 				pointerStartCycle: snapCycle(pointerCycle),
 				startCycle: timing.startCycle,
@@ -882,7 +1160,7 @@ export default function Studio() {
 			window.addEventListener('pointerup', stopTimingDrag);
 			window.addEventListener('pointercancel', stopTimingDrag);
 		},
-		[handleTimingPointerMove, stopTimingDrag],
+		[cancelPendingTrackCommit, handleTimingPointerMove, stopTimingDrag],
 	);
 
 	useEffect(() => stopTimingDrag, [stopTimingDrag]);
@@ -957,6 +1235,26 @@ export default function Studio() {
 		[updateTrackSource],
 	);
 
+	const setTrackMidiRoute = useCallback(
+		(trackId: string, output: string | number | null | undefined, channel: number, enabled: boolean, settings: Pick<TrackMidiRouteUpdate, 'instrument' | 'velocity' | 'gain' | 'noteOffsetMs' | 'midimap' | 'program'> = {}) => updateTrackSource(trackId, (source) => updateTrackMidiRoute(source, trackId, { output, channel, enabled, ...settings })),
+		[updateTrackSource],
+	);
+	const setMidiInstrument = useCallback(
+		(trackId: string, instrument: string | null) => updateTrackSource(trackId, (source) => updateTrackInstrument(source, trackId, instrument)),
+		[updateTrackSource],
+	);
+	const commitTrackMidiRoute = useCallback(
+		async (trackId: string, output: string | number | null | undefined, channel: number, enabled: boolean, settings: Pick<TrackMidiRouteUpdate, 'instrument' | 'velocity' | 'gain' | 'noteOffsetMs' | 'midimap' | 'program'> = {}, expectedRevision?: number): Promise<CommitSourceResult> => {
+			cancelPendingTrackCommit();
+			const current = studioRef.current;
+			const source = sourceForTrackMutation(current);
+			const nextSource = updateTrackMidiRoute(source, trackId, { output, channel, enabled, ...settings });
+			if (nextSource === source) return { ok: true, changed: false, previousSource: source, source, revision: current.revision };
+			return commitSource(nextSource, expectedRevision === undefined ? {} : { expectedRevision });
+		},
+		[cancelPendingTrackCommit, commitSource],
+	);
+
 	const setQuarterNotesPerCycle = useCallback(
 		(value: number) => updateSourceDraft((source) => updateSourceQuarterNotesPerCycle(source, value)),
 		[updateSourceDraft],
@@ -1020,6 +1318,7 @@ export default function Studio() {
 		}
 
 		cancelPendingTrackCommit();
+		midiServiceRef.current.panic();
 		patchStudio({ phase: 'validating', diagnostics: [] });
 		const stopped = await adapter.stop();
 		if (!mountedRef.current || studioGenerationRef.current !== generation) return false;
@@ -1034,6 +1333,8 @@ export default function Studio() {
 			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(imported.project.source.revision, evaluated.error, 'evaluate', imported.project.source.lastValid)] });
 			return false;
 		}
+		midiServiceRef.current.setTempo(getSourceGlobals(imported.project.source.lastValid).bpm);
+		if (externalMidiCpsRef.current !== null) adapter.setRuntimeCps(externalMidiCpsRef.current);
 
 		let draftDiagnostics: SourceDiagnostic[] = [];
 		if (imported.project.source.draft !== imported.project.source.lastValid) {
@@ -1132,6 +1433,7 @@ export default function Studio() {
 
 	const selectTrack = useCallback((trackId: string) => {
 		setSelectedTrackId(trackId);
+		setNoteEditorTrackId((openTrackId) => openTrackId && openTrackId !== trackId ? null : openTrackId);
 		setContextMenu(null);
 		setFxDrawerTrackId((current) => current ? trackId : current);
 	}, []);
@@ -1156,6 +1458,27 @@ export default function Studio() {
 		setRenamingTrackValue('');
 	}, []);
 
+	const openNoteEditor = useCallback((trackId: string) => {
+		if (!getSourceBlocks(studioRef.current.lastValid).some((track) => track.id === trackId)) return;
+		cancelTrackRename();
+		setSelectedTrackId(trackId);
+		setContextMenu(null);
+		setNoteEditorTrackId(trackId);
+	}, [cancelTrackRename]);
+
+	const closeNoteEditor = useCallback(() => {
+		setNoteEditorTrackId(null);
+	}, []);
+
+	const updateTrackNoteGrid = useCallback(
+		(trackId: string, edit: NoteGridEdit) => updateTrackSource(trackId, (source) => updateNoteGridSource(source, trackId, edit)),
+		[updateTrackSource],
+	);
+
+	const previewTrackNote = useCallback((midi: number, sound: string) => {
+		void adapterRef.current?.previewNote(midiToNoteName(midi), sound);
+	}, []);
+
 	const finishTrackRename = useCallback(
 		async (trackId: string, name = renamingTrackValue) => {
 			const result = await renameTrack(trackId, name);
@@ -1177,7 +1500,7 @@ export default function Studio() {
 		event.preventDefault();
 		selectTrack(trackId);
 		const menuWidth = 260;
-		const menuHeight = 280;
+		const menuHeight = 320;
 		const maxX = Math.max(8, window.innerWidth - menuWidth - 8);
 		const maxY = Math.max(8, window.innerHeight - menuHeight - 8);
 		setContextMenu({ trackId, x: Math.min(Math.max(8, event.clientX), maxX), y: Math.min(Math.max(8, event.clientY), maxY) });
@@ -1189,7 +1512,7 @@ export default function Studio() {
 			event.preventDefault();
 			const rect = event.currentTarget.getBoundingClientRect();
 			const menuWidth = 260;
-			const menuHeight = 280;
+			const menuHeight = 320;
 			const maxX = Math.max(8, window.innerWidth - menuWidth - 8);
 			const maxY = Math.max(8, window.innerHeight - menuHeight - 8);
 			selectTrack(trackId);
@@ -1290,6 +1613,7 @@ export default function Studio() {
 				// instead of passing the stale pre-commit snapshot to the scheduler.
 				const result = await adapter.play(studioRef.current.songEndCycle);
 				if (result.ok) {
+					midiServiceRef.current.startTransportClock();
 					const remainingDiagnostics = studioRef.current.diagnostics.filter((diagnostic) => diagnostic.phase !== 'audio');
 					patchStudio({
 						phase: remainingDiagnostics.length ? 'error' : 'ready',
@@ -1313,8 +1637,13 @@ export default function Studio() {
 			}
 
 			if (command.type === 'pause') {
+				const midiRecording = midiServiceRef.current.getState().recording.status;
+				if (midiRecording === 'recording') midiServiceRef.current.stopRecording(getMidiClock());
+				midiServiceRef.current.panic();
+				if (midiRecording === 'count-in' || midiRecording === 'armed') midiServiceRef.current.cancelRecording();
 				const result = await adapter.pause();
 				if (result.ok) {
+					midiServiceRef.current.stopTransportClock();
 					const remainingDiagnostics = studioRef.current.diagnostics.filter((diagnostic) => diagnostic.phase !== 'audio');
 					patchStudio({
 						phase: remainingDiagnostics.length ? 'error' : 'ready',
@@ -1333,9 +1662,12 @@ export default function Studio() {
 			}
 
 			if (command.type === 'seek') {
+				const wasPlaying = studioRef.current.runtime.transport === 'playing';
 				const targetCycle = clamp(command.cycle, 0, studioRef.current.songEndCycle);
+				if (wasPlaying) midiServiceRef.current.panic();
 				const result = await adapter.seek(targetCycle);
 				if (result.ok) {
+					if (wasPlaying) midiServiceRef.current.startTransportClock();
 					patchStudio({ runtime: { ...studioRef.current.runtime, currentCycle: targetCycle } });
 				} else {
 					patchStudio({
@@ -1347,13 +1679,21 @@ export default function Studio() {
 				return { ok: true };
 			}
 
-				const result = await adapter.stop();
-				if (result.ok) {
-					const remainingDiagnostics = studioRef.current.diagnostics.filter((diagnostic) => diagnostic.phase !== 'audio');
-					patchStudio({
-						phase: remainingDiagnostics.length ? 'error' : 'ready',
-						diagnostics: remainingDiagnostics,
-						runtime: { ...studioRef.current.runtime, transport: 'stopped', currentCycle: 0 },
+			const midiRecording = midiServiceRef.current.getState().recording.status;
+			if (midiRecording === 'recording') {
+				autoCommitMidiTakeRef.current = true;
+				midiServiceRef.current.stopRecording(getMidiClock());
+			}
+			if (midiRecording === 'count-in' || midiRecording === 'armed') midiServiceRef.current.cancelRecording();
+			midiServiceRef.current.panic();
+			const result = await adapter.stop();
+			if (result.ok) {
+				midiServiceRef.current.stopTransportClock();
+				const remainingDiagnostics = studioRef.current.diagnostics.filter((diagnostic) => diagnostic.phase !== 'audio');
+				patchStudio({
+					phase: remainingDiagnostics.length ? 'error' : 'ready',
+					diagnostics: remainingDiagnostics,
+					runtime: { ...studioRef.current.runtime, transport: 'stopped', currentCycle: 0 },
 				});
 			} else {
 				patchStudio({
@@ -1365,8 +1705,257 @@ export default function Studio() {
 			}
 			return { ok: true };
 		},
-		[cancelPendingTrackCommit, commitSource, patchStudio],
+		[cancelPendingTrackCommit, commitSource, getMidiClock, patchStudio],
 	);
+
+	useEffect(() => {
+		if (midiState.recording.status !== 'review' || studio.runtime.transport !== 'playing' || autoCommitMidiTakeRef.current) return;
+		void dispatch({ type: 'stop' });
+	}, [dispatch, midiState.recording.status, studio.runtime.transport]);
+
+	useEffect(() => {
+		const service = midiServiceRef.current;
+		const sourceCps = () => {
+			const globals = getSourceGlobals(studioRef.current.lastValid);
+			return Math.max(0.000001, globals.bpm / (60 * Math.max(0.000001, globals.quarterNotesPerCycle)));
+		};
+		const restoreSourceCps = () => {
+			externalMidiCpsRef.current = null;
+			adapterRef.current?.setRuntimeCps(sourceCps());
+		};
+		service.setExternalTransportHandler((action) => {
+			if (service.getState().clockMode !== 'receive') return;
+			if (action === 'stop') {
+				restoreSourceCps();
+				void dispatch({ type: 'stop' });
+			} else void dispatch({ type: 'play' });
+		});
+		service.setExternalClockHandler((update) => {
+			if (service.getState().clockMode !== 'receive') return;
+			if (update.action === 'stop') {
+				restoreSourceCps();
+				return;
+			}
+			if (update.action === 'clock' && update.bpm !== undefined) {
+				const globals = getSourceGlobals(studioRef.current.lastValid);
+				externalMidiCpsRef.current = update.bpm / (60 * Math.max(0.000001, globals.quarterNotesPerCycle));
+				adapterRef.current?.setRuntimeCps(externalMidiCpsRef.current);
+			}
+		});
+		return () => {
+			service.setExternalTransportHandler(undefined);
+			service.setExternalClockHandler(undefined);
+			restoreSourceCps();
+		};
+	}, [dispatch]);
+
+	const connectMidi = useCallback((sysex = false) => {
+		// The Connect button is the visible gesture that may both request MIDI
+		// permission and unlock the shared Strudel Web Audio context for live keys.
+		void adapterRef.current?.unlockAudio();
+		const service = midiServiceRef.current;
+		void service.connect({ sysex }).then(() => {
+			if (studioRef.current.runtime.transport === 'playing' && service.getState().clockMode === 'send') service.startTransportClock();
+		});
+	}, []);
+	const disconnectMidi = useCallback(() => {
+		adapterRef.current?.releaseAllLiveMidiNotes();
+		void midiServiceRef.current.disconnect();
+	}, []);
+	const refreshMidi = useCallback(() => {
+		midiServiceRef.current.refreshPorts();
+	}, []);
+	const setMidiInput = useCallback((id: string | null) => {
+		midiServiceRef.current.setSelectedInput(id);
+	}, []);
+	const setMidiOutput = useCallback((id: string | null) => {
+		const service = midiServiceRef.current;
+		const before = service.getState();
+		if (before.clockRunning && id !== before.selectedOutputId) service.panic();
+		const next = service.setSelectedOutput(id);
+		if (id === null) service.stopTransportClock();
+		else if (!next.lastError && studioRef.current.runtime.transport === 'playing' && next.clockMode === 'send' && (!next.clockRunning || next.selectedOutputId !== before.selectedOutputId)) service.startTransportClock();
+	}, []);
+	const setMidiInputChannel = useCallback((channel: MidiChannel) => {
+		midiServiceRef.current.setInputChannel(channel);
+	}, []);
+	const setMidiOutputChannel = useCallback((channel: number) => {
+		midiServiceRef.current.setOutputChannel(channel);
+	}, []);
+	const setMidiMonitor = useCallback((enabled: boolean) => {
+		midiServiceRef.current.setMonitor(enabled);
+	}, []);
+	const beginMidiControlLearn = useCallback(() => {
+		midiServiceRef.current.beginControlLearn();
+	}, []);
+	const setMidiClockMode = useCallback((mode: MidiClockMode) => {
+		const service = midiServiceRef.current;
+		service.setClockMode(mode);
+		if (mode === 'send' && studioRef.current.runtime.transport === 'playing') service.startTransportClock();
+		if (mode !== 'receive') {
+			externalMidiCpsRef.current = null;
+			const globals = getSourceGlobals(studioRef.current.lastValid);
+			adapterRef.current?.setRuntimeCps(Math.max(0.000001, globals.bpm / (60 * Math.max(0.000001, globals.quarterNotesPerCycle))));
+		}
+	}, []);
+	const panicMidi = useCallback(() => {
+		adapterRef.current?.releaseAllLiveMidiNotes();
+		midiServiceRef.current.panic();
+	}, []);
+	const testMidiNote = useCallback(() => {
+		void midiServiceRef.current.testNote();
+	}, []);
+	const cancelMidiRecording = useCallback(() => {
+		midiRecordStartTokenRef.current += 1;
+		midiServiceRef.current.cancelRecording();
+	}, []);
+	const retryMidiRecording = useCallback(() => {
+		midiRecordStartTokenRef.current += 1;
+		const recording = midiServiceRef.current.getState().recording;
+		if (recording.status !== 'review' || !recording.options) return;
+		midiServiceRef.current.armRecording(recording.options);
+	}, []);
+	const startMidiRecording = useCallback(async (signal?: AbortSignal): Promise<MidiRuntimeState> => {
+		const service = midiServiceRef.current;
+		const armed = service.getState().recording;
+		if (armed.status !== 'armed' || !armed.options) return service.getState();
+		if (signal?.aborted) return service.getState();
+		const token = midiRecordStartTokenRef.current + 1;
+		midiRecordStartTokenRef.current = token;
+		if (studioRef.current.runtime.transport !== 'playing') {
+			const playback = await dispatch({ type: 'play' });
+			if (!playback.ok || midiRecordStartTokenRef.current !== token || signal?.aborted) {
+				service.cancelRecording();
+				return service.getState();
+			}
+		}
+		const options = service.getState().recording.options;
+		if (!options || service.getState().recording.status !== 'armed') return service.getState();
+		const currentCycle = getMidiClock().cycle;
+		const targetCycle = options.countInBars === 0 ? currentCycle : Math.ceil(Math.max(0, currentCycle) - 0.000001) + options.countInBars;
+		if (options.countInBars > 0) {
+			service.setRecordingStatus('count-in');
+			const reachedBoundary = await waitForMidiBoundary(getMidiClock, targetCycle, () => midiRecordStartTokenRef.current !== token || signal?.aborted === true || midiServiceRef.current.getState().recording.status !== 'count-in');
+			if (!reachedBoundary || midiRecordStartTokenRef.current !== token || signal?.aborted) {
+				service.cancelRecording();
+				return service.getState();
+			}
+		}
+		if (service.getState().recording.status !== (options.countInBars > 0 ? 'count-in' : 'armed') || signal?.aborted) {
+			service.cancelRecording();
+			return service.getState();
+		}
+		return service.startRecording({ options, clock: getMidiClock() });
+	}, [dispatch, getMidiClock]);
+	const recordMidiNow = useCallback((options: MidiRecordingOptions) => {
+		midiRecordStartTokenRef.current += 1;
+		const track = getSourceBlockDetails(studioRef.current.lastValid).find((candidate) => candidate.id === options.trackId);
+		setSelectedTrackId(options.trackId);
+		setFxDrawerTrackId(options.trackId);
+		const armed = midiServiceRef.current.armRecording({
+			...options,
+			...(options.loop && track ? { loopStartCycle: track.timing.startCycle, loopEndCycle: track.timing.endCycle } : {}),
+		});
+		if (armed.recording.status === 'armed') void startMidiRecording();
+	}, [startMidiRecording]);
+	const startMidiRecordingForController = useCallback(async (signal?: AbortSignal): Promise<ReturnType<MidiService['getState']>> => {
+		return startMidiRecording(signal);
+	}, [startMidiRecording]);
+	const stopMidiRecording = useCallback(async (): Promise<ReturnType<MidiService['getState']>> => {
+		midiRecordStartTokenRef.current += 1;
+		const status = midiServiceRef.current.getState().recording.status;
+		if (status === 'recording') midiServiceRef.current.stopRecording(getMidiClock());
+		else if (status === 'armed' || status === 'count-in') midiServiceRef.current.cancelRecording();
+		if (status === 'recording' || status === 'count-in') await dispatch({ type: 'stop' });
+		return midiServiceRef.current.getState();
+	}, [dispatch, getMidiClock]);
+	const commitMidiTake = useCallback(async (expectedRevision?: number): Promise<CommitSourceResult> => {
+		const service = midiServiceRef.current;
+		const recording = service.getState().recording;
+		const take = recording.status === 'review' ? recording.take : null;
+		const current = studioRef.current;
+		if (expectedRevision !== undefined && expectedRevision !== current.revision) return { ok: false, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision, conflict: { expectedRevision, actualRevision: current.revision } };
+		if (!take) return { ok: false, changed: false, previousSource: current.draft, source: current.draft, revision: current.revision, error: diagnosticFromError(current.revision, new Error('There is no MIDI take waiting for review.'), current.draft) };
+		const source = sourceForTrackMutation(current);
+		const midiSnapshot = service.getState();
+		const existingTrack = getSourceBlockDetails(source).find((track) => track.id === take.trackId);
+		const existingMidiRoute = existingTrack?.midi;
+		const includeRoute = existingMidiRoute?.enabled === true;
+		const selectedOutput = midiSnapshot.outputs.find((port) => port.id === midiSnapshot.selectedOutputId)?.name;
+		const output = includeRoute ? (typeof existingMidiRoute?.output === 'string' ? existingMidiRoute.output : selectedOutput) : undefined;
+		const written = writeMidiTakeToSource(source, take, getSourceGlobals(source), {
+			instrument: existingTrack?.instrument ?? 'sine',
+			outputName: output,
+			channel: existingMidiRoute?.channel,
+			velocity: existingMidiRoute?.velocity,
+			gain: existingMidiRoute?.gain,
+			noteOffsetMs: existingMidiRoute?.noteOffsetMs,
+			midimap: existingMidiRoute?.midimap,
+			program: existingMidiRoute?.program,
+			includeRoute,
+			startCycle: take.startedAtCycle,
+			endCycle: Math.max(take.endedAtCycle, take.startedAtCycle + getSourceCycleStep(source)),
+		});
+		if (!written.ok) {
+			patchStudio({ phase: 'error', diagnostics: [getErrorDiagnostic(current.revision, new Error(written.error), 'commit', source)] });
+			return { ok: false, changed: false, previousSource: source, source, revision: current.revision, error: diagnosticFromError(current.revision, new Error(written.error), source) };
+		}
+		const committed = await commitSource(written.source, { expectedRevision: expectedRevision ?? current.revision });
+		if (!committed.ok) return committed;
+		service.acceptRecording();
+		setSelectedTrackId(take.trackId);
+		return committed;
+	}, [commitSource, patchStudio]);
+	commitMidiTakeRef.current = commitMidiTake;
+	useEffect(() => {
+		if (!autoCommitMidiTakeRef.current || midiState.recording.status !== 'review' || studio.runtime.transport === 'playing') return;
+		autoCommitMidiTakeRef.current = false;
+		void commitMidiTakeRef.current?.();
+	}, [commitMidiTake, midiState.recording.status, studio.runtime.transport]);
+	const finishMidiRecording = useCallback(async () => {
+		autoCommitMidiTakeRef.current = false;
+		const stopped = await stopMidiRecording();
+		if (stopped.recording.status === 'review') await commitMidiTake();
+	}, [commitMidiTake, stopMidiRecording]);
+	const toggleMidiRecord = useCallback(() => {
+		setMidiPanelOpen(true);
+		const service = midiServiceRef.current;
+		const status = service.getState().recording.status;
+		if (status === 'armed') {
+			void startMidiRecording();
+			return;
+		}
+		if (status === 'recording' || status === 'count-in') {
+			void finishMidiRecording();
+			return;
+		}
+		if (status !== 'idle') return;
+		void (async () => {
+			const sourceTracks = getSourceBlockDetails(studioRef.current.lastValid);
+			const selected = selectedTrackIdRef.current ? sourceTracks.find((track) => track.id === selectedTrackIdRef.current && track.type === 'midi') : undefined;
+			const target = selected ?? sourceTracks.find((track) => track.type === 'midi');
+			const trackId = target?.id ?? await createTrack('midi');
+			if (!trackId) return;
+			const midi = service.getState();
+			const inputId = midi.enabled && midi.selectedInputId ? midi.selectedInputId : COMPUTER_KEYBOARD_INPUT_ID;
+			const armed = service.armRecording({ trackId, inputId, channel: midi.enabled ? midi.inputChannel : 1, mode: 'replace', quantize: '1/16', quantizeStrength: 1, swing: 0, countInBars: 0, loop: false, captureAutomation: true });
+			if (armed.recording.status === 'armed') await startMidiRecording();
+		})();
+	}, [createTrack, finishMidiRecording, startMidiRecording]);
+
+	useEffect(() => {
+		const handleMidiShortcut = (event: KeyboardEvent) => {
+			if (event.defaultPrevented || event.key.toLowerCase() !== 'r' || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+			const target = event.target;
+			if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.isContentEditable)) return;
+			const midi = midiServiceRef.current.getState();
+			if (!midi.enabled && midi.recording.status === 'idle') return;
+			event.preventDefault();
+			toggleMidiRecord();
+		};
+		document.addEventListener('keydown', handleMidiShortcut);
+		return () => document.removeEventListener('keydown', handleMidiShortcut);
+	}, [toggleMidiRecord]);
 
 	useStudioWebMcp({
 		studioRef,
@@ -1386,6 +1975,11 @@ export default function Studio() {
 		deleteTrack,
 		renameTrack,
 		loadTemplate: loadEditorPreset,
+		midiService: midiServiceRef.current,
+		startMidiRecording: startMidiRecordingForController,
+		stopMidiRecording,
+		commitMidiTake,
+		setTrackMidiRoute: commitTrackMidiRoute,
 	});
 	const seekTimelineAtClientX = useCallback(
 		(clientX: number, ruler: HTMLElement) => {
@@ -1481,9 +2075,35 @@ export default function Studio() {
 		: undefined;
 	const sourceGlobals = useMemo(() => getSourceGlobals(studio.lastValid), [studio.lastValid]);
 	liveSourceGlobalsRef.current = sourceGlobals;
+	useEffect(() => {
+		midiServiceRef.current.setTempo(sourceGlobals.bpm);
+	}, [sourceGlobals.bpm]);
+	const liveMidiTake = midiState.recording.status === 'recording' || midiState.recording.status === 'stopping' || midiState.recording.status === 'review'
+		? midiState.recording.take
+		: null;
+	const noteGrids = useMemo(() => {
+		const next = new Map<string, NoteGrid>();
+		for (const block of blocks) {
+			if (liveMidiTake?.trackId === block.id) {
+				const details = validTrackDetails.get(block.id);
+				if (details) {
+					next.set(block.id, noteGridFromMidiTake(liveMidiTake, details.timing.startCycle, details.timing.endCycle, getSourceCycleStep(studio.lastValid), details.instrument ?? 'sine'));
+					continue;
+				}
+			}
+			const result = parseNoteGrid(studio.lastValid, block.id, sourceGlobals);
+			if (result.ok) next.set(block.id, result.grid);
+		}
+		return next;
+	}, [blocks, liveMidiTake, sourceGlobals, studio.lastValid, validTrackDetails]);
 	const draftGlobals = useMemo(() => getSourceGlobals(studio.draft), [studio.draft]);
 	const draftBpm = clamp(Math.round(draftGlobals.bpm), 0, 300);
 	const draftKey = getKeyParts(draftGlobals.key);
+	const noteEditorTrack = useMemo(() => blocks.find((block) => block.id === noteEditorTrackId), [blocks, noteEditorTrackId]);
+	const noteEditorResult = useMemo(
+		() => noteEditorTrackId && noteEditorTrack ? parseNoteGrid(studio.draft, noteEditorTrackId, draftGlobals) : null,
+		[draftGlobals, noteEditorTrack, noteEditorTrackId, studio.draft],
+	);
 	const isDirty = studio.draft !== studio.lastValid;
 	const isBusy = studio.phase === 'booting' || studio.phase === 'validating';
 	const canPlay = !isBusy && studio.runtime.audioState !== 'initializing';
@@ -1549,7 +2169,8 @@ export default function Studio() {
 		if (contextMenu && !blocks.some((block) => block.id === contextMenu.trackId)) setContextMenu(null);
 		if (renamingTrackId && !blocks.some((block) => block.id === renamingTrackId)) cancelTrackRename();
 		if (fxDrawerTrackId && selectedTrackId && fxDrawerTrackId !== selectedTrackId && blocks.some((block) => block.id === selectedTrackId)) setFxDrawerTrackId(selectedTrackId);
-	}, [blocks, cancelTrackRename, contextMenu, fxDrawerTrackId, renamingTrackId, selectedTrackId]);
+		if (noteEditorTrackId && !blocks.some((block) => block.id === noteEditorTrackId)) setNoteEditorTrackId(null);
+	}, [blocks, cancelTrackRename, contextMenu, fxDrawerTrackId, noteEditorTrackId, renamingTrackId, selectedTrackId]);
 
 	return (
 		<div className="studio-shell" ref={studioShellRef}>
@@ -1595,6 +2216,10 @@ export default function Studio() {
 				onPlay={() => { void dispatch({ type: 'play' }); }}
 				onPause={() => { void dispatch({ type: 'pause' }); }}
 				onStop={() => { void dispatch({ type: 'stop' }); }}
+				onRecordMidi={toggleMidiRecord}
+				onToggleMidiPanel={() => setMidiPanelOpen((open) => !open)}
+				midiPanelOpen={midiPanelOpen}
+				midiState={midiState}
 				onLoadPreset={(preset) => { void loadEditorPreset(preset); }}
 				onLoadLocalProject={(projectId) => { void loadLocalProject(projectId); }}
 				onRefreshLocalProjects={() => { void refreshLocalProjects(); }}
@@ -1654,6 +2279,7 @@ export default function Studio() {
 						cycleStep={cycleStep}
 						draftBpm={draftBpm}
 						blocks={blocks}
+						noteGrids={noteGrids}
 						draftTrackDetails={draftTrackDetails}
 						validTrackDetails={validTrackDetails}
 						sourceGlobals={sourceGlobals}
@@ -1668,7 +2294,8 @@ export default function Studio() {
 						renamingTrackValue={renamingTrackValue}
 						openPopover={openHeaderPopover}
 						onTogglePopover={(popover) => setOpenHeaderPopover((current) => current === popover ? null : popover)}
-						onAddTrack={() => { void addTrack(); }}
+						onAddAudioTrack={addAudioTrack}
+						onAddMidiTrack={addMidiTrack}
 						onSetSongEndCycle={setSongEndCycle}
 						onAdjustZoom={adjustTimelineZoom}
 						onStartTimelineSeekDrag={startTimelineSeekDrag}
@@ -1677,6 +2304,7 @@ export default function Studio() {
 						onOpenTrackFxDrawer={openTrackFxDrawer}
 						onToggleTrackEffects={toggleTrackEffectsInSource}
 						onOpenTrackContextMenu={openTrackContextMenu}
+						onOpenNoteEditor={openNoteEditor}
 						onTrackLaneKeyDown={handleTrackLaneKeyDown}
 						onStartRename={beginTrackRename}
 						onRenameValueChange={setRenamingTrackValue}
@@ -1693,6 +2321,33 @@ export default function Studio() {
 				</main>
 			</div>
 
+			{midiPanelOpen ? <MidiPanel
+				state={midiState}
+				tracks={blocks}
+				selectedTrackId={selectedTrackId}
+				trackColor={getTrackColor((selectedTrackId ? draftTrackDetails.get(selectedTrackId) ?? validTrackDetails.get(selectedTrackId) : undefined)?.color)}
+				isBusy={isBusy}
+				onClose={() => setMidiPanelOpen(false)}
+				onConnect={connectMidi}
+				onDisconnect={disconnectMidi}
+				onRefresh={refreshMidi}
+				onSelectInput={setMidiInput}
+				onSelectOutput={setMidiOutput}
+				onSetInputChannel={setMidiInputChannel}
+				onSetOutputChannel={setMidiOutputChannel}
+				onSetMonitor={setMidiMonitor}
+				onBeginControlLearn={beginMidiControlLearn}
+				onSetClockMode={setMidiClockMode}
+				onPanic={panicMidi}
+				onTestNote={testMidiNote}
+				onRecordNow={recordMidiNow}
+				onStartRecording={startMidiRecording}
+				onStopRecording={finishMidiRecording}
+				onCancelRecording={cancelMidiRecording}
+				onRetryRecording={retryMidiRecording}
+				onAcceptTake={() => { void commitMidiTake(); }}
+			/> : null}
+
 			{fxDrawerTrack ? <TrackFxDrawer
 				track={fxDrawerTrack}
 				trackColor={fxDrawerTrackColor}
@@ -1706,6 +2361,25 @@ export default function Studio() {
 				onRemoveEffect={removeTrackEffectFromSource}
 				onReorderEffect={reorderTrackEffectInSource}
 				onSetSound={setTrackSound}
+				midiState={midiState}
+				onSetMidiRoute={setTrackMidiRoute}
+				onSetMidiInstrument={setMidiInstrument}
+				onOpenMidiPanel={() => setMidiPanelOpen(true)}
+				onTestMidi={testMidiNote}
+			/> : null}
+
+			{noteEditorTrack && noteEditorResult ? <NoteEditor
+				track={noteEditorTrack}
+				trackColor={getTrackColor((draftTrackDetails.get(noteEditorTrack.id) ?? validTrackDetails.get(noteEditorTrack.id))?.color)}
+				result={noteEditorResult}
+				isBusy={isBusy}
+				onClose={closeNoteEditor}
+				onSetNote={(slot, midi, stackIndex) => updateTrackNoteGrid(noteEditorTrack.id, { type: 'set', slot, midi, stackIndex })}
+				onMoveNote={(slot, targetSlot, midi, stackIndex) => updateTrackNoteGrid(noteEditorTrack.id, { type: 'move', slot, targetSlot, midi, stackIndex })}
+				onDeleteNote={(slot, stackIndex) => updateTrackNoteGrid(noteEditorTrack.id, { type: 'delete', slot, stackIndex })}
+				onResizeNote={(slot, durationCycles, stackIndex) => updateTrackNoteGrid(noteEditorTrack.id, { type: 'resize', slot, durationCycles, stackIndex })}
+				onTrimStartNote={(slot, startCycle, stackIndex) => updateTrackNoteGrid(noteEditorTrack.id, { type: 'trim-start', slot, startCycle, stackIndex })}
+				onPreviewNote={previewTrackNote}
 			/> : null}
 
 			{contextMenu && contextMenuTrack ? <TrackContextMenu
@@ -1714,6 +2388,7 @@ export default function Studio() {
 				position={{ x: contextMenu.x, y: contextMenu.y }}
 				menuRef={contextMenuRef}
 				trackDetails={contextMenuTrackDetails}
+				onOpenNoteEditor={openNoteEditor}
 				onRename={beginTrackRename}
 				onDelete={deleteSelectedTrack}
 				onSetColor={setTrackColor}
