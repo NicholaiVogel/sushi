@@ -38,6 +38,27 @@ $: note("<c3 eb3 g3 bb3>")
   .lpf(900)
 ```
 
+## How to test WebMCP (ChatGPT)
+
+No account is required.
+
+Open the live application in ChatGPT’s in-app browser, or in Chrome 149+ with WebMCP enabled through `chrome://flags/#enable-webmcp-testing`.
+
+Ask the agent:
+
+> Open the current Sushi studio session. Inspect the current revision, list the available editor templates, load one, set the tempo to 128 BPM, validate the Strudel source, and start playback. Report the resulting revision and any diagnostics.
+
+Expected result:
+
+1. The agent discovers Sushi’s WebMCP tools.
+2. It inspects the current project and revision.
+3. It loads a composition and changes its tempo.
+4. The source and visual studio update together.
+5. The source validates successfully.
+6. Playback begins.
+
+(Browser audio policies may require one initial user gesture. Click Play once if the browser reports that audio is locked.)
+
 ## Agent-assisted composition
 
 Sushi uses [WebMCP](https://webmachinelearning.github.io/webmcp) to connect compatible agents to the studio. Agents can read and modify source, inspect musical state, and control playback, making it possible to collaborate on patterns and arrangements through natural-language assistance.
