@@ -25,11 +25,10 @@ Try it live at [sushidaw.com](https://sushidaw.com/).
 - Bring in existing Strudel source or write new patterns with Tidal Cycles mini-notation.
 - Arrange pattern-based tracks and sections on a visual timeline.
 - Shape tempo, key, gain, pan, effects, and playback from the studio.
-- Open supported flat `note(...)` and `n(...).scale(...)` lanes in a live piano-roll editor with source-backed note placement, pitch dragging, grid-snapped edge trimming, deletion, and duration editing.
+- Open supported lanes in a live piano-roll editor with source-backed note placement, pitch dragging, grid-snapped edge trimming, deletion, and duration editing.
 - Save, reopen, import, and export portable `.sushi.json` projects.
 - Hear compositions through Strudel and Web Audio.
-- Connect browser MIDI devices for native Strudel output, channel routing, recording, quantization, automation capture, and panic recovery.
-- Use optional WebMCP integration to let compatible agents inspect the studio, edit source, control playback, and assist with composition, including guarded MIDI state and recording tools.
+- Use optional WebMCP integration to let compatible agents inspect the studio, edit source, control playback, and assist with composition.
 
 ## Example
 
@@ -71,7 +70,7 @@ Expected result:
 
 Sushi uses [WebMCP](https://webmachinelearning.github.io/webmcp) to connect compatible agents to the studio. Agents can read and modify source, inspect musical state, and control playback, making it possible to collaborate on patterns and arrangements through natural-language assistance.
 
-The WebMCP integration also exposes the curated editor templates: agents can use `list_editor_templates` to browse available compositions, `view_editor_template` to inspect one, and `load_editor_template` to load it into the current session. See [`MIDI-ROADMAP.md`](./MIDI-ROADMAP.md) for the planned MIDI device, recording, routing, and agent-tool architecture.
+The WebMCP integration also exposes the curated editor templates: agents can use `list_editor_templates` to browse available compositions, `view_editor_template` to inspect one, and `load_editor_template` to load it into the current session. 
 
 ## Run locally
 
