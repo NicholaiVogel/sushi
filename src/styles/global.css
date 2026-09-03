@@ -1216,6 +1216,46 @@ a { color: inherit; }
 
 .sidebar-diagnostic-revision { color: var(--ink-muted); }
 
+.about-credits {
+	display: grid;
+	flex: 0 0 auto;
+	gap: 5px;
+	padding: 10px 14px 0;
+	border-top: 1px solid var(--line);
+	background: var(--editor-sidebar-bg);
+	color: var(--ink-muted);
+	font-family: var(--mono);
+	font-size: 8px;
+	line-height: 1.35;
+}
+
+.about-credits-heading {
+	color: var(--accent);
+	font-size: 8px;
+	letter-spacing: 0.09em;
+}
+
+.about-credits-links {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 5px;
+}
+
+.about-credits a {
+	color: var(--ink-soft);
+	text-decoration: underline;
+	text-decoration-color: var(--line);
+	text-underline-offset: 2px;
+}
+
+.about-credits a:hover,
+.about-credits a:focus-visible { color: var(--accent); text-decoration-color: currentColor; }
+
+.about-credits-notice,
+.about-credits-license { margin: 0; }
+.about-credits-license a { color: var(--accent); }
+
 .daw-canvas {
 	min-width: 0;
 	min-height: 0;
