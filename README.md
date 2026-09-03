@@ -14,6 +14,14 @@ Compose in a source editor as you would in a live-coding environment, or use Sus
 
 Try it live at [sushidaw.com](https://sushidaw.com/).
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./public/logos/brand-wordmark-white.png">
+    <source media="(prefers-color-scheme: light)" srcset="./public/logos/brand-wordmark-dark.png">
+    <img alt="Sushi" src="./public/Screenshot 2026-09-03 at 04-33-22 Sushi — Tidal Cycles workspace.png" width="420">
+  </picture>
+</p>
+
 ## Highlights
 
 - Bring in existing Strudel source or write new patterns with Tidal Cycles mini-notation.
