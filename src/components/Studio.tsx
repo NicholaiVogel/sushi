@@ -100,7 +100,9 @@ import type {
 	StudioCommand,
 	StudioState,
 	TimingDrag,
+	WorkspaceMode,
 } from './studio/types';
+import { STUDIO_LAYOUT_SETTLED_EVENT } from './studio/types';
 
 // The home row is the familiar browser-piano layout: white keys are A–K and
 // the raised keys are W/E/T/Y/U. Z–M supplies a lower white-key octave.
@@ -127,6 +129,20 @@ const COMPUTER_KEYBOARD_NOTE_BY_CODE: Readonly<Record<string, number>> = {
 	KeyK: 72,
 	KeyL: 74,
 	Semicolon: 76,
+};
+
+const TIMELINE_SEEK_THROTTLE_MS = 40;
+const EDITOR_EDGE_SNAP_PX = 64;
+const WORKSPACE_LAYOUT_TRANSITION_MS = 180;
+const WORKSPACE_LAYOUT_TRANSITION_FALLBACK_MS = WORKSPACE_LAYOUT_TRANSITION_MS + 80;
+
+type EditorResizeDrag = {
+	startX: number;
+	startWidth: number;
+	bodyWidth: number;
+	currentWidth: number;
+	mode: WorkspaceMode;
+	body: HTMLDivElement;
 };
 
 function isKeyboardTextEntryTarget(target: EventTarget | null): boolean {
@@ -212,6 +228,7 @@ export default function Studio() {
 	const [appearanceMode, setAppearanceMode] = useState<AppearanceMode>(readStoredAppearanceMode);
 	const [systemPrefersDark, setSystemPrefersDark] = useState(() => typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches);
 	const [editorWidth, setEditorWidth] = useState(350);
+	const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>('split');
 	const [, setSourceHistoryVersion] = useState(0);
 	const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
 	const selectedTrackIdRef = useRef<string | null>(null);
@@ -236,6 +253,7 @@ export default function Studio() {
 	const adapterRef = useRef<StrudelAdapter | null>(null);
 	const mountedRef = useRef(true);
 	const studioShellRef = useRef<HTMLDivElement | null>(null);
+	const studioBodyRef = useRef<HTMLDivElement | null>(null);
 	const transportClockRef = useRef<HTMLSpanElement | null>(null);
 	const transportCycleRef = useRef<HTMLSpanElement | null>(null);
 	const liveSourceGlobalsRef = useRef<ReturnType<typeof getSourceGlobals> | null>(null);
@@ -247,7 +265,9 @@ export default function Studio() {
 	const timelineViewportRef = useRef<HTMLElement | null>(null);
 	const timelineShellRef = useRef<HTMLElement | null>(null);
 	const timelineZoomAnchorRef = useRef<number | null>(null);
-	const editorResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+	const editorResizeRef = useRef<EditorResizeDrag | null>(null);
+	const workspaceLayoutTransitionRef = useRef(false);
+	const workspaceLayoutTransitionTimerRef = useRef<number | undefined>(undefined);
 	const pendingTrackSourceRef = useRef<{ source: string; baseRevision: number } | null>(null);
 	const trackCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const sourceCommitQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -255,6 +275,13 @@ export default function Studio() {
 	const timingDragRef = useRef<TimingDrag | null>(null);
 	const timelineSeekDragRef = useRef<HTMLElement | null>(null);
 	const timelineSeekCycleRef = useRef<number | null>(null);
+	const timelineSeekPendingCycleRef = useRef<number | null>(null);
+	const timelineSeekPreviewFrameRef = useRef<number | undefined>(undefined);
+	const timelineSeekDispatchTimerRef = useRef<number | undefined>(undefined);
+	const timelineSeekLastDispatchAtRef = useRef(0);
+	const timelineSeekInFlightRef = useRef(false);
+	const timelineSeekInFlightCycleRef = useRef<number | null>(null);
+	const timelineSeekForceRef = useRef(false);
 	const contextMenuRef = useRef<HTMLDivElement | null>(null);
 	const headerPopoverScopeRef = useRef<HTMLElement | null>(null);
 	const timelineLengthRef = useRef<HTMLDivElement | null>(null);
@@ -393,38 +420,133 @@ export default function Studio() {
 	const handleEditorResizePointerMove = useCallback((event: PointerEvent) => {
 		const drag = editorResizeRef.current;
 		if (!drag) return;
-		setEditorWidth(clamp(drag.startWidth + event.clientX - drag.startX, EDITOR_WIDTH_MIN, EDITOR_WIDTH_MAX));
+		const requestedWidth = drag.startWidth + event.clientX - drag.startX;
+		let mode: WorkspaceMode = 'split';
+		let width: number;
+		if (requestedWidth <= EDITOR_EDGE_SNAP_PX) {
+			mode = 'arrangement';
+			width = 0;
+		} else if (requestedWidth >= drag.bodyWidth - EDITOR_EDGE_SNAP_PX) {
+			mode = 'code';
+			width = drag.bodyWidth - 10;
+		} else {
+			const maxSplitWidth = Math.min(EDITOR_WIDTH_MAX, Math.max(EDITOR_WIDTH_MIN, drag.bodyWidth - 10));
+			width = clamp(requestedWidth, EDITOR_WIDTH_MIN, maxSplitWidth);
+		}
+
+		// Keep the pointer loop out of React. The timeline is a large subtree, so
+		// committing editor width on every pointermove makes the divider chase a
+		// queue of expensive renders. The browser can resize the grid directly;
+		// React commits the final value once the gesture ends.
+		drag.mode = mode;
+		drag.currentWidth = width;
+		drag.body.style.setProperty('--editor-width', `${width}px`);
+		drag.body.classList.toggle('workspace-mode-preview-split', mode === 'split');
+		drag.body.classList.toggle('workspace-mode-preview-code', mode === 'code');
+		drag.body.classList.toggle('workspace-mode-preview-arrangement', mode === 'arrangement');
 	}, []);
 
 	const stopEditorResize = useCallback(() => {
+		const drag = editorResizeRef.current;
+		if (!drag) return;
 		editorResizeRef.current = null;
 		window.removeEventListener('pointermove', handleEditorResizePointerMove);
 		window.removeEventListener('pointerup', stopEditorResize);
 		window.removeEventListener('pointercancel', stopEditorResize);
+		if (drag.mode === 'split') {
+			setEditorWidth(drag.currentWidth);
+			const viewportWidth = timelineViewportRef.current?.clientWidth;
+			if (viewportWidth !== undefined) setTimelineViewportWidth((current) => current === viewportWidth ? current : viewportWidth);
+		}
+		setWorkspaceMode(drag.mode);
+		window.requestAnimationFrame(() => {
+			if (editorResizeRef.current) return;
+			drag.body.classList.remove('studio-body-resizing', 'workspace-mode-preview-split', 'workspace-mode-preview-code', 'workspace-mode-preview-arrangement');
+			drag.body.dispatchEvent(new Event(STUDIO_LAYOUT_SETTLED_EVENT));
+		});
 	}, [handleEditorResizePointerMove]);
 
 	const startEditorResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
 		if (event.button !== 0) return;
 		event.preventDefault();
-		editorResizeRef.current = { startX: event.clientX, startWidth: editorWidth };
+		const body = studioBodyRef.current;
+		if (!body) return;
+		const sourceSidebar = body?.querySelector<HTMLElement>('.source-sidebar');
+		const bodyWidth = body.getBoundingClientRect().width;
+		const startWidth = workspaceMode === 'code'
+			? Math.max(0, bodyWidth - 10)
+			: workspaceMode === 'arrangement'
+				? 0
+				: sourceSidebar?.getBoundingClientRect().width ?? editorWidth;
+		editorResizeRef.current = {
+			startX: event.clientX,
+			startWidth,
+			bodyWidth: bodyWidth || window.innerWidth,
+			currentWidth: startWidth,
+			mode: workspaceMode,
+			body,
+		};
+		body.classList.add('studio-body-resizing');
+		body.classList.remove('workspace-mode-preview-split', 'workspace-mode-preview-code', 'workspace-mode-preview-arrangement');
 		window.addEventListener('pointermove', handleEditorResizePointerMove);
 		window.addEventListener('pointerup', stopEditorResize);
 		window.addEventListener('pointercancel', stopEditorResize);
-	}, [editorWidth, handleEditorResizePointerMove, stopEditorResize]);
+	}, [editorWidth, handleEditorResizePointerMove, stopEditorResize, workspaceMode]);
+
+	const commitTimelineViewportWidth = useCallback(() => {
+		const viewport = timelineViewportRef.current;
+		if (!viewport) return;
+		const width = viewport.clientWidth;
+		setTimelineViewportWidth((current) => current === width ? current : width);
+	}, []);
+
+	const finishWorkspaceLayoutTransition = useCallback(() => {
+		if (!workspaceLayoutTransitionRef.current) return;
+		workspaceLayoutTransitionRef.current = false;
+		if (workspaceLayoutTransitionTimerRef.current !== undefined) {
+			window.clearTimeout(workspaceLayoutTransitionTimerRef.current);
+			workspaceLayoutTransitionTimerRef.current = undefined;
+		}
+		studioBodyRef.current?.classList.remove('studio-body-layout-transitioning');
+		studioBodyRef.current?.dispatchEvent(new Event(STUDIO_LAYOUT_SETTLED_EVENT));
+		// Measure once, after the grid has settled, instead of rerendering the
+		// whole timeline for every frame of the layout transition.
+		commitTimelineViewportWidth();
+	}, [commitTimelineViewportWidth]);
+
+	const beginWorkspaceLayoutTransition = useCallback((mode: WorkspaceMode) => {
+		if (mode === workspaceMode && !workspaceLayoutTransitionRef.current) return;
+		if (workspaceLayoutTransitionTimerRef.current !== undefined) {
+			window.clearTimeout(workspaceLayoutTransitionTimerRef.current);
+		}
+		workspaceLayoutTransitionRef.current = true;
+		studioBodyRef.current?.classList.add('studio-body-layout-transitioning');
+		setWorkspaceMode(mode);
+		workspaceLayoutTransitionTimerRef.current = window.setTimeout(
+			finishWorkspaceLayoutTransition,
+			WORKSPACE_LAYOUT_TRANSITION_FALLBACK_MS,
+		);
+	}, [finishWorkspaceLayoutTransition, workspaceMode]);
 
 	const handleEditorResizeKeyDown = useCallback((event: ReactKeyboardEvent<HTMLButtonElement>) => {
 		if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return;
 		event.preventDefault();
 		if (event.key === 'Home') {
-			setEditorWidth(EDITOR_WIDTH_MIN);
+			beginWorkspaceLayoutTransition('arrangement');
 			return;
 		}
 		if (event.key === 'End') {
-			setEditorWidth(EDITOR_WIDTH_MAX);
+			beginWorkspaceLayoutTransition('code');
 			return;
 		}
-		setEditorWidth((current) => clamp(current + (event.key === 'ArrowRight' ? 16 : -16), EDITOR_WIDTH_MIN, EDITOR_WIDTH_MAX));
-	}, []);
+		const currentWidth = workspaceMode === 'arrangement' ? EDITOR_WIDTH_MIN : workspaceMode === 'code' ? EDITOR_WIDTH_MAX : editorWidth;
+		beginWorkspaceLayoutTransition('split');
+		setEditorWidth(clamp(currentWidth + (event.key === 'ArrowRight' ? 16 : -16), EDITOR_WIDTH_MIN, EDITOR_WIDTH_MAX));
+	}, [beginWorkspaceLayoutTransition, editorWidth, workspaceMode]);
+
+	const handleWorkspaceModeChange = useCallback((mode: WorkspaceMode) => {
+		beginWorkspaceLayoutTransition(mode);
+	}, [beginWorkspaceLayoutTransition]);
 
 	const patchStudio = useCallback((patch: Partial<StudioState>) => {
 		const next = { ...studioRef.current, ...patch };
@@ -1150,49 +1272,60 @@ export default function Studio() {
 			const drag = timingDragRef.current;
 			if (!drag) return;
 
-			const rect = drag.lane.getBoundingClientRect();
-			if (!rect.width) return;
-			const songEndCycle = studioRef.current.songEndCycle;
 			// Accumulate pointer movement instead of remapping the absolute
 			// pointer position on every event. The timeline can grow while the
 			// pointer is outside its old boundary, which changes the grid scale;
 			// accumulating keeps the drag target stable across that reflow.
-			drag.pointerCycle = Math.max(0, drag.pointerCycle + ((event.clientX - drag.lastPointerClientX) / rect.width) * songEndCycle);
+			drag.pointerCycle = Math.max(0, drag.pointerCycle + ((event.clientX - drag.lastPointerClientX) / drag.laneWidth) * drag.songEndCycle);
 			drag.lastPointerClientX = event.clientX;
 			const nextCycle = Math.max(0, snapCycle(drag.pointerCycle));
+			let range: { startCycle: number; endCycle: number };
 
 			if (drag.edge === 'move') {
 				const delta = nextCycle - drag.pointerStartCycle;
-				const range = shiftTrackRange(drag.startCycle, drag.endCycle, delta);
-				setTrackRange(drag.trackId, range.startCycle, range.endCycle, drag);
-				return;
+				range = shiftTrackRange(drag.startCycle, drag.endCycle, delta);
+			} else {
+				const startCycle = drag.edge === 'start' ? Math.min(nextCycle, drag.endCycle - TIMELINE_SNAP_CYCLE) : drag.startCycle;
+				const endCycle = drag.edge === 'end' ? Math.max(nextCycle, drag.startCycle + TIMELINE_SNAP_CYCLE) : drag.endCycle;
+				range = { startCycle: Math.max(0, startCycle), endCycle: Math.max(0, endCycle) };
 			}
 
-			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === drag.trackId);
-			if (!details) return;
-			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, drag.endCycle - TIMELINE_SNAP_CYCLE) : drag.startCycle;
-			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, drag.startCycle + TIMELINE_SNAP_CYCLE) : drag.endCycle;
-			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.max(0, endCycle), drag);
+			drag.currentStartCycle = range.startCycle;
+			drag.currentEndCycle = range.endCycle;
+			const clipStart = clamp(range.startCycle / drag.songEndCycle, 0, 1);
+			const clipEnd = clamp(range.endCycle / drag.songEndCycle, clipStart + 0.01, 1);
+			drag.region.style.setProperty('--clip-start', `${clipStart * 100}%`);
+			drag.region.style.setProperty('--clip-width', `${Math.max(0.01, clipEnd - clipStart) * 100}%`);
 		},
-		[setTrackRange],
+		[],
 	);
 
 	const stopTimingDrag = useCallback(() => {
+		const drag = timingDragRef.current;
 		timingDragRef.current = null;
 		window.removeEventListener('pointermove', handleTimingPointerMove);
 		window.removeEventListener('pointerup', stopTimingDrag);
 		window.removeEventListener('pointercancel', stopTimingDrag);
+		if (drag) {
+			drag.region.classList.remove('pattern-region-resizing');
+			drag.region.dispatchEvent(new Event(STUDIO_LAYOUT_SETTLED_EVENT, { bubbles: true }));
+			setTrackRange(drag.trackId, drag.currentStartCycle, drag.currentEndCycle, drag);
+		}
 		const pending = pendingTrackSourceRef.current;
 		if (pending) {
 			pendingTrackSourceRef.current = null;
 			void commitSource(pending.source, { expectedRevision: pending.baseRevision });
 		}
-	}, [commitSource, handleTimingPointerMove]);
+	}, [commitSource, handleTimingPointerMove, setTrackRange]);
 
 	const startTimingDrag = useCallback(
 		(event: ReactPointerEvent<HTMLElement>, trackId: string, edge: 'start' | 'end' | 'move') => {
 			const lane = event.currentTarget.closest('.lane-grid');
 			if (!(lane instanceof HTMLElement)) return;
+			const region = event.currentTarget.closest('.pattern-region');
+			if (!(region instanceof HTMLElement)) return;
+			const rect = lane.getBoundingClientRect();
+			if (!rect.width) return;
 			const details = getSourceBlockDetails(studioRef.current.draft).find((block) => block.id === trackId);
 			if (!details) return;
 			const timing = getTrackTimingForTimeline(details, studioRef.current.songEndCycle);
@@ -1200,7 +1333,7 @@ export default function Studio() {
 			cancelPendingTrackCommit();
 			event.preventDefault();
 			event.stopPropagation();
-			const rect = lane.getBoundingClientRect();
+			region.classList.add('pattern-region-resizing');
 			const pointerCycle = rect.width
 				? Math.max(0, ((event.clientX - rect.left) / rect.width) * studioRef.current.songEndCycle)
 				: timing.startCycle;
@@ -1209,9 +1342,14 @@ export default function Studio() {
 				edge,
 				source,
 				lane,
+				laneWidth: rect.width,
+				songEndCycle: studioRef.current.songEndCycle,
+				region,
 				pointerStartCycle: snapCycle(pointerCycle),
 				startCycle: timing.startCycle,
 				endCycle: timing.endCycle,
+				currentStartCycle: timing.startCycle,
+				currentEndCycle: timing.endCycle,
 				pointerCycle,
 				lastPointerClientX: event.clientX,
 			};
@@ -1226,9 +1364,34 @@ export default function Studio() {
 	useEffect(() => stopEditorResize, [stopEditorResize]);
 
 	useEffect(() => {
+		const body = studioBodyRef.current;
+		if (!body) return undefined;
+		const handleTransitionEnd = (event: TransitionEvent) => {
+			if (event.target !== body || event.propertyName !== 'grid-template-columns') return;
+			finishWorkspaceLayoutTransition();
+		};
+		body.addEventListener('transitionend', handleTransitionEnd);
+		return () => body.removeEventListener('transitionend', handleTransitionEnd);
+	}, [finishWorkspaceLayoutTransition]);
+
+	useEffect(() => () => {
+		if (workspaceLayoutTransitionTimerRef.current !== undefined) {
+			window.clearTimeout(workspaceLayoutTransitionTimerRef.current);
+			workspaceLayoutTransitionTimerRef.current = undefined;
+		}
+		workspaceLayoutTransitionRef.current = false;
+		studioBodyRef.current?.classList.remove('studio-body-layout-transitioning');
+	}, []);
+
+	useEffect(() => {
 		const viewport = timelineViewportRef.current;
 		if (!viewport) return undefined;
-		const updateViewportWidth = () => setTimelineViewportWidth(viewport.clientWidth);
+		const updateViewportWidth = () => {
+			// During a divider drag or layout transition the outer grid is allowed
+			// to move without asking the timeline to recalculate every frame.
+			if (editorResizeRef.current || workspaceLayoutTransitionRef.current) return;
+			commitTimelineViewportWidth();
+		};
 		updateViewportWidth();
 		if (typeof ResizeObserver === 'undefined') {
 			window.addEventListener('resize', updateViewportWidth);
@@ -1237,7 +1400,7 @@ export default function Studio() {
 		const observer = new ResizeObserver(updateViewportWidth);
 		observer.observe(viewport);
 		return () => observer.disconnect();
-	}, []);
+	}, [commitTimelineViewportWidth]);
 
 	const setTrackGain = useCallback(
 		(trackId: string, value: number) => updateTrackSource(trackId, (source) => updateTrackGain(source, trackId, value)),
@@ -2198,17 +2361,75 @@ export default function Studio() {
 		commitMidiTake,
 		setTrackMidiRoute: commitTrackMidiRoute,
 	});
+	const paintTimelinePlayhead = useCallback((cycle: number) => {
+		const state = studioRef.current;
+		const songEndCycle = Math.max(0.001, state.songEndCycle);
+		const currentCycle = clamp(cycle, 0, songEndCycle);
+		studioShellRef.current?.style.setProperty('--playhead-position', String(currentCycle / songEndCycle));
+		const globals = liveSourceGlobalsRef.current ?? getSourceGlobals(state.lastValid);
+		if (transportClockRef.current) transportClockRef.current.textContent = formatClock(cyclesToSeconds(currentCycle, globals));
+		if (transportCycleRef.current) transportCycleRef.current.textContent = `CYCLE ${formatCycle(currentCycle)}`;
+	}, []);
+
+	const flushTimelineSeek = useCallback(async (force = false): Promise<void> => {
+		if (force) timelineSeekForceRef.current = true;
+		if (timelineSeekInFlightRef.current) return;
+		const pendingCycle = timelineSeekPendingCycleRef.current;
+		if (pendingCycle === null) return;
+		const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+		const seekImmediately = timelineSeekForceRef.current;
+		const elapsed = now - timelineSeekLastDispatchAtRef.current;
+		if (!seekImmediately && elapsed < TIMELINE_SEEK_THROTTLE_MS) {
+			if (timelineSeekDispatchTimerRef.current === undefined) {
+				timelineSeekDispatchTimerRef.current = window.setTimeout(() => {
+					timelineSeekDispatchTimerRef.current = undefined;
+					void flushTimelineSeek();
+				}, TIMELINE_SEEK_THROTTLE_MS - elapsed);
+			}
+			return;
+		}
+		if (timelineSeekDispatchTimerRef.current !== undefined) {
+			window.clearTimeout(timelineSeekDispatchTimerRef.current);
+			timelineSeekDispatchTimerRef.current = undefined;
+		}
+		timelineSeekForceRef.current = false;
+		timelineSeekPendingCycleRef.current = null;
+		timelineSeekInFlightRef.current = true;
+		timelineSeekInFlightCycleRef.current = pendingCycle;
+		timelineSeekLastDispatchAtRef.current = now;
+		try {
+			await dispatch({ type: 'seek', cycle: pendingCycle });
+			if (timelineSeekPendingCycleRef.current === null) paintTimelinePlayhead(pendingCycle);
+		} finally {
+			timelineSeekInFlightRef.current = false;
+			timelineSeekInFlightCycleRef.current = null;
+			if (timelineSeekPendingCycleRef.current !== null) void flushTimelineSeek();
+		}
+	}, [dispatch, paintTimelinePlayhead]);
+
+	const queueTimelineSeek = useCallback((cycle: number) => {
+		if (timelineSeekCycleRef.current === cycle) return;
+		timelineSeekCycleRef.current = cycle;
+		timelineSeekPendingCycleRef.current = cycle;
+		if (timelineSeekPreviewFrameRef.current === undefined) {
+			timelineSeekPreviewFrameRef.current = window.requestAnimationFrame(() => {
+				timelineSeekPreviewFrameRef.current = undefined;
+				const previewCycle = timelineSeekCycleRef.current;
+				if (previewCycle !== null) paintTimelinePlayhead(previewCycle);
+			});
+		}
+		void flushTimelineSeek();
+	}, [flushTimelineSeek, paintTimelinePlayhead]);
+
 	const seekTimelineAtClientX = useCallback(
 		(clientX: number, ruler: HTMLElement) => {
 			const rect = ruler.getBoundingClientRect();
 			if (!rect.width) return;
 			const songEndCycle = studioRef.current.songEndCycle;
 			const cycle = clamp(snapCycle(((clientX - rect.left) / rect.width) * songEndCycle), 0, songEndCycle);
-			if (timelineSeekCycleRef.current === cycle) return;
-			timelineSeekCycleRef.current = cycle;
-			void dispatch({ type: 'seek', cycle });
+			queueTimelineSeek(cycle);
 		},
-		[dispatch],
+		[queueTimelineSeek],
 	);
 
 	const handleTimelineSeekPointerMove = useCallback(
@@ -2220,12 +2441,25 @@ export default function Studio() {
 	);
 
 	const stopTimelineSeekDrag = useCallback(() => {
+		const wasDragging = timelineSeekDragRef.current !== null;
+		const finalCycle = timelineSeekCycleRef.current;
 		timelineSeekDragRef.current = null;
 		timelineSeekCycleRef.current = null;
+		if (timelineSeekPreviewFrameRef.current !== undefined) {
+			window.cancelAnimationFrame(timelineSeekPreviewFrameRef.current);
+			timelineSeekPreviewFrameRef.current = undefined;
+		}
 		window.removeEventListener('pointermove', handleTimelineSeekPointerMove);
 		window.removeEventListener('pointerup', stopTimelineSeekDrag);
 		window.removeEventListener('pointercancel', stopTimelineSeekDrag);
-	}, [handleTimelineSeekPointerMove]);
+		if (wasDragging && finalCycle !== null && finalCycle !== timelineSeekInFlightCycleRef.current) {
+			timelineSeekPendingCycleRef.current = finalCycle;
+			paintTimelinePlayhead(finalCycle);
+			void flushTimelineSeek(true);
+		} else if (wasDragging && finalCycle !== null) {
+			paintTimelinePlayhead(finalCycle);
+		}
+	}, [flushTimelineSeek, handleTimelineSeekPointerMove, paintTimelinePlayhead]);
 
 	const startTimelineSeekDrag = useCallback(
 		(event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -2339,9 +2573,9 @@ export default function Studio() {
 	const timelineSongCycles = Math.max(TIMELINE_SNAP_CYCLE, studio.songEndCycle);
 	const zoomOutCycles = timelineSongCycles;
 	const timelineVisibleCycles = zoomOutCycles - (zoomOutCycles - 1) * (timelineZoom / 100);
-	const timelineShowsQuarterBars = timelineVisibleCycles <= DEFAULT_SONG_END_CYCLE;
 	const timelineAvailableWidth = Math.max(560, (timelineViewportWidth || 960) - TIMELINE_LABEL_MIN_WIDTH);
 	const timelineGridWidth = Math.max(560, timelineAvailableWidth * timelineSongCycles / timelineVisibleCycles);
+	const timelineShowsQuarterBars = timelineGridWidth / Math.max(1, timelineCellCount) >= 12;
 	const timelineBarLabelStride = timelineLabelStride(timelineGridWidth / timelineSongCycles);
 	const timelineCells = useMemo(() => Array.from({ length: timelineCellCount }, (_, index) => {
 		const isBarStart = index % 4 === 0;
@@ -2404,6 +2638,7 @@ export default function Studio() {
 				isBusy={isBusy}
 				canPlay={canPlay}
 				experimentalMidi={experimentalMidi}
+				workspaceMode={workspaceMode}
 				runtime={studio.runtime}
 				sourceGlobals={sourceGlobals}
 				draftGlobals={draftGlobals}
@@ -2446,9 +2681,10 @@ export default function Studio() {
 				onRefreshLocalProjects={() => { void refreshLocalProjects(); }}
 				onAppearanceModeChange={handleAppearanceModeChange}
 				onOpenOnboarding={openOnboarding}
+				onWorkspaceModeChange={handleWorkspaceModeChange}
 			/>
 
-			<div className="studio-body" style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
+			<div className={`studio-body workspace-mode-${workspaceMode}`} ref={studioBodyRef} style={{ '--editor-width': `${editorWidth}px` } as CSSProperties}>
 				<SourceEditor
 					draft={studio.draft}
 					diagnostics={studio.diagnostics}
@@ -2477,12 +2713,13 @@ export default function Studio() {
 						type="button"
 						onPointerDown={startEditorResize}
 						onKeyDown={handleEditorResizeKeyDown}
-						aria-label="Resize source editor"
+						aria-label="Resize source editor; use Home for arrangement only or End for code only"
 						aria-orientation="vertical"
-						aria-valuemin={EDITOR_WIDTH_MIN}
+						aria-valuemin={0}
 						aria-valuemax={EDITOR_WIDTH_MAX}
-						aria-valuenow={editorWidth}
-						title="Drag to resize source editor"
+						aria-valuenow={workspaceMode === 'arrangement' ? 0 : workspaceMode === 'code' ? EDITOR_WIDTH_MAX : editorWidth}
+						aria-valuetext={workspaceMode === 'arrangement' ? 'Arrangement only' : workspaceMode === 'code' ? 'Code only' : `${editorWidth} pixels, split view`}
+						title="Drag to resize; snap to code-only or arrangement-only at the edges"
 					/>
 				</div>
 
@@ -2507,6 +2744,7 @@ export default function Studio() {
 						draftTrackDetails={draftTrackDetails}
 						validTrackDetails={validTrackDetails}
 						sourceGlobals={sourceGlobals}
+						acceptedSourceRevision={studio.phase === 'booting' || studio.phase === 'validating' ? null : studio.activeRevision}
 						runtime={studio.runtime}
 						getVisualizerHaps={getVisualizerHaps}
 						getVisualizerScopeData={getVisualizerScopeData}

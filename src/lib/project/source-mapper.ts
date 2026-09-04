@@ -265,7 +265,11 @@ export function getSourceTrackTiming(expression: string, defaultEndCycle = DEFAU
 	// when projecting the lane's source-defined timing.
 	const trimmed = expression.replace(/^\s*\/\*\s*@sushi-midi-generated:start\s*\*\/\s*/, '').trim();
 	if (/^seqPLoop\s*\(/.test(trimmed)) {
-		const pairs = Array.from(trimmed.matchAll(new RegExp(`\\[\\s*(${numericLiteral})\\s*,\\s*(${numericLiteral})\\s*,`, 'g')))
+		const open = trimmed.indexOf('(');
+		const close = open < 0 ? undefined : findMatchingCallEnd(trimmed, open);
+		const pairs = close === undefined ? [] : splitCallArguments(trimmed, open + 1, close)
+			.map((argument) => argument.text.match(new RegExp(`^\\s*\\[\\s*(${numericLiteral})\\s*,\\s*(${numericLiteral})\\s*,`)))
+			.filter((match): match is RegExpMatchArray => match !== null)
 			.map((match) => ({ start: Number(match[1]), end: Number(match[2]) }))
 			.filter((pair) => Number.isFinite(pair.start) && Number.isFinite(pair.end) && pair.end > pair.start);
 		if (pairs.length) {

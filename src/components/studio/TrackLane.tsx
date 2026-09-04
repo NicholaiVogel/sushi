@@ -32,6 +32,7 @@ export interface TrackLaneProps {
 	timelineGridStyle: CSSProperties;
 	timelineCells: TimelineCell[];
 	timelineCellCount: number;
+	acceptedSourceRevision: number | null;
 	runtime: RuntimeState;
 	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
 	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
@@ -94,6 +95,7 @@ export function TrackLane({
 	timelineGridStyle,
 	timelineCells,
 	timelineCellCount,
+	acceptedSourceRevision,
 	runtime,
 	getVisualizerHaps,
 	getVisualizerScopeData,
@@ -262,6 +264,7 @@ export function TrackLane({
 						trackName={block.name}
 						visualizer={trackDetails.visualizer}
 						trackColor={trackColor}
+						acceptedSourceRevision={acceptedSourceRevision}
 						runtime={runtime}
 						windowStartCycle={timing.startCycle}
 						windowEndCycle={timing.endCycle}

@@ -11,8 +11,24 @@ import {
 	getKeyParts,
 	KEY_ROOT_OPTIONS,
 } from './helpers';
-import type { AppearanceMode, HeaderPopover, PersistenceState } from './types';
+import type { AppearanceMode, HeaderPopover, PersistenceState, WorkspaceMode } from './types';
 import { SettingsMenu } from './SettingsMenu';
+
+const WORKSPACE_MODES: ReadonlyArray<{ id: WorkspaceMode; title: string }> = [
+	{ id: 'code', title: 'Code only' },
+	{ id: 'split', title: 'Code and arrangement' },
+	{ id: 'arrangement', title: 'Arrangement only' },
+];
+
+function WorkspaceModeIcon({ mode }: { mode: WorkspaceMode }) {
+	if (mode === 'code') {
+		return <svg className="workspace-mode-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6-6 6 6 6M15 6l6 6-6 6" /></svg>;
+	}
+	if (mode === 'split') {
+		return <svg className="workspace-mode-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="7" height="16" rx="1" /><rect x="13.5" y="4" width="7" height="16" rx="1" /></svg>;
+	}
+	return <svg className="workspace-mode-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h7v4H4zM4 14h16v4H4z" /><path d="M14 6h6" /></svg>;
+}
 
 export interface StudioHeaderProps {
 	headerRef: RefObject<HTMLElement | null>;
@@ -25,6 +41,7 @@ export interface StudioHeaderProps {
 	isBusy: boolean;
 	canPlay: boolean;
 	experimentalMidi: boolean;
+	workspaceMode: WorkspaceMode;
 	runtime: RuntimeState;
 	sourceGlobals: SourceGlobals;
 	draftGlobals: SourceGlobals;
@@ -67,6 +84,7 @@ export interface StudioHeaderProps {
 	onRefreshLocalProjects: () => void;
 	onAppearanceModeChange: (mode: AppearanceMode) => void;
 	onOpenOnboarding: () => void;
+	onWorkspaceModeChange: (mode: WorkspaceMode) => void;
 }
 
 export function StudioHeader({
@@ -80,6 +98,7 @@ export function StudioHeader({
 	isBusy,
 	canPlay,
 	experimentalMidi,
+	workspaceMode,
 	runtime,
 	sourceGlobals,
 	draftGlobals,
@@ -122,6 +141,7 @@ export function StudioHeader({
 	onRefreshLocalProjects,
 	onAppearanceModeChange,
 	onOpenOnboarding,
+	onWorkspaceModeChange,
 }: StudioHeaderProps) {
 	return (
 		<header className="studio-topbar" ref={headerRef}>
@@ -209,6 +229,23 @@ export function StudioHeader({
 							<button className="transport-button source-action-button" type="button" onClick={onRedoSource} disabled={isBusy || isDirty || !canRedo} aria-label="Redo source edit" title="Redo source edit">
 								<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 8 5 4-5 4" /><path d="M20 12h-8a6 6 0 0 0-6 6" /></svg>
 							</button>
+						</div>
+						<div className="workspace-mode-control" role="radiogroup" aria-label="Workspace view">
+							{WORKSPACE_MODES.map((mode) => (
+								<button
+									key={mode.id}
+									className={`workspace-mode-button${workspaceMode === mode.id ? ' workspace-mode-button-active' : ''}`}
+									type="button"
+									onClick={() => onWorkspaceModeChange(mode.id)}
+									disabled={isBusy}
+									role="radio"
+									aria-checked={workspaceMode === mode.id}
+									aria-label={mode.title}
+									title={mode.title}
+								>
+									<WorkspaceModeIcon mode={mode.id} />
+								</button>
+							))}
 						</div>
 						<div className="transport-status" aria-label="Playback status">
 							<span ref={transportClockRef} className="transport-clock" aria-live="polite">{formatClock(currentSeconds)}</span>

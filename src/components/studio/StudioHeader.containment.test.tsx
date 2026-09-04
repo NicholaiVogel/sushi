@@ -25,6 +25,7 @@ function headerProps(experimentalMidi: boolean): StudioHeaderProps {
 		isBusy: false,
 		canPlay: true,
 		experimentalMidi,
+		workspaceMode: 'split',
 		runtime: studio.runtime,
 		sourceGlobals: globals,
 		draftGlobals: globals,
@@ -67,6 +68,7 @@ function headerProps(experimentalMidi: boolean): StudioHeaderProps {
 		onRefreshLocalProjects: noop,
 		onAppearanceModeChange: noop,
 		onOpenOnboarding: noop,
+		onWorkspaceModeChange: noop,
 	};
 }
 
@@ -84,5 +86,20 @@ describe('StudioHeader MIDI containment', () => {
 
 		expect(markup).toContain('Open MIDI controls');
 		expect(markup).toContain('Open MIDI recording');
+	});
+
+	test('exposes the three workspace views in the header', () => {
+		const markup = renderToStaticMarkup(<StudioHeader {...headerProps(false)} />);
+
+		expect(markup).toContain('aria-label="Workspace view"');
+		expect(markup).toContain('aria-label="Code only"');
+		expect(markup).toContain('aria-label="Code and arrangement"');
+		expect(markup).toContain('aria-label="Arrangement only"');
+		expect(markup).toContain('workspace-mode-icon');
+		expect(markup).not.toContain('>VIEW<');
+		expect(markup).not.toContain('>CODE<');
+		expect(markup).not.toContain('>SPLIT<');
+		expect(markup).not.toContain('>ARRANGE<');
+		expect(markup).toContain('class="workspace-mode-button workspace-mode-button-active"');
 	});
 });

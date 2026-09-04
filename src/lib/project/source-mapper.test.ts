@@ -524,6 +524,13 @@ $: s("sine") // ._scope()
 		expect(moved).toContain('seqPLoop([2, 4, s("bd")], [5, 7, s("cp")])');
 	});
 
+	test('ignores nested note arrays when reading seqPLoop timing', () => {
+		const source = `// @sushi-track {"id":"trk_chord_loop","name":"Chord loop","type":"synth","schema":1}\n$: seqPLoop([16, 24, n("<[0,2,4,7] [0,2,5,14] [-1,2,4,13]>/2").scale(key)], [24, 26, silence])`;
+		const [track] = getSourceBlockDetails(source);
+
+		expect(track.timing).toEqual({ mode: 'seqPLoop', startCycle: 16, endCycle: 26 });
+	});
+
 	test('keeps semicolon-terminated expressions valid when adding a range', () => {
 		const source = `// @sushi-track {"id":"trk_semicolon","name":"Pulse","type":"synth","schema":1}\n$: s("bd");`;
 		const updated = updateTrackRange(source, 'trk_semicolon', 1, 3);

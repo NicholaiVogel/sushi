@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties 
 
 export type OnboardingWebMcpStatus = 'ready' | 'connecting' | 'unavailable';
 
-export const ONBOARDING_AGENT_PROMPT = 'Inspect this project, add a complementary bassline after cycle 8, validate the source, and play the result.';
+export const ONBOARDING_AGENT_PROMPT = 'Navigate to sushidaw.com, inspect the current composition, add a complementary bassline after cycle 8, validate the source, and play the result.';
 
 interface OnboardingModalProps {
 	webmcpStatus: OnboardingWebMcpStatus;
@@ -218,9 +218,8 @@ export function OnboardingModal({
 				aria-describedby="onboarding-description"
 				tabIndex={-1}
 			>
-				<div className="onboarding-modal-header">
+				<div className="onboarding-modal-header onboarding-enter onboarding-enter-1">
 					<div className="onboarding-heading">
-						<span className="onboarding-eyebrow">// WELCOME TO SUSHI</span>
 						<h1 id="onboarding-title">One composition. Three ways to make it.</h1>
 						<p id="onboarding-description">Arrange visually, edit the Strudel source, or ask an agent to work directly in the project. Every supported change stays synchronized.</p>
 					</div>
@@ -231,12 +230,12 @@ export function OnboardingModal({
 						</span>
 						{webmcpStatus === 'unavailable' ? <p>WebMCP was not detected in this browser. The studio remains fully usable.</p> : null}
 					</div>
-					<button className="onboarding-close" type="button" onClick={onClose} aria-label="Close Welcome to Sushi" title="Close">
+					<button className="onboarding-close" type="button" onClick={onClose} aria-label="Close onboarding" title="Close">
 						<span aria-hidden="true">×</span>
 					</button>
 				</div>
 
-				<div className="onboarding-concepts" aria-label="Three interfaces to one live project">
+				<div className="onboarding-concepts onboarding-enter onboarding-enter-2" aria-label="Three interfaces to one live project">
 					{CONCEPTS.map((concept, index) => (
 						<Fragment key={concept.label}>
 							<OnboardingConcept {...concept} />
@@ -245,9 +244,9 @@ export function OnboardingModal({
 					))}
 				</div>
 
-				<div className="onboarding-divider" aria-hidden="true"><span />ONE LIVE PROJECT<span /></div>
+				<div className="onboarding-divider onboarding-enter onboarding-enter-3" aria-hidden="true"><span />ONE LIVE PROJECT<span /></div>
 
-				<div className="onboarding-actions">
+				<div className="onboarding-actions onboarding-enter onboarding-enter-4">
 					<button ref={primaryActionRef} className="onboarding-action onboarding-action-primary" type="button" onClick={() => { void runDemo(); }} disabled={busyAction !== null}>
 						<span className="onboarding-action-icon" aria-hidden="true">▶</span>
 						{busyAction === 'demo' ? 'Loading demo…' : 'Play the demo'}
@@ -255,7 +254,7 @@ export function OnboardingModal({
 					<button className="onboarding-action onboarding-action-secondary" type="button" onClick={() => { void runBlank(); }} disabled={busyAction !== null}>
 						{busyAction === 'blank' ? 'Creating blank…' : 'Start blank'}
 					</button>
-					{onOpenExisting ? <button className="onboarding-action onboarding-action-tertiary" type="button" onClick={() => { onClose(); onOpenExisting(); }} disabled={busyAction !== null}>Open an existing project</button> : null}
+					{onOpenExisting ? <button className="onboarding-action onboarding-action-tertiary" type="button" onClick={() => { onClose(); onOpenExisting(); }} disabled={busyAction !== null}>Open a project</button> : null}
 				</div>
 				{blankConfirmationOpen ? (
 					<div className="onboarding-blank-confirm" role="alert">
@@ -268,11 +267,11 @@ export function OnboardingModal({
 				) : null}
 				{actionError ? <p className="onboarding-action-error" role="alert">{actionError}</p> : null}
 
-				<div className="onboarding-divider onboarding-divider-agent" aria-hidden="true"><span />TRY WITH AN AGENT<span /></div>
-				<div className="onboarding-prompt-box">
+				<div className="onboarding-divider onboarding-divider-agent onboarding-enter onboarding-enter-5" aria-hidden="true"><span />TRY WITH AN AGENT<span /></div>
+				<div className="onboarding-prompt-box onboarding-enter onboarding-enter-6">
 					<code>{ONBOARDING_AGENT_PROMPT}</code>
-					<button className="onboarding-copy" type="button" onClick={() => { void copyPrompt(); }}>
-						<span aria-hidden="true">▣</span>
+					<button className={`onboarding-copy onboarding-copy-${copyState}`} type="button" onClick={() => { void copyPrompt(); }}>
+						<span className="onboarding-copy-icon" aria-hidden="true">{copyState === 'copied' ? '✓' : copyState === 'unavailable' ? '!' : '▣'}</span>
 						{copyState === 'copied' ? 'Copied' : copyState === 'unavailable' ? 'Copy unavailable' : 'Copy'}
 					</button>
 				</div>

@@ -36,6 +36,7 @@ export interface TimelineProps {
 	draftTrackDetails: Map<string, TrackDetails>;
 	validTrackDetails: Map<string, TrackDetails>;
 	sourceGlobals: SourceGlobals;
+	acceptedSourceRevision: number | null;
 	runtime: RuntimeState;
 	getVisualizerHaps: (trackId: string, visualizer: StrudelVisualizer, begin: number, end: number) => VisualizerHap[];
 	getVisualizerScopeData: (trackId: string) => ArrayLike<number> | undefined;
@@ -90,6 +91,7 @@ export function Timeline({
 	draftTrackDetails,
 	validTrackDetails,
 	sourceGlobals,
+	acceptedSourceRevision,
 	runtime,
 	getVisualizerHaps,
 	getVisualizerScopeData,
@@ -210,6 +212,7 @@ export function Timeline({
 					timelineGridStyle={timelineGridStyle}
 					timelineCells={timelineCells}
 					timelineCellCount={timelineCellCount}
+					acceptedSourceRevision={acceptedSourceRevision}
 					runtime={runtime}
 					getVisualizerHaps={getVisualizerHaps}
 					getVisualizerScopeData={getVisualizerScopeData}

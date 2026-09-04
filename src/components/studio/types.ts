@@ -6,6 +6,8 @@ export type { AppearanceMode } from '../../lib/project/appearance';
 
 export type StudioPhase = 'booting' | 'ready' | 'validating' | 'error';
 export type PersistenceState = 'loading' | 'ready' | 'unavailable';
+export type WorkspaceMode = 'code' | 'split' | 'arrangement';
+export const STUDIO_LAYOUT_SETTLED_EVENT = 'studio-layout-settled';
 
 export interface StudioState {
 	projectName: string;
@@ -61,9 +63,14 @@ export interface TimingDrag {
 	edge: 'start' | 'end' | 'move';
 	source: string;
 	lane: HTMLElement;
+	laneWidth: number;
+	songEndCycle: number;
+	region: HTMLElement;
 	pointerStartCycle: number;
 	startCycle: number;
 	endCycle: number;
+	currentStartCycle: number;
+	currentEndCycle: number;
 	pointerCycle: number;
 	lastPointerClientX: number;
 }

@@ -1,12 +1,14 @@
 import { useEffect, useRef } from 'react';
 import type { RuntimeState } from '../../lib/project/model';
 import type { StrudelVisualizer, VisualizerHap } from '../../lib/strudel/adapter';
+import { STUDIO_LAYOUT_SETTLED_EVENT } from './types';
 
 export interface VisualizerCanvasProps {
 	trackId: string;
 	trackName: string;
 	visualizer: StrudelVisualizer;
 	trackColor: string;
+	acceptedSourceRevision: number | null;
 	runtime: RuntimeState;
 	windowStartCycle: number;
 	windowEndCycle: number;
@@ -53,6 +55,7 @@ function subscribeToVisualizerFrames(listener: VisualizerFrameListener): () => v
 
 const DEFAULT_MIN_MIDI = 36;
 const DEFAULT_MAX_MIDI = 84;
+const VISUALIZER_HAP_RETRY_DELAYS_MS = [0, 32, 96, 192, 384] as const;
 const NOTE_BASE: Record<string, number> = { c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11 };
 
 function finiteNumber(value: unknown): number | undefined {
@@ -275,11 +278,20 @@ function hasSignal(data: ArrayLike<number>): boolean {
 	return false;
 }
 
+function isStudioLayoutMoving(body: HTMLElement | null, canvas?: HTMLElement | null): boolean {
+	return Boolean(
+		body?.classList.contains('studio-body-resizing')
+		|| body?.classList.contains('studio-body-layout-transitioning')
+		|| canvas?.closest('.pattern-region')?.classList.contains('pattern-region-resizing')
+	);
+}
+
 export function VisualizerCanvas({
 	trackId,
 	trackName,
 	visualizer,
 	trackColor,
+	acceptedSourceRevision,
 	runtime,
 	windowStartCycle,
 	windowEndCycle,
@@ -295,7 +307,8 @@ export function VisualizerCanvas({
 
 	useEffect(() => {
 		const canvas = canvasRef.current;
-		if (!canvas) return undefined;
+		if (!canvas || acceptedSourceRevision === null) return undefined;
+		const layoutBody = canvas.closest<HTMLElement>('.studio-body');
 		let scopeSamples = new Float32Array(0);
 		analyzerDataRef.current = undefined;
 		const windowStart = Math.max(0, windowStartCycle);
@@ -303,7 +316,7 @@ export function VisualizerCanvas({
 		// Haps are derived from the accepted Strudel pattern. They are static for
 		// this clip, so querying them once per source/range change keeps the audio
 		// scheduler out of the visualizer's frame loop.
-		const haps = getVisualizerHaps(trackId, visualizer, windowStart, windowEnd);
+		let haps = getVisualizerHaps(trackId, visualizer, windowStart, windowEnd);
 
 		const draw = (analyzerData = analyzerDataRef.current) => {
 			const rect = canvas.getBoundingClientRect();
@@ -332,16 +345,57 @@ export function VisualizerCanvas({
 
 		drawRef.current = draw;
 		draw();
-		const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => draw()) : undefined;
+		const handleLayoutSettled = (event: Event) => {
+			const target = event.target;
+			if (target !== layoutBody && !(target instanceof HTMLElement && target.contains(canvas))) return;
+			draw();
+		};
+		layoutBody?.addEventListener(STUDIO_LAYOUT_SETTLED_EVENT, handleLayoutSettled);
+
+		// Pattern evaluation and React rendering do not finish in the same turn.
+		// During that handoff queryArc can briefly return no events even though the
+		// accepted pattern is about to be available. Retry a bounded number of times
+		// so a transient empty query cannot leave a permanently blank canvas.
+		let retryTimer: number | undefined;
+		let cancelled = false;
+		let retryIndex = 0;
+		const retryForHaps = () => {
+			if (cancelled) return;
+			const nextHaps = getVisualizerHaps(trackId, visualizer, windowStart, windowEnd);
+			if (nextHaps.length) {
+				haps = nextHaps;
+				draw();
+				return;
+			}
+			if (retryIndex >= VISUALIZER_HAP_RETRY_DELAYS_MS.length) return;
+			const delay = VISUALIZER_HAP_RETRY_DELAYS_MS[retryIndex];
+			retryIndex += 1;
+			retryTimer = window.setTimeout(() => {
+				retryTimer = undefined;
+				retryForHaps();
+			}, delay);
+		};
+		if (!haps.length) retryForHaps();
+		const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => {
+			// A canvas can scale its existing bitmap while the outer grid is moving.
+			// Redrawing every canvas on every resize frame makes divider drags fight
+			// the browser's layout work. The settle event paints one sharp final frame.
+			if (!isStudioLayoutMoving(layoutBody, canvas)) draw();
+		}) : undefined;
 		observer?.observe(canvas);
 		return () => {
+			cancelled = true;
+			if (retryTimer !== undefined) window.clearTimeout(retryTimer);
 			observer?.disconnect();
+			layoutBody?.removeEventListener(STUDIO_LAYOUT_SETTLED_EVENT, handleLayoutSettled);
 			if (drawRef.current === draw) drawRef.current = undefined;
 		};
-	}, [getVisualizerHaps, trackColor, trackId, visualizer, windowEndCycle, windowStartCycle]);
+	}, [acceptedSourceRevision, getVisualizerHaps, trackColor, trackId, visualizer, windowEndCycle, windowStartCycle]);
 
 	useEffect(() => {
 		if (visualizer !== 'scope' && visualizer !== 'spectrum') return undefined;
+		const canvas = canvasRef.current;
+		const layoutBody = canvas?.closest<HTMLElement>('.studio-body') ?? null;
 		if (runtime.transport !== 'playing') {
 			drawRef.current?.();
 			return undefined;
@@ -350,6 +404,7 @@ export function VisualizerCanvas({
 		let lastScopeDraw = -Infinity;
 		return subscribeToVisualizerFrames((timestamp) => {
 			if (runtimeRef.current.transport !== 'playing') return;
+			if (isStudioLayoutMoving(layoutBody, canvas)) return;
 			// Analyzer data is useful at audio-monitoring rates, not at every display
 			// refresh. Capping this work keeps a multi-scope arrangement cheap while
 			// preserving a responsive waveform.
