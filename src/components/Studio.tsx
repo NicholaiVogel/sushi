@@ -1164,7 +1164,7 @@ export default function Studio() {
 			if (drag.edge === 'move') {
 				const delta = nextCycle - drag.pointerStartCycle;
 				const range = shiftTrackRange(drag.startCycle, drag.endCycle, delta);
-				setTrackRange(drag.trackId, range.startCycle, range.endCycle, experimentalMidi ? drag : undefined);
+				setTrackRange(drag.trackId, range.startCycle, range.endCycle, drag);
 				return;
 			}
 
@@ -1172,9 +1172,9 @@ export default function Studio() {
 			if (!details) return;
 			const startCycle = drag.edge === 'start' ? Math.min(nextCycle, drag.endCycle - TIMELINE_SNAP_CYCLE) : drag.startCycle;
 			const endCycle = drag.edge === 'end' ? Math.max(nextCycle, drag.startCycle + TIMELINE_SNAP_CYCLE) : drag.endCycle;
-			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.max(0, endCycle), experimentalMidi ? drag : undefined);
+			setTrackRange(drag.trackId, Math.max(0, startCycle), Math.max(0, endCycle), drag);
 		},
-		[experimentalMidi, setTrackRange],
+		[setTrackRange],
 	);
 
 	const stopTimingDrag = useCallback(() => {
