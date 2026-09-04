@@ -187,6 +187,44 @@ export interface MidiServiceSnapshot {
 	midiModuleLoaded: boolean;
 }
 
+/**
+ * Runtime state used by compositions that intentionally omit the MIDI feature.
+ * This is a pure compatibility value; it never probes the browser or hardware.
+ */
+export function createDisabledMidiRuntimeState(): MidiRuntimeState {
+	return {
+		supported: false,
+		secureContext: false,
+		permission: 'unsupported',
+		enabled: false,
+		sysexEnabled: false,
+		inputs: [],
+		outputs: [],
+		selectedInputId: null,
+		selectedOutputId: null,
+		inputChannel: 'all',
+		outputChannel: 1,
+		monitor: false,
+		clockMode: 'off',
+		clockRunning: false,
+		externalClockTicks: 0,
+		externalClockRunning: false,
+		learning: false,
+		recording: {
+			status: 'idle',
+			trackId: null,
+			inputId: null,
+			startedAtCycle: null,
+			currentCycle: null,
+			noteCount: 0,
+			automationCount: 0,
+			activeNoteCount: 0,
+			take: null,
+			options: null,
+		},
+	};
+}
+
 export interface MidiServiceListener {
 	(state: MidiRuntimeState): void;
 }

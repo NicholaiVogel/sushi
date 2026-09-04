@@ -21,6 +21,7 @@ export interface TimelineCell {
 
 export interface TrackLaneProps {
 	block: SourceBlockSummary;
+	enableMidi: boolean;
 	index: number;
 	trackColor: string;
 	trackDetails?: TrackDetails;
@@ -41,7 +42,7 @@ export interface TrackLaneProps {
 	fxDrawerOpen: boolean;
 	onSelect: (trackId: string) => void;
 	onContextMenu: (event: MouseEvent<HTMLElement>, trackId: string) => void;
-	onOpenNoteEditor: (trackId: string) => void;
+	onOpenNoteEditor?: (trackId: string) => void;
 	onLaneKeyDown: (event: KeyboardEvent<HTMLDivElement>, trackId: string) => void;
 	onStartRename: (trackId: string) => void;
 	onRenameValueChange: (value: string) => void;
@@ -82,6 +83,7 @@ function getTrackPreviewNotes(noteGrid: NoteGrid, timing: TrackDetails['timing']
 
 export function TrackLane({
 	block,
+	enableMidi,
 	index,
 	trackColor,
 	trackDetails,
@@ -125,11 +127,12 @@ export function TrackLane({
 	const clipStart = clamp(timing.startCycle / songEndCycle, 0, 1);
 	const clipEnd = clamp(timing.endCycle / songEndCycle, clipStart + 0.01, 1);
 	const clipWidth = Math.max(0.01, clipEnd - clipStart);
-	const previewNotes = noteGrid ? getTrackPreviewNotes(noteGrid, timing) : [];
+	const previewNotes = enableMidi && noteGrid ? getTrackPreviewNotes(noteGrid, timing) : [];
 	const previewMinMidi = noteGrid?.notes.length ? Math.max(0, Math.min(...noteGrid.notes.map((note) => note.midi)) - 6) : 36;
 	const previewMaxMidi = noteGrid?.notes.length ? Math.min(127, Math.max(...noteGrid.notes.map((note) => note.midi)) + 6) : 84;
 	const previewMidiRange = Math.max(12, previewMaxMidi - previewMinMidi);
 	const previewSpan = Math.max(0.25, timing.endCycle - timing.startCycle);
+	const trackTypeLabel = !enableMidi && block.type === 'midi' ? 'SOURCE' : getTrackLabel(block.type);
 	const timingLabel = `${formatCycle(timing.startCycle)}–${formatCycle(timing.endCycle)} cycles · ${formatCycle(cyclesToSeconds(timing.endCycle - timing.startCycle, sourceGlobals))}s`;
 
 	return (
@@ -146,7 +149,7 @@ export function TrackLane({
 			onContextMenu={(event) => onContextMenu(event, block.id)}
 			onDoubleClick={(event) => {
 				if (event.target instanceof HTMLElement && event.target.closest('button, input, select, textarea')) return;
-				onOpenNoteEditor(block.id);
+				if (enableMidi) onOpenNoteEditor?.(block.id);
 			}}
 			onKeyDown={(event) => onLaneKeyDown(event, block.id)}
 			aria-current={selected ? 'true' : undefined}
@@ -154,7 +157,7 @@ export function TrackLane({
 		>
 			<div className="track-header" style={{ '--track-color': trackColor } as CSSProperties}>
 				<div className="track-header-top">
-					<span className="track-instrument-icon" aria-hidden="true">{block.type === 'midi' ? '⌁' : '♩'}</span>
+					<span className="track-instrument-icon" aria-hidden="true">{enableMidi && block.type === 'midi' ? '⌁' : '♩'}</span>
 					<div className="track-title-wrap">
 						<div className="track-name-line">
 							<span className="track-number">{(index + 1).toString().padStart(2, '0')}</span>
@@ -190,7 +193,7 @@ export function TrackLane({
 								</span>
 							)}
 						</div>
-						<span className="track-type">{getTrackLabel(block.type)} <span aria-hidden="true">·</span> LINE {block.line}</span>
+						<span className="track-type">{trackTypeLabel} <span aria-hidden="true">·</span> LINE {block.line}</span>
 					</div>
 					<div className="track-header-actions">
 						<button
@@ -252,7 +255,7 @@ export function TrackLane({
 					role="button"
 					tabIndex={0}
 					aria-label={`Move ${block.name} clip, currently ${timingLabel}`}
-					title={`${block.name}: drag to move in quarter-cycle steps; double-click to open the note editor`}
+					title={`${block.name}: drag to move in quarter-cycle steps${enableMidi ? '; double-click to open the note editor' : ''}`}
 				>
 					{trackDetails?.visualizer ? <VisualizerCanvas
 						trackId={block.id}
@@ -266,7 +269,7 @@ export function TrackLane({
 						getVisualizerScopeData={getVisualizerScopeData}
 						getVisualizerSpectrumData={getVisualizerSpectrumData}
 					/> : null}
-					{noteGrid?.notes.length ? <div className="track-note-preview" aria-label={`${block.name} note preview`}>
+					{enableMidi && noteGrid?.notes.length ? <div className="track-note-preview" aria-label={`${block.name} note preview`}>
 						{previewNotes.map((note) => {
 							const left = clamp((note.startCycle - timing.startCycle) / previewSpan, 0, 1) * 100;
 							const width = Math.max(0.4, Math.min(note.durationCycles / previewSpan, 1 - (note.startCycle - timing.startCycle) / previewSpan) * 100);

@@ -17,6 +17,7 @@ import type { StrudelVisualizer, VisualizerHap } from '../../lib/strudel/adapter
 import type { NoteGrid } from '../../lib/project/note-grid';
 
 export interface TimelineProps {
+	enableMidi: boolean;
 	timelineViewportRef: RefObject<HTMLElement | null>;
 	timelineShellRef: RefObject<HTMLElement | null>;
 	timelineLengthRef: RefObject<HTMLDivElement | null>;
@@ -47,7 +48,7 @@ export interface TimelineProps {
 	openPopover: HeaderPopover | null;
 	onTogglePopover: (popover: HeaderPopover) => void;
 	onAddAudioTrack: () => void;
-	onAddMidiTrack: () => void;
+	onAddMidiTrack?: () => void;
 	onSetSongEndCycle: (value: number) => void;
 	onAdjustZoom: (value: number) => void;
 	onStartTimelineSeekDrag: (event: ReactPointerEvent<HTMLButtonElement>) => void;
@@ -56,7 +57,7 @@ export interface TimelineProps {
 	onOpenTrackFxDrawer: (trackId: string) => void;
 	onToggleTrackEffects: (trackId: string, enabled: boolean) => void;
 	onOpenTrackContextMenu: (event: MouseEvent<HTMLElement>, trackId: string) => void;
-	onOpenNoteEditor: (trackId: string) => void;
+	onOpenNoteEditor?: (trackId: string) => void;
 	onTrackLaneKeyDown: (event: KeyboardEvent<HTMLDivElement>, trackId: string) => void;
 	onStartRename: (trackId: string) => void;
 	onRenameValueChange: (value: string) => void;
@@ -70,6 +71,7 @@ export interface TimelineProps {
 }
 
 export function Timeline({
+	enableMidi,
 	timelineViewportRef,
 	timelineShellRef,
 	timelineLengthRef,
@@ -138,19 +140,19 @@ export function Timeline({
 			<div className="timeline-head" style={timelineGridStyle}>
 				<div className="timeline-heading-cell">
 					<div className="arrangement-toolbar">
-						<div className="add-track-control" ref={addTrackMenuRef}>
+						{enableMidi ? <div className="add-track-control" ref={addTrackMenuRef}>
 							<button className="add-track-button" type="button" onClick={() => setAddTrackOpen((open) => !open)} disabled={isBusy} aria-label="Add track" aria-expanded={addTrackOpen} aria-haspopup="menu"><span aria-hidden="true">＋</span> Add track</button>
 							{addTrackOpen ? <div className="add-track-menu" role="menu" aria-label="Choose track type">
 								<button type="button" role="menuitem" className="add-track-option" onClick={() => { setAddTrackOpen(false); onAddAudioTrack(); }}>
 									<strong><span aria-hidden="true">♫</span> Audio track</strong>
 									<small>Start with an editable Strudel instrument lane.</small>
 								</button>
-								<button type="button" role="menuitem" className="add-track-option add-track-option-midi" onClick={() => { setAddTrackOpen(false); onAddMidiTrack(); }}>
+								{onAddMidiTrack ? <button type="button" role="menuitem" className="add-track-option add-track-option-midi" onClick={() => { setAddTrackOpen(false); onAddMidiTrack(); }}>
 									<strong><span aria-hidden="true">⌁</span> MIDI track</strong>
 									<small>Record keys, pads, knobs, and live-play a chosen instrument.</small>
-								</button>
+								</button> : null}
 							</div> : null}
-						</div>
+						</div> : <button className="add-track-button" type="button" onClick={onAddAudioTrack} disabled={isBusy} aria-label="Add track"><span aria-hidden="true">＋</span> Add track</button>}
 					</div>
 					<div className="timeline-duration">
 						<div className="timeline-length-control-wrap" ref={timelineLengthRef}>
@@ -197,6 +199,7 @@ export function Timeline({
 				const trackDetails = draftTrackDetails.get(block.id) ?? validTrackDetails.get(block.id);
 				return <TrackLane
 					block={block}
+					enableMidi={enableMidi}
 					index={index}
 					trackColor={getTrackColor(trackDetails?.color)}
 					trackDetails={trackDetails}

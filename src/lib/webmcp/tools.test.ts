@@ -265,6 +265,18 @@ describe('WebMCP tool adapter', () => {
 		expect((await route?.execute({ trackId: 'trk_test', channel: 2, enabled: true, baseRevision: 0, transactionId: 'midi-route-test' }, { signal: new AbortController().signal }) as { ok: boolean }).ok).toBe(true);
 	});
 
+	test('omits MIDI tools when the studio composition has no MIDI controller', () => {
+		const controller = testController();
+		delete controller.midi;
+		delete controller.setTrackMidiRoute;
+
+		const tools = createWebMcpTools(controller);
+
+		expect(tools.some((tool) => tool.name === 'open_studio_session')).toBe(true);
+		expect(tools.some((tool) => tool.name.startsWith('midi') || tool.name.includes('_midi'))).toBe(false);
+		expect(tools.some((tool) => tool.name === 'set_track_midi_route')).toBe(false);
+	});
+
 	test('passes a local instrument through the revision-safe MIDI route tool', async () => {
 		let received: unknown;
 		const controller = { ...testController(), setTrackMidiRoute: async (input: Parameters<NonNullable<WebMcpController['setTrackMidiRoute']>>[0]) => {

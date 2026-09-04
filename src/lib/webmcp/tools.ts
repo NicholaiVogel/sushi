@@ -852,6 +852,26 @@ function midiStateResult(action: string, state: MidiRuntimeState): Record<string
 	return { ok: !error, action, midi: boundedState, ...(error ? { error } : {}) };
 }
 
+const MIDI_WEBMCP_TOOL_NAMES = new Set<WebMcpToolName>([
+	'get_midi_capabilities',
+	'list_midi_devices',
+	'inspect_midi_state',
+	'read_midi_take',
+	'request_midi_access',
+	'select_midi_input',
+	'select_midi_output',
+	'set_midi_settings',
+	'learn_midi_control',
+	'set_track_midi_route',
+	'arm_midi_recording',
+	'start_midi_recording',
+	'stop_midi_recording',
+	'cancel_midi_recording',
+	'accept_midi_take',
+	'panic_midi',
+	'send_midi_test_note',
+]);
+
 export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelContextTool[] {
 	const executeSafely = async (operation: () => WebMCP.MaybePromise<unknown>) => {
 		try {
@@ -861,7 +881,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 		}
 	};
 
-	return [
+	const tools = [
 		createTool({
 			name: 'open_studio_session',
 			title: 'Open Sushi studio session',
@@ -1446,6 +1466,7 @@ export function createWebMcpTools(controller: WebMcpController): WebMCP.ModelCon
 			return executeSafely(async () => midiStateResult('send_midi_test_note', await controller.midi!.testNote(parsed.note, parsed.durationMs, parsed.velocity)));
 		}),
 	];
+	return controller.midi ? tools : tools.filter((tool) => !MIDI_WEBMCP_TOOL_NAMES.has(tool.name as WebMcpToolName));
 }
 
 export async function registerWebMcpTools(
