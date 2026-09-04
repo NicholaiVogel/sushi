@@ -24,6 +24,9 @@ const webmcpOriginIsolation = {
 export default defineConfig({
   integrations: [react(), webmcpOriginIsolation],
   vite: {
+    // Astro defaults Vite's client env prefix to PUBLIC_. Keep that prefix and
+    // explicitly expose the documented VITE_EXPERIMENTAL_MIDI switch.
+    envPrefix: ['PUBLIC_', 'VITE_'],
     // Soundfont loading is intentionally lazy in the adapter, but keeping the
     // package in the dependency graph prevents Vite from emitting an outdated
     // optimized-dependency URL on the first GM-instrument playback.
