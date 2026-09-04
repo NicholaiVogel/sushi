@@ -19,6 +19,10 @@ import type { TrackDetails } from './types';
 
 export type TrackFxDrawerMode = 'effects' | 'sounds' | 'midi';
 
+export function normalizeTrackFxDrawerMode(mode: TrackFxDrawerMode, experimentalMidi: boolean): TrackFxDrawerMode {
+	return !experimentalMidi && mode === 'midi' ? 'effects' : mode;
+}
+
 export interface TrackFxDrawerProps {
 	track: SourceBlockSummary;
 	experimentalMidi: boolean;
@@ -193,6 +197,7 @@ export function TrackFxDrawer({
 	const [soundPickerPosition, setSoundPickerPosition] = useState<EffectPickerPosition | null>(null);
 	const [soundPickerTargetId, setSoundPickerTargetId] = useState('sound-0');
 	const [drawerHeight, setDrawerHeight] = useState<number | undefined>();
+	const visibleMode = normalizeTrackFxDrawerMode(mode, experimentalMidi);
 	const resizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
 	const sliders = trackDetails?.sliders ?? [];
 	const effects = trackDetails?.effects ?? [];
@@ -457,7 +462,7 @@ export function TrackFxDrawer({
 			</header>
 
 			<div className="track-fx-drawer-body">
-				{mode === 'effects' || !experimentalMidi ? (
+				{visibleMode === 'effects' ? (
 					<>
 						{sliders.length ? <section className="track-fx-drawer-section track-fx-drawer-source-section" aria-labelledby="track-fx-source-heading">
 							<div className="track-fx-drawer-section-heading">
@@ -705,7 +710,7 @@ export function TrackFxDrawer({
 							</div>
 						</section>
 					</>
-				) : mode === 'sounds' ? (
+				) : visibleMode === 'sounds' ? (
 					<section className="track-fx-drawer-section track-fx-drawer-sounds-section" aria-labelledby="track-fx-sounds-heading">
 						<div className="track-fx-drawer-section-heading">
 							<div className="track-fx-drawer-section-heading-main">
@@ -939,11 +944,11 @@ export function TrackFxDrawer({
 
 			<footer className="track-fx-drawer-footer">
 				<div className="track-fx-drawer-mode-switch" role="tablist" aria-label="Track control mode">
-					<button type="button" role="tab" aria-selected={mode === 'effects'} className={mode === 'effects' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('effects')}>Effects</button>
-					<button type="button" role="tab" aria-selected={mode === 'sounds'} className={mode === 'sounds' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('sounds')}>Sounds</button>
-					{experimentalMidi ? <button type="button" role="tab" aria-selected={mode === 'midi'} className={mode === 'midi' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('midi')}>MIDI</button> : null}
+					<button type="button" role="tab" aria-selected={visibleMode === 'effects'} className={visibleMode === 'effects' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('effects')}>Effects</button>
+					<button type="button" role="tab" aria-selected={visibleMode === 'sounds'} className={visibleMode === 'sounds' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('sounds')}>Sounds</button>
+					{experimentalMidi ? <button type="button" role="tab" aria-selected={visibleMode === 'midi'} className={visibleMode === 'midi' ? 'track-fx-drawer-mode-active' : ''} onClick={() => setMode('midi')}>MIDI</button> : null}
 				</div>
-				<span className="track-fx-drawer-footer-status">{mode === 'effects' || !experimentalMidi ? 'SOURCE · EFFECTS' : mode === 'sounds' ? 'SOURCE · SOUNDS' : 'SOURCE · MIDI'}</span>
+				<span className="track-fx-drawer-footer-status">{visibleMode === 'effects' ? 'SOURCE · EFFECTS' : visibleMode === 'sounds' ? 'SOURCE · SOUNDS' : 'SOURCE · MIDI'}</span>
 			</footer>
 		</aside>
 	);
