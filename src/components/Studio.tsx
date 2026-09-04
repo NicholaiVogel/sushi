@@ -39,7 +39,7 @@ import {
 } from '../lib/project/source-mapper';
 import type { TrackEffectMethod } from '../lib/strudel/track-effects';
 import { extendNoteGridSourceRange, midiToNoteName, parseNoteGrid, trimNoteGridSourceRange, updateNoteGridSource, type NoteGrid, type NoteGridEdit } from '../lib/project/note-grid';
-import { EDITOR_PRESETS, type EditorPreset } from '../lib/project/presets';
+import { EDITOR_PRESETS, getEditorPreset, ONBOARDING_DEMO_PRESET_ID, type EditorPreset } from '../lib/project/presets';
 import {
 	getTimelineCapacityForEndCycle,
 	getTimelineZoomForVisibleCycles,
@@ -144,6 +144,18 @@ type EditorResizeDrag = {
 	mode: WorkspaceMode;
 	body: HTMLDivElement;
 };
+
+function setTimelinePlayheadPosition(shell: HTMLElement, position: number): void {
+	const left = `${position * 100}%`;
+	const timelinePlayheads = shell.getElementsByClassName('timeline-playhead');
+	const lanePlayheads = shell.getElementsByClassName('lane-playhead');
+	for (let index = 0; index < timelinePlayheads.length; index += 1) {
+		(timelinePlayheads.item(index) as HTMLElement | null)?.style.setProperty('left', left);
+	}
+	for (let index = 0; index < lanePlayheads.length; index += 1) {
+		(lanePlayheads.item(index) as HTMLElement | null)?.style.setProperty('left', left);
+	}
+}
 
 function isKeyboardTextEntryTarget(target: EventTarget | null): boolean {
 	if (!(target instanceof HTMLElement)) return false;
@@ -1975,7 +1987,7 @@ export default function Studio() {
 
 	const prepareOnboardingDemo = useCallback(async (): Promise<boolean> => {
 		const adapter = adapterRef.current;
-		const preset = EDITOR_PRESETS[0];
+		const preset = getEditorPreset(ONBOARDING_DEMO_PRESET_ID);
 		if (!adapter || !preset || studioRef.current.phase === 'booting' || studioRef.current.phase === 'validating') return false;
 
 		const unlocked = await adapter.unlockAudio();
@@ -2365,7 +2377,8 @@ export default function Studio() {
 		const state = studioRef.current;
 		const songEndCycle = Math.max(0.001, state.songEndCycle);
 		const currentCycle = clamp(cycle, 0, songEndCycle);
-		studioShellRef.current?.style.setProperty('--playhead-position', String(currentCycle / songEndCycle));
+		const shell = studioShellRef.current;
+		if (shell) setTimelinePlayheadPosition(shell, currentCycle / songEndCycle);
 		const globals = liveSourceGlobalsRef.current ?? getSourceGlobals(state.lastValid);
 		if (transportClockRef.current) transportClockRef.current.textContent = formatClock(cyclesToSeconds(currentCycle, globals));
 		if (transportCycleRef.current) transportCycleRef.current.textContent = `CYCLE ${formatCycle(currentCycle)}`;
@@ -2603,7 +2616,7 @@ export default function Studio() {
 				Math.max(0, state.songEndCycle),
 			);
 			const songEndCycle = Math.max(0.001, state.songEndCycle);
-			shell.style.setProperty('--playhead-position', String(clamp(currentCycle / songEndCycle, 0, 1)));
+			setTimelinePlayheadPosition(shell, clamp(currentCycle / songEndCycle, 0, 1));
 			const globals = liveSourceGlobalsRef.current ?? getSourceGlobals(state.lastValid);
 			if (transportClockRef.current) transportClockRef.current.textContent = formatClock(cyclesToSeconds(currentCycle, globals));
 			if (transportCycleRef.current) transportCycleRef.current.textContent = `CYCLE ${formatCycle(currentCycle)}`;

@@ -365,8 +365,8 @@ describe('WebMCP tool adapter', () => {
 		const tools = createWebMcpTools(testController());
 		const list = tools.find((tool) => tool.name === 'list_editor_templates');
 		const view = tools.find((tool) => tool.name === 'view_editor_template');
-		const listed = await list?.execute({ query: 'witch' }, { signal: new AbortController().signal }) as { templates: Array<{ id: string; name: string; description: string; bpm: number; key: string; lanes: number; source?: string }> };
-		expect(listed.templates).toEqual([{ id: 'witch-house-climax', name: 'Witch-House Climax', description: 'A cinematic 24-cycle build from sparse arpeggios into a dense, distorted climax.', bpm: 84, key: 'F minor', lanes: 16 }]);
+		const listed = await list?.execute({ query: 'F minor' }, { signal: new AbortController().signal }) as { templates: Array<{ id: string; name: string; description: string; bpm: number; key: string; lanes: number; source?: string }> };
+		expect(listed.templates).toEqual([{ id: 'witch-house-climax', name: 'F Minor Arrangement', description: 'A detailed 24-cycle arrangement that builds from sparse arpeggios into a dense final section.', bpm: 84, key: 'F minor', lanes: 16 }]);
 		expect(listed.templates[0]).not.toHaveProperty('source');
 
 		const viewed = await view?.execute({ templateId: 'witch-house-climax' }, { signal: new AbortController().signal }) as { template: { id: string; source: string } };

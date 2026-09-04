@@ -1,3 +1,4 @@
+import { D_MINOR_PULSE_SOURCE } from './presets/d-minor-pulse';
 import { WITCH_HOUSE_SOURCE } from './presets/witch-house';
 
 export interface EditorPreset {
@@ -12,11 +13,22 @@ export interface EditorPreset {
 
 export type EditorPresetSummary = Omit<EditorPreset, 'source'>;
 
+export const ONBOARDING_DEMO_PRESET_ID = 'd-minor-pulse';
+
 export const EDITOR_PRESETS: readonly EditorPreset[] = [
 	{
+		id: ONBOARDING_DEMO_PRESET_ID,
+		name: 'D Minor Pulse',
+		description: 'A compact 23-cycle arrangement with a moving bassline, layered piano motifs, and a restrained pulse.',
+		bpm: 90,
+		key: 'D minor',
+		lanes: 12,
+		source: D_MINOR_PULSE_SOURCE,
+	},
+	{
 		id: 'witch-house-climax',
-		name: 'Witch-House Climax',
-		description: 'A cinematic 24-cycle build from sparse arpeggios into a dense, distorted climax.',
+		name: 'F Minor Arrangement',
+		description: 'A detailed 24-cycle arrangement that builds from sparse arpeggios into a dense final section.',
 		bpm: 84,
 		key: 'F minor',
 		lanes: 16,

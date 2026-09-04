@@ -188,7 +188,6 @@ a { color: inherit; }
 
 .studio-shell {
 	--topbar-height: 72px;
-	--playhead-position: 0;
 	display: flex;
 	flex-direction: column;
 	height: 100svh;
